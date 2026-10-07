@@ -52,6 +52,9 @@ impl Daemon {
     pub async fn reload(&self) -> Result<Value> {
         self.post("/lmdeck/reload", json!({}), Duration::from_secs(5)).await
     }
+    pub async fn restart(&self, model: Option<&str>) -> Result<Value> {
+        self.post("/lmdeck/restart", model.map(|m| json!({"model": m})).unwrap_or(json!({})), Duration::from_secs(3600)).await
+    }
     pub async fn clear_downloads(&self) -> Result<()> {
         self.http.delete(format!("{}/lmdeck/downloads", self.base)).send().await?;
         Ok(())
@@ -97,5 +100,22 @@ pub fn stop_daemon(pid: Option<u32>) -> Result<()> {
     } else if let Some(p) = pid {
         unsafe { libc::kill(p as i32, libc::SIGTERM) };
     }
+    Ok(())
+}
+
+/// SIGKILL the daemon and every backend. Under systemd the whole cgroup goes;
+/// otherwise kill the daemon and each backend's process group.
+pub fn force_stop(pid: Option<u32>) -> Result<()> {
+    if crate::sys::service_active() {
+        crate::sys::systemctl(&["kill", "-s", "KILL", "lmdeck"])?;
+        // Restart=on-failure would bring it back; stop cancels the pending restart.
+        crate::sys::systemctl(&["stop", "lmdeck"])?;
+        return Ok(());
+    }
+    if let Some(p) = pid {
+        unsafe { libc::kill(p as i32, libc::SIGKILL) };
+    }
+    // Backends run in their own process groups; sweep any left behind.
+    let _ = std::process::Command::new("pkill").args(["-KILL", "-f", "lmdeck/mlx_fast_server.py|lmdeck/llama.cpp/bin/llama-server"]).status();
     Ok(())
 }

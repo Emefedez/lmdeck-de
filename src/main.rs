@@ -6,6 +6,7 @@ mod models;
 mod server;
 mod sys;
 mod tui;
+mod usage;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};

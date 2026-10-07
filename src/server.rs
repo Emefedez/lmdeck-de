@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::hf::{self, Downloads};
 use crate::models::{Format, LocalModel};
 use crate::sys::{self, rfc3339};
+use crate::usage::{EVENTS, USAGE};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
@@ -32,6 +33,15 @@ pub struct App {
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let app = App { mgr: Manager::new(cfg), dl: Downloads::default(), hf: hf::client(), started: Instant::now() };
+
+    let flusher = app.mgr.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let cfg = flusher.cfg();
+            let _ = tokio::task::spawn_blocking(move || USAGE.flush(&cfg)).await;
+        }
+    });
 
     let reaper = app.mgr.clone();
     tokio::spawn(async move {
@@ -66,6 +76,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/lmdeck/downloads", get(lm_downloads).delete(lm_clear_downloads))
         .route("/lmdeck/reload", post(lm_reload))
         .route("/lmdeck/logs", get(lm_logs))
+        .route("/lmdeck/watch", get(lm_watch))
+        .route("/lmdeck/config", get(lm_config_get).post(lm_config_set))
+        .route("/lmdeck/search", get(lm_search))
+        .route("/lmdeck/repo", get(lm_repo))
+        .route("/lmdeck/restart", post(lm_restart))
         .with_state(app.clone());
 
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| anyhow::anyhow!("binding {addr}: {e} (is Ollama or another lmdeck running?)"))?;
@@ -80,6 +95,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             }
             sys::log("shutting down, unloading models");
             mgr.unload_all().await;
+            USAGE.flush(&mgr.cfg());
         })
         .await?;
     Ok(())
@@ -246,6 +262,7 @@ async fn delete_model(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         Err(e) => return not_found_or_500(e),
     };
     let _ = a.mgr.unload(&m.name).await;
+    sys::log(&format!("deleting {} ({} bytes)", m.name, m.size));
     let cfg = a.mgr.cfg();
     let res = tokio::task::spawn_blocking(move || crate::models::delete(&m, &cfg)).await;
     a.mgr.invalidate();
@@ -261,6 +278,7 @@ async fn delete_model(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
 async fn pull(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let Some(name) = model_field(&b) else { return err(StatusCode::BAD_REQUEST, "model is required") };
     let stream = b.get("stream").and_then(|v| v.as_bool()).unwrap_or(true);
+    sys::log(&format!("pull requested: {name}"));
     let d = a.dl.start(a.hf.clone(), a.mgr.cfg(), &name);
     let mgr = a.mgr.clone();
     if !stream {
@@ -670,6 +688,7 @@ async fn ollama_generate(a: App, b: Value, messages: Vec<Value>, is_chat: bool) 
             v["context"] = json!([]);
         }
         let stats = final_stats(&acc, t0, load, t_sent);
+        record_usage(&model_name, &stats);
         for (k, val) in stats.as_object().unwrap() {
             v[k] = val.clone();
         }
@@ -700,6 +719,7 @@ async fn ollama_generate(a: App, b: Value, messages: Vec<Value>, is_chat: bool) 
             v["context"] = json!([]);
         }
         let stats = final_stats(&acc, t0, load, t_sent);
+        record_usage(&model_name, &stats);
         for (k, val) in stats.as_object().unwrap() {
             v[k] = val.clone();
         }
@@ -806,8 +826,14 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
     let rewrite = (guard.0.model.format == Format::Mlx).then(|| guard.0.name.clone());
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let ok = status.is_success();
     tokio::spawn(async move {
         let _g = guard;
+        let model_name = _g.0.name.clone();
+        let t0 = Instant::now();
+        let mut t_first: Option<Instant> = None;
+        let mut deltas = 0u64;
+        let mut tail: Vec<u8> = Vec::with_capacity(16 << 10);
         let mut s = resp.bytes_stream();
         let mut line_buf: Vec<u8> = Vec::new();
         while let Some(chunk) = s.next().await {
@@ -818,6 +844,15 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
                     return;
                 }
             };
+            if ok {
+                t_first.get_or_insert_with(Instant::now);
+                deltas += chunk.windows(7).filter(|w| *w == b"\"delta\"").count() as u64;
+                tail.extend_from_slice(&chunk);
+                if tail.len() > 16 << 10 {
+                    let cut = tail.len() - (16 << 10);
+                    tail.drain(..cut);
+                }
+            }
             let out = match &rewrite {
                 None => chunk,
                 Some(name) => {
@@ -845,6 +880,12 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
             };
             let _ = tx.send(Ok(Bytes::from(text))).await;
         }
+        if ok {
+            let (p, c) = extract_usage(&tail).unwrap_or((0, deltas));
+            let first = t_first.unwrap_or(t0);
+            let ttft = first.duration_since(t0).as_secs_f64();
+            USAGE.record(&model_name, p, c, ttft, Instant::now().duration_since(first).as_secs_f64(), ttft);
+        }
     });
     let mut r = Response::new(Body::from_stream(ReceiverStream::new(rx)));
     *r.status_mut() = status;
@@ -856,19 +897,184 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
 
 // ---------- lmdeck control ----------
 
-async fn status(State(a): State<App>) -> Json<Value> {
+fn status_value(a: &App) -> Value {
     let (total, avail) = sys::mem();
     let cfg = a.mgr.cfg();
-    Json(json!({
+    let quick: serde_json::Map<String, Value> = [
+        "server.keep_alive",
+        "server.max_loaded",
+        "server.host",
+        "llama.ctx_size",
+        "llama.cache_type_k",
+        "llama.cache_type_v",
+        "llama.cache_reuse",
+        "mlx.prompt_cache_size",
+        "mlx.fast_path",
+        "server.mem_check",
+    ]
+    .iter()
+    .map(|k| (k.to_string(), json!(crate::config::get_setting(&cfg, k))))
+    .collect();
+    json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "event": EVENTS.version(),
         "uptime_secs": a.started.elapsed().as_secs(),
         "pid": std::process::id(),
         "rss": sys::self_rss(),
         "listen": format!("{}:{}", cfg.server.host, cfg.server.port),
+        "host": cfg.server.host,
+        "port": cfg.server.port,
+        "ips": sys::lan_ips().into_iter().map(|(i, ip)| json!({"iface": i, "ip": ip})).collect::<Vec<_>>(),
         "running": a.mgr.views(),
+        "loading": a.mgr.loading(),
         "downloads": a.dl.list(),
         "mem": {"total": total, "available": avail},
-    }))
+        "usage": USAGE.summary(),
+        "settings": quick,
+    })
+}
+
+async fn status(State(a): State<App>) -> Json<Value> {
+    Json(status_value(&a))
+}
+
+#[derive(serde::Deserialize)]
+struct WatchQ {
+    since: Option<u64>,
+    timeout: Option<u64>,
+}
+
+/// Long-poll: returns as soon as anything changes (or after `timeout` s).
+/// Lets the bar widget follow lmdeck with ~one idle request a minute.
+async fn lm_watch(State(a): State<App>, Query(q): Query<WatchQ>) -> Json<Value> {
+    if let Some(since) = q.since {
+        EVENTS.wait(since, Duration::from_secs(q.timeout.unwrap_or(55).min(300))).await;
+    }
+    Json(status_value(&a))
+}
+
+async fn lm_config_get(State(a): State<App>) -> Json<Value> {
+    let cfg = a.mgr.cfg();
+    Json(json!(crate::config::SETTINGS
+        .iter()
+        .map(|(k, help)| json!({"key": k, "value": crate::config::get_setting(&cfg, k), "help": help, "reload": crate::config::needs_reload(k)}))
+        .collect::<Vec<_>>()))
+}
+
+async fn lm_config_set(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
+    let (Some(key), Some(value)) = (b.get("key").and_then(|k| k.as_str()), b.get("value")) else {
+        return err(StatusCode::BAD_REQUEST, "key and value are required");
+    };
+    let value = match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let mut cfg = a.mgr.cfg();
+    if let Err(e) = crate::config::set_setting(&mut cfg, key, &value) {
+        return err(StatusCode::BAD_REQUEST, format!("{key}: {e}"));
+    }
+    if let Err(e) = cfg.save() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    *a.mgr.cfg.write().unwrap() = cfg;
+    a.mgr.invalidate();
+    EVENTS.bump();
+    let restart = key == "server.host" || key == "server.port";
+    let reload = crate::config::needs_reload(key) && !a.mgr.running().is_empty();
+    Json(json!({"ok": true, "reload": reload, "restart_server": restart})).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct SearchQ {
+    q: Option<String>,
+    kind: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn lm_search(State(a): State<App>, Query(q): Query<SearchQ>) -> Resp {
+    let kind = q.kind.unwrap_or_else(|| "mlx".into());
+    match hf::search(&a.hf, q.q.as_deref().unwrap_or(""), &kind, q.limit.unwrap_or(30).min(100)).await {
+        Ok(h) => Json(json!(h)).into_response(),
+        Err(e) => err(StatusCode::BAD_GATEWAY, format!("{e:#}")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RepoQ {
+    id: String,
+}
+
+async fn lm_repo(State(a): State<App>, Query(q): Query<RepoQ>) -> Resp {
+    let res = async {
+        let sha = hf::repo_sha(&a.hf, &q.id, "main").await?;
+        hf::repo_files(&a.hf, &q.id, &sha).await
+    }
+    .await;
+    match res {
+        Ok(files) => {
+            let (total, avail) = sys::mem();
+            let cfg = a.mgr.cfg();
+            let out: Vec<Value> = hf::choices(&q.id, &files, &cfg.download.gguf_default_quant)
+                .into_iter()
+                .map(|c| {
+                    let need = c.size + c.size / 10;
+                    let fit = if need + (2u64 << 30) < avail { "fits" } else if need < total { "tight" } else { "too big" };
+                    let mut v = json!(c);
+                    v["fit"] = json!(fit);
+                    v
+                })
+                .collect();
+            Json(json!(out)).into_response()
+        }
+        Err(e) => err(StatusCode::BAD_GATEWAY, format!("{e:#}")),
+    }
+}
+
+async fn lm_restart(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
+    let names: Vec<String> = match model_field(&b) {
+        Some(n) => vec![n],
+        None => a.mgr.running().iter().map(|r| r.name.clone()).collect(),
+    };
+    for n in names {
+        if let Err(e) = a.mgr.restart(&n).await {
+            return not_found_or_500(e);
+        }
+    }
+    Json(json!({"ok": true})).into_response()
+}
+
+fn record_usage(model: &str, stats: &Value) {
+    let f = |k: &str| stats[k].as_u64().unwrap_or(0);
+    let pd = f("prompt_eval_duration") as f64 / 1e9;
+    let ed = f("eval_duration") as f64 / 1e9;
+    USAGE.record(model, f("prompt_eval_count"), f("eval_count"), pd, ed, pd);
+}
+
+/// Token counts from the tail of an OpenAI/Anthropic/llama.cpp response.
+fn extract_usage(tail: &[u8]) -> Option<(u64, u64)> {
+    let s = String::from_utf8_lossy(tail);
+    for (i, _) in s.rmatch_indices("\"usage\"") {
+        let rest = &s[i + 7..];
+        let Some(colon) = rest.find(':') else { continue };
+        let mut it = serde_json::Deserializer::from_str(&rest[colon + 1..]).into_iter::<Value>();
+        if let Some(Ok(v)) = it.next() {
+            let g = |a: &str, b: &str| v.get(a).or_else(|| v.get(b)).and_then(|x| x.as_u64());
+            if let (Some(p), Some(c)) = (g("prompt_tokens", "input_tokens"), g("completion_tokens", "output_tokens")) {
+                return Some((p, c));
+            }
+        }
+    }
+    for (i, _) in s.rmatch_indices("\"timings\"") {
+        let rest = &s[i + 9..];
+        let Some(colon) = rest.find(':') else { continue };
+        let mut it = serde_json::Deserializer::from_str(&rest[colon + 1..]).into_iter::<Value>();
+        if let Some(Ok(v)) = it.next() {
+            if let (Some(p), Some(c)) = (v["prompt_n"].as_u64(), v["predicted_n"].as_u64()) {
+                return Some((p, c));
+            }
+        }
+    }
+    None
 }
 
 async fn lm_models(State(a): State<App>) -> Json<Value> {
@@ -899,6 +1105,7 @@ async fn lm_unload(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
 
 async fn lm_pull(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let Some(name) = model_field(&b) else { return err(StatusCode::BAD_REQUEST, "model is required") };
+    sys::log(&format!("pull requested: {name}"));
     let d = a.dl.start(a.hf.clone(), a.mgr.cfg(), &name);
     Json(json!(d.view())).into_response()
 }

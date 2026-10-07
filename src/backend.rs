@@ -5,6 +5,7 @@
 use crate::config::{log_dir, parse_duration, which, Config};
 use crate::models::{self, Format, LocalModel};
 use crate::sys;
+use crate::usage::EVENTS;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use std::process::Stdio;
@@ -21,6 +22,8 @@ pub struct Running {
     pub port: u16,
     pub pid: u32,
     pub log: std::path::PathBuf,
+    /// Backend-relevant config at spawn; differs from the current one => stale.
+    pub sig: String,
     child: tokio::sync::Mutex<Child>,
     pub loaded_at: SystemTime,
     pub load_secs: f64,
@@ -56,9 +59,11 @@ impl Drop for InFlight {
     fn drop(&mut self) {
         *self.0.last_used.lock().unwrap() = Instant::now();
         self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+        EVENTS.bump();
     }
 }
 fn enter(r: &Arc<Running>) -> InFlight {
+    EVENTS.bump();
     r.in_flight.fetch_add(1, Ordering::Relaxed);
     *r.last_used.lock().unwrap() = Instant::now();
     InFlight(r.clone())
@@ -77,11 +82,14 @@ pub struct RunningView {
     pub load_secs: f64,
     pub expires_in_secs: Option<u64>,
     pub log: String,
+    /// Settings changed since load; reload the model to apply them.
+    pub stale: bool,
 }
 
 pub struct Manager {
     pub cfg: RwLock<Config>,
     running: Mutex<Vec<Arc<Running>>>,
+    loading: Mutex<Option<String>>,
     load_lock: tokio::sync::Mutex<()>,
     cache: Mutex<Option<(Instant, Arc<Vec<LocalModel>>)>>,
     pub http: reqwest::Client,
@@ -92,6 +100,7 @@ impl Manager {
         Arc::new(Self {
             cfg: RwLock::new(cfg),
             running: Mutex::new(Vec::new()),
+            loading: Mutex::new(None),
             load_lock: tokio::sync::Mutex::new(()),
             cache: Mutex::new(None),
             http: reqwest::Client::builder()
@@ -155,6 +164,7 @@ impl Manager {
                 load_secs: r.load_secs,
                 expires_in_secs: r.expires_in().map(|d| d.as_secs()),
                 log: r.log.display().to_string(),
+                stale: r.sig != backend_sig(&self.cfg(), &r.model),
             })
             .collect()
     }
@@ -187,11 +197,41 @@ impl Manager {
             return Ok((enter(&r), 0.0));
         }
         let t0 = Instant::now();
-        self.make_room(&m).await?;
-        let r = self.spawn(&m, ka).await?;
+        self.loading.lock().unwrap().replace(m.name.clone());
+        EVENTS.bump();
+        let res = self.load_locked(&m, ka).await;
+        self.loading.lock().unwrap().take();
+        EVENTS.bump();
+        let r = res?;
         let guard = enter(&r);
         self.running.lock().unwrap().push(r);
         Ok((guard, t0.elapsed().as_secs_f64()))
+    }
+
+    async fn load_locked(&self, m: &LocalModel, ka: Option<Duration>) -> Result<Arc<Running>> {
+        self.make_room(m).await?;
+        self.spawn(m, ka).await
+    }
+
+    /// Model currently being loaded, if any.
+    pub fn loading(&self) -> Option<String> {
+        self.loading.lock().unwrap().clone()
+    }
+
+    /// Unload and load again (picks up changed settings), keeping keep_alive.
+    pub async fn restart(&self, name: &str) -> Result<f64> {
+        let m = self.resolve(name)?;
+        let ka = self.find(&m.name).map(|r| *r.keep_alive.lock().unwrap());
+        if let Some(r) = self.find(&m.name) {
+            self.stop(&r).await;
+        }
+        let ka_s = match ka {
+            Some(Some(d)) => Some(format!("{}s", d.as_secs())),
+            Some(None) => Some("-1".to_string()),
+            None => None,
+        };
+        let (_g, secs) = self.acquire(&m.name, ka_s.as_deref()).await?;
+        Ok(secs)
     }
 
     async fn make_room(&self, m: &LocalModel) -> Result<()> {
@@ -266,6 +306,10 @@ impl Manager {
                     a.push(shim.display().to_string());
                 }
                 a.extend(["--model".into(), m.path.display().to_string(), "--host".into(), "127.0.0.1".into(), "--port".into(), port.to_string()]);
+                a.extend(["--prompt-cache-size".into(), cfg.mlx.prompt_cache_size.to_string()]);
+                if cfg.mlx.prompt_cache_gib > 0.0 {
+                    a.extend(["--prompt-cache-bytes".into(), ((cfg.mlx.prompt_cache_gib * (1u64 << 30) as f64) as u64).to_string()]);
+                }
                 a.extend(cfg.mlx.extra_args.clone());
                 let mut env: Vec<(String, String)> = cfg.mlx.env.clone().into_iter().collect();
                 env.push(("LMDECK_MLX_BATCH".into(), if cfg.mlx.batching { "1" } else { "0" }.into()));
@@ -297,6 +341,10 @@ impl Manager {
                     "--alias".into(),
                     m.name.clone(),
                 ];
+                a.extend(["-ctk".into(), cfg.llama.cache_type_k.clone(), "-ctv".into(), cfg.llama.cache_type_v.clone()]);
+                if cfg.llama.cache_reuse > 0 {
+                    a.extend(["--cache-reuse".into(), cfg.llama.cache_reuse.to_string()]);
+                }
                 if cfg.llama.threads > 0 {
                     a.extend(["-t".into(), cfg.llama.threads.to_string()]);
                 }
@@ -346,6 +394,7 @@ impl Manager {
             port,
             pid,
             log: log.clone(),
+            sig: backend_sig(&cfg, m),
             child: tokio::sync::Mutex::new(child),
             loaded_at: SystemTime::now(),
             load_secs: 0.0,
@@ -438,6 +487,7 @@ impl Manager {
     pub async fn stop(&self, r: &Arc<Running>) {
         self.running.lock().unwrap().retain(|x| !Arc::ptr_eq(x, r));
         self.kill(r).await;
+        EVENTS.bump();
         sys::log(&format!("unloaded {}", r.name));
         if self.running().is_empty() {
             let h = self.cfg().hooks.on_idle;
@@ -495,6 +545,16 @@ impl Manager {
         }
         Ok(false)
     }
+}
+
+/// Fingerprint of everything that shapes a backend process for `m`.
+pub fn backend_sig(cfg: &Config, m: &LocalModel) -> String {
+    let ov = cfg.overrides.get(&m.name).map(|o| serde_json::to_string(o).unwrap_or_default()).unwrap_or_default();
+    let section = match m.format {
+        Format::Mlx => serde_json::to_string(&cfg.mlx).unwrap_or_default(),
+        Format::Gguf => serde_json::to_string(&cfg.llama).unwrap_or_default(),
+    };
+    format!("{section}|{ov}|{}", cfg.server.uclamp_boost)
 }
 
 fn free_port() -> Result<u16> {

@@ -3,7 +3,7 @@
 //! Omarchy theme applies.
 
 use crate::client::{self, Daemon};
-use crate::config::{log_dir, Config};
+use crate::config::{get_setting, log_dir, set_setting, Config, SETTINGS};
 use crate::hf::{self, RepoFile, RepoHit};
 use crate::human;
 use crate::models::{self, Format, LocalModel};
@@ -70,6 +70,7 @@ enum Input {
 
 #[derive(Clone)]
 enum Confirmed {
+    ForceStop,
     Delete(String),
     Run(Action),
 }
@@ -280,134 +281,6 @@ fn find_named(dir: &std::path::Path, name: &str, depth: u32, out: &mut Vec<std::
 }
 
 // ---------- settings table ----------
-
-const SETTINGS: &[(&str, &str)] = &[
-    ("server.host", "Listen address (127.0.0.1 keeps it local)"),
-    ("server.port", "Port (11434 = Ollama's, so clients work unchanged)"),
-    ("server.keep_alive", "Idle time before unloading: 5m, 1h, 0, -1 (forever)"),
-    ("server.max_loaded", "Models resident at once"),
-    ("server.load_timeout_secs", "Max seconds to load a model"),
-    ("server.mem_check", "Refuse loads that would not fit in RAM (true/false)"),
-    ("server.mem_reserve_gib", "RAM kept free for the desktop (GiB)"),
-    ("server.uclamp_boost", "Run backends under uclampset -m 1024 (helps on power-saver profiles)"),
-    ("models.hf_cache", "Hugging Face cache dir (empty = default)"),
-    ("models.extra_dirs", "Extra dirs with loose .gguf files (comma separated)"),
-    ("download.connections", "Parallel connections per large file"),
-    ("download.parallel_files", "Files downloaded at once"),
-    ("download.gguf_default_quant", "Quant used when a GGUF pull has no :tag"),
-    ("download.gguf_mmproj", "Also fetch vision projector (mmproj) for GGUF"),
-    ("mlx.command", "Command that starts the MLX server"),
-    ("mlx.fast_path", "Patch out mlx_lm.server's per-token GPU sync (~2x decode)"),
-    ("mlx.batching", "Batched generator: only for concurrent requests (slower per stream)"),
-    ("mlx.extra_args", "Extra mlx_lm.server args (e.g. --prompt-cache-size 4)"),
-    ("mlx.env", "Env for MLX backend, K=V,K=V (e.g. MLX_OMARCHY_GDN_RAW_REPEAT=0)"),
-    ("llama.server_path", "llama-server binary (empty = lmdeck build, then PATH)"),
-    ("llama.gpu_layers", "Layers offloaded to the GPU (999 = all)"),
-    ("llama.ctx_size", "Context window for GGUF models"),
-    ("llama.flash_attn", "Flash attention: on / off / auto"),
-    ("llama.threads", "CPU threads (0 = auto)"),
-    ("llama.parallel", "Parallel request slots"),
-    ("llama.extra_args", "Extra llama-server args (e.g. --cache-type-k q8_0)"),
-    ("llama.env", "Env for llama backend, K=V,K=V"),
-    ("llama.git_ref", "llama.cpp branch/tag to build"),
-    ("hooks.on_load", "Shell cmd before first model loads (e.g. tuned-adm profile asahi-performance)"),
-    ("hooks.on_idle", "Shell cmd after last model unloads"),
-];
-
-fn kv_join(m: &std::collections::BTreeMap<String, String>) -> String {
-    m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(",")
-}
-fn kv_parse(s: &str) -> std::collections::BTreeMap<String, String> {
-    s.split(',').filter_map(|p| p.split_once('=')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect()
-}
-fn words(s: &str) -> Vec<String> {
-    s.split_whitespace().map(str::to_string).collect()
-}
-
-fn get_setting(c: &Config, key: &str) -> String {
-    match key {
-        "server.host" => c.server.host.clone(),
-        "server.port" => c.server.port.to_string(),
-        "server.keep_alive" => c.server.keep_alive.clone(),
-        "server.max_loaded" => c.server.max_loaded.to_string(),
-        "server.load_timeout_secs" => c.server.load_timeout_secs.to_string(),
-        "server.mem_check" => c.server.mem_check.to_string(),
-        "server.mem_reserve_gib" => c.server.mem_reserve_gib.to_string(),
-        "server.uclamp_boost" => c.server.uclamp_boost.to_string(),
-        "models.hf_cache" => c.models.hf_cache.clone(),
-        "models.extra_dirs" => c.models.extra_dirs.join(","),
-        "download.connections" => c.download.connections.to_string(),
-        "download.parallel_files" => c.download.parallel_files.to_string(),
-        "download.gguf_default_quant" => c.download.gguf_default_quant.clone(),
-        "download.gguf_mmproj" => c.download.gguf_mmproj.to_string(),
-        "mlx.command" => c.mlx.command.join(" "),
-        "mlx.fast_path" => c.mlx.fast_path.to_string(),
-        "mlx.batching" => c.mlx.batching.to_string(),
-        "mlx.extra_args" => c.mlx.extra_args.join(" "),
-        "mlx.env" => kv_join(&c.mlx.env),
-        "llama.server_path" => c.llama.server_path.clone(),
-        "llama.gpu_layers" => c.llama.gpu_layers.to_string(),
-        "llama.ctx_size" => c.llama.ctx_size.to_string(),
-        "llama.flash_attn" => c.llama.flash_attn.clone(),
-        "llama.threads" => c.llama.threads.to_string(),
-        "llama.parallel" => c.llama.parallel.to_string(),
-        "llama.extra_args" => c.llama.extra_args.join(" "),
-        "llama.env" => kv_join(&c.llama.env),
-        "llama.git_ref" => c.llama.git_ref.clone(),
-        "hooks.on_load" => c.hooks.on_load.clone(),
-        "hooks.on_idle" => c.hooks.on_idle.clone(),
-        _ => String::new(),
-    }
-}
-
-fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
-    let v = v.trim();
-    let num = |s: &str| s.parse::<u64>().map_err(|_| format!("'{s}' is not a number"));
-    let boolean = |s: &str| match s {
-        "true" | "yes" | "on" | "1" => Ok(true),
-        "false" | "no" | "off" | "0" => Ok(false),
-        _ => Err(format!("'{s}' is not true/false")),
-    };
-    match key {
-        "server.host" => c.server.host = v.into(),
-        "server.port" => c.server.port = num(v)? as u16,
-        "server.keep_alive" => c.server.keep_alive = v.into(),
-        "server.max_loaded" => c.server.max_loaded = num(v)?.max(1) as usize,
-        "server.load_timeout_secs" => c.server.load_timeout_secs = num(v)?,
-        "server.mem_check" => c.server.mem_check = boolean(v)?,
-        "server.mem_reserve_gib" => c.server.mem_reserve_gib = v.parse().map_err(|_| "not a number".to_string())?,
-        "server.uclamp_boost" => c.server.uclamp_boost = boolean(v)?,
-        "models.hf_cache" => c.models.hf_cache = v.into(),
-        "models.extra_dirs" => c.models.extra_dirs = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-        "download.connections" => c.download.connections = num(v)?.clamp(1, 32) as usize,
-        "download.parallel_files" => c.download.parallel_files = num(v)?.clamp(1, 16) as usize,
-        "download.gguf_default_quant" => c.download.gguf_default_quant = v.into(),
-        "download.gguf_mmproj" => c.download.gguf_mmproj = boolean(v)?,
-        "mlx.command" => c.mlx.command = words(v),
-        "mlx.fast_path" => c.mlx.fast_path = boolean(v)?,
-        "mlx.batching" => c.mlx.batching = boolean(v)?,
-        "mlx.extra_args" => c.mlx.extra_args = words(v),
-        "mlx.env" => c.mlx.env = kv_parse(v),
-        "llama.server_path" => c.llama.server_path = v.into(),
-        "llama.gpu_layers" => c.llama.gpu_layers = v.parse().map_err(|_| "not a number".to_string())?,
-        "llama.ctx_size" => c.llama.ctx_size = num(v)? as u32,
-        "llama.flash_attn" => {
-            if !["on", "off", "auto"].contains(&v) {
-                return Err("use on, off or auto".into());
-            }
-            c.llama.flash_attn = v.into()
-        }
-        "llama.threads" => c.llama.threads = num(v)? as u32,
-        "llama.parallel" => c.llama.parallel = num(v)?.max(1) as u32,
-        "llama.extra_args" => c.llama.extra_args = words(v),
-        "llama.env" => c.llama.env = kv_parse(v),
-        "llama.git_ref" => c.llama.git_ref = v.into(),
-        "hooks.on_load" => c.hooks.on_load = v.into(),
-        "hooks.on_idle" => c.hooks.on_idle = v.into(),
-        _ => return Err("unknown setting".into()),
-    }
-    Ok(())
-}
 
 // ---------- state & events ----------
 
@@ -628,6 +501,14 @@ impl Ui {
 
     fn confirmed(&mut self, c: Confirmed) -> Option<Action> {
         match c {
+            Confirmed::ForceStop => {
+                let pid = self.status.as_ref().and_then(|s| s["pid"].as_u64()).map(|p| p as u32);
+                match client::force_stop(pid) {
+                    Ok(()) => self.toast("force-stopped lmdeck and its backends"),
+                    Err(e) => self.toast(format!("force stop failed: {e}")),
+                }
+                None
+            }
             Confirmed::Delete(name) => {
                 let cfg = self.cfg.clone();
                 let tx = self.tx.clone();
@@ -681,6 +562,16 @@ impl Ui {
                         Err(e) => self.toast(format!("start failed: {e}")),
                     }
                 }
+            }
+            KeyCode::Char('R') => self.spawn_daemon_op("reloading models to apply settings".into(), |d| async move {
+                d.restart(None).await?;
+                Ok("reloaded".into())
+            }),
+            KeyCode::Char('X') => {
+                self.input = Input::Confirm(
+                    "Force-stop lmdeck (SIGKILL server + all model backends)? [y/N]".into(),
+                    Confirmed::ForceStop,
+                );
             }
             KeyCode::Char('S') => match sys::install_service() {
                 Ok(()) => self.toast("user service installed & enabled (starts at login)"),
@@ -825,17 +716,10 @@ impl Ui {
     fn repo_choices(&self) -> Vec<(String, String, u64)> {
         let Some(rv) = &self.repo else { return vec![] };
         let Some(files) = &rv.files else { return vec![] };
-        let mut out = Vec::new();
-        let has_st = files.iter().any(|f| f.path.ends_with(".safetensors")) && files.iter().any(|f| f.path == "config.json");
-        if has_st {
-            let size: u64 = files.iter().filter(|f| !f.path.ends_with(".gguf")).map(|f| f.size).sum();
-            out.push((rv.repo.clone(), "MLX / safetensors (whole repo)".into(), size));
-        }
-        for (q, s) in hf::gguf_quants(files) {
-            let star = if q.eq_ignore_ascii_case(&self.cfg.download.gguf_default_quant) { " ★" } else { "" };
-            out.push((format!("{}:{q}", rv.repo), format!("GGUF {q}{star}"), s));
-        }
-        out
+        hf::choices(&rv.repo, files, &self.cfg.download.gguf_default_quant)
+            .into_iter()
+            .map(|c| (c.spec, if c.default && c.format == "gguf" { format!("{} ★", c.label) } else { c.label }, c.size))
+            .collect()
     }
 
     fn key_discover(&mut self, k: KeyEvent) -> Option<Action> {
@@ -990,7 +874,7 @@ impl Ui {
             Tab::Logs => self.draw_logs(f, body),
         }
         let help = match self.tab {
-            Tab::Dashboard => "s start/stop · S service · a unload all · M migrate · U update MLX · B build llama.cpp · D launcher · C clear downloads · r recheck",
+            Tab::Dashboard => "s start/stop · X force stop · R reload stale · S service · a unload all · M migrate · U update · B llama.cpp · D launcher · C clear dl",
             Tab::Models => "⏎ load · u unload · c chat · x context · d delete · y copy name · r rescan",
             Tab::Discover => {
                 if self.repo.is_some() {
@@ -1004,7 +888,7 @@ impl Ui {
         };
         let foot_line = match &self.toast {
             Some((t, _)) => Line::from(Span::styled(t.clone(), Style::new().fg(Color::Yellow))),
-            None => Line::from(vec![Span::styled(help, Style::new().fg(Color::DarkGray)), Span::styled("  · 1-5 tabs · q quit", Style::new().fg(Color::DarkGray))]),
+            None => Line::from(vec![Span::styled(help, Style::new().fg(Color::DarkGray)), Span::styled("  · q closes TUI (server keeps running)", Style::new().fg(Color::DarkGray))]),
         };
         f.render_widget(foot_line, foot);
         self.draw_input(f);
@@ -1030,7 +914,8 @@ impl Ui {
 
     fn draw_dashboard(&self, f: &mut Frame, area: Rect) {
         let [left, right] = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
-        let [srv, loaded, dls] = Layout::vertical([Constraint::Length(9), Constraint::Min(4), Constraint::Length(8)]).areas(left);
+        let [srv, loaded, usage_area, dls] =
+            Layout::vertical([Constraint::Length(10), Constraint::Min(4), Constraint::Length(9), Constraint::Length(7)]).areas(left);
 
         // Server
         let mut lines = vec![];
@@ -1058,6 +943,23 @@ impl Ui {
         lines.push(kv("Policy", &format!("keep {} · max {} loaded · uclamp {}", self.cfg.server.keep_alive, self.cfg.server.max_loaded, if self.cfg.server.uclamp_boost { "on" } else { "off" })));
         let (total, avail) = sys::mem();
         lines.push(kv("Memory", &format!("{} free of {}", human(avail), human(total))));
+        if let Some(st) = &self.status {
+            let exposed = st["host"].as_str() == Some("0.0.0.0");
+            let ip = st["ips"]
+                .as_array()
+                .and_then(|a| a.iter().find(|i| !i["iface"].as_str().unwrap_or("").starts_with("docker")).or(a.first()))
+                .and_then(|i| i["ip"].as_str())
+                .unwrap_or("-")
+                .to_string();
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:<12}", "LAN"), Style::new().fg(Color::DarkGray)),
+                if exposed {
+                    Span::styled(format!("http://{ip}:{} (exposed)", self.cfg.server.port), Style::new().fg(Color::Yellow))
+                } else {
+                    Span::raw(format!("{ip} · local only (server.host)"))
+                },
+            ]));
+        }
         f.render_widget(Paragraph::new(lines).block(panel("Server")), srv);
 
         // Loaded models
@@ -1077,7 +979,11 @@ impl Ui {
                     } else {
                         r["expires_in_secs"].as_u64().map(|s| format!("{}", dur(s))).unwrap_or("∞".into())
                     }),
-                    Cell::from(format!("{:.1}s", r["load_secs"].as_f64().unwrap_or(0.0))),
+                    Cell::from(if r["stale"].as_bool() == Some(true) {
+                        Span::styled("⟳ R", Style::new().fg(Color::Yellow))
+                    } else {
+                        Span::raw(format!("{:.1}s", r["load_secs"].as_f64().unwrap_or(0.0)))
+                    }),
                 ])
             })
             .collect();
@@ -1091,6 +997,7 @@ impl Ui {
             f.render_widget(Paragraph::new("nothing loaded — models load on first request").fg(Color::DarkGray), inner);
         }
 
+        self.draw_usage(f, usage_area);
         self.draw_downloads(f, dls);
 
         // Runtime
@@ -1137,6 +1044,11 @@ impl Ui {
         }
         rl.push(kv("  offload", &format!("ngl {} · ctx {} · fa {}", self.cfg.llama.gpu_layers, self.cfg.llama.ctx_size, self.cfg.llama.flash_attn)));
         rl.push(Line::raw(""));
+        rl.push(Line::from(vec![Span::styled("Cache        ", Style::new().fg(Color::Cyan).bold()), Span::raw(format!("keep {} · max {} loaded", self.cfg.server.keep_alive, self.cfg.server.max_loaded))]));
+        rl.push(kv("  MLX", &format!("prompt cache {} entries{}", self.cfg.mlx.prompt_cache_size, if self.cfg.mlx.prompt_cache_gib > 0.0 { format!(" · ≤{} GiB", self.cfg.mlx.prompt_cache_gib) } else { String::new() })));
+        rl.push(kv("  GGUF", &format!("KV {}/{} · reuse {} · ctx {}", self.cfg.llama.cache_type_k, self.cfg.llama.cache_type_v, self.cfg.llama.cache_reuse, self.cfg.llama.ctx_size)));
+        rl.push(Line::from(Span::styled("  edit in Settings (4) or the bar panel", Style::new().fg(Color::DarkGray))));
+        rl.push(Line::raw(""));
         let n_mlx = self.models.iter().filter(|m| m.format == Format::Mlx).count();
         let disk: u64 = self.models.iter().map(|m| m.size).sum();
         rl.push(Line::from(vec![
@@ -1144,6 +1056,50 @@ impl Ui {
             Span::raw(format!("{} MLX · {} GGUF · {} on disk", n_mlx, self.models.len() - n_mlx, human(disk))),
         ]));
         f.render_widget(Paragraph::new(rl).wrap(Wrap { trim: false }).block(panel("Runtimes")), right);
+    }
+
+    fn draw_usage(&self, f: &mut Frame, area: Rect) {
+        let u = self.status.as_ref().map(|s| s["usage"].clone()).unwrap_or(Value::Null);
+        let mut l = vec![];
+        let today = &u["today"];
+        l.push(kv(
+            "Today",
+            &format!(
+                "{} requests · {} in · {} out",
+                today["requests"].as_u64().unwrap_or(0),
+                compact(today["prompt"].as_u64().unwrap_or(0)),
+                compact(today["completion"].as_u64().unwrap_or(0))
+            ),
+        ));
+        match u["last"].as_object() {
+            Some(last) => l.push(kv(
+                "Last",
+                &format!(
+                    "{:.1} tok/s gen · {:.0} tok/s prefill · ttft {:.2}s",
+                    last.get("gen_tps").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    last.get("prompt_tps").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    last.get("ttft_secs").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                ),
+            )),
+            None => l.push(kv("Last", "no requests yet")),
+        }
+        // 7-day sparkline of tokens
+        if let Some(week) = u["week"].as_array() {
+            let vals: Vec<u64> = week.iter().map(|d| d["tokens"].as_u64().unwrap_or(0)).collect();
+            let peak = vals.iter().copied().max().unwrap_or(0).max(1);
+            let bars = "▁▂▃▄▅▆▇█";
+            let spark: String = vals.iter().map(|v| bars.chars().nth(((*v as f64 / peak as f64) * 7.0).round() as usize).unwrap_or('▁')).collect();
+            l.push(kv("7 days", &format!("{spark}  peak {}", compact(peak))));
+        }
+        for m in u["models"].as_array().cloned().unwrap_or_default().iter().take(area.height.saturating_sub(5) as usize) {
+            let name = m["model"].as_str().unwrap_or("");
+            let tokens = m["prompt"].as_u64().unwrap_or(0) + m["completion"].as_u64().unwrap_or(0);
+            l.push(Line::from(vec![
+                Span::styled(format!("  {:>7} ", compact(tokens)), Style::new().fg(Color::DarkGray)),
+                Span::raw(name.to_string()),
+            ]));
+        }
+        f.render_widget(Paragraph::new(l).block(panel("Usage")), area);
     }
 
     fn draw_downloads(&self, f: &mut Frame, area: Rect) {

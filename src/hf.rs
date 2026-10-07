@@ -165,6 +165,30 @@ pub fn gguf_quants(files: &[RepoFile]) -> Vec<(String, u64)> {
     m
 }
 
+/// Downloadable variants of a repo: the MLX/safetensors repo and each GGUF quant.
+#[derive(Debug, Clone, Serialize)]
+pub struct Choice {
+    pub spec: String,
+    pub label: String,
+    pub size: u64,
+    pub format: &'static str,
+    pub default: bool,
+}
+
+pub fn choices(repo: &str, files: &[RepoFile], default_quant: &str) -> Vec<Choice> {
+    let mut out = Vec::new();
+    let has_st = files.iter().any(|f| f.path.ends_with(".safetensors")) && files.iter().any(|f| f.path == "config.json");
+    if has_st {
+        let size = files.iter().filter(|f| !f.path.ends_with(".gguf")).map(|f| f.size).sum();
+        out.push(Choice { spec: repo.to_string(), label: "MLX / safetensors".into(), size, format: "mlx", default: true });
+    }
+    for (q, size) in gguf_quants(files) {
+        let default = q.eq_ignore_ascii_case(default_quant);
+        out.push(Choice { spec: format!("{repo}:{q}"), label: format!("GGUF {q}"), size, format: "gguf", default });
+    }
+    out
+}
+
 // ---------- pull planning ----------
 
 #[derive(Debug, Clone, Serialize)]
@@ -348,6 +372,7 @@ impl Downloads {
             started: Instant::now(),
         });
         map.insert(key.clone(), d.clone());
+        crate::usage::EVENTS.bump();
         let dd = d.clone();
         tokio::spawn(async move {
             match pull(&c, &cfg, &key, &dd).await {
@@ -358,6 +383,7 @@ impl Downloads {
                 }
                 Err(e) => dd.set(DlStatus::Failed(format!("{e:#}"))),
             }
+            crate::usage::EVENTS.bump();
         });
         d
     }
