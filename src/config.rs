@@ -36,6 +36,14 @@ pub struct ServerCfg {
     pub mem_reserve_gib: f64,
     /// Skip the memory admission check entirely.
     pub mem_check: bool,
+    /// Refuse GPU loads that exceed the GPU memory budget (Asahi gives the GPU
+    /// ~half of RAM; overcommitting it can hang the whole machine).
+    pub gpu_mem_check: bool,
+    /// GPU heap per model backend (HK_SYSMEM, per process only):
+    /// "auto" = raise above the stock 50%-of-RAM heap only when a model needs
+    /// it, capped by available RAM minus the reserve; "stock" = never raise;
+    /// a number = that many GiB.
+    pub gpu_heap: String,
     /// Run backends with `uclampset -m 1024` so the CPU-side dispatch thread
     /// is not parked at low clocks by schedutil (big win for decode latency).
     pub uclamp_boost: bool,
@@ -77,6 +85,14 @@ pub struct MlxCfg {
     pub prompt_cache_size: u32,
     /// Cap on prompt cache memory in GiB (0 = no cap).
     pub prompt_cache_gib: f64,
+    /// Quantize the KV cache to 4 or 8 bits (0 = f16). Needs runtime support;
+    /// the launcher probes it and falls back to f16.
+    pub kv_bits: u32,
+    pub kv_group_size: u32,
+    /// Start quantizing once the context passes this many tokens.
+    pub quantized_kv_start: u32,
+    /// Rotating KV window in tokens (0 = unbounded).
+    pub max_kv_size: u32,
     pub extra_args: Vec<String>,
     pub env: BTreeMap<String, String>,
 }
@@ -130,6 +146,9 @@ impl Default for UsageCfg {
 #[serde(default)]
 pub struct ModelOverride {
     pub ctx_size: Option<u32>,
+    /// "cpu" runs this model on the CPU (discouraged; for models whose ops
+    /// have no Apple GPU kernel yet). Unset/"gpu" = Apple GPU.
+    pub device: Option<String>,
     pub keep_alive: Option<String>,
     pub extra_args: Vec<String>,
     pub env: BTreeMap<String, String>,
@@ -161,6 +180,8 @@ impl Default for ServerCfg {
             load_timeout_secs: 900,
             mem_reserve_gib: 3.0,
             mem_check: true,
+            gpu_mem_check: true,
+            gpu_heap: "auto".into(),
             uclamp_boost: true,
         }
     }
@@ -191,6 +212,10 @@ impl Default for MlxCfg {
             batching: false,
             prompt_cache_size: 10,
             prompt_cache_gib: 0.0,
+            kv_bits: 0,
+            kv_group_size: 64,
+            quantized_kv_start: 512,
+            max_kv_size: 0,
             extra_args: vec![],
             env: BTreeMap::new(),
         }
@@ -334,43 +359,50 @@ fn is_executable(p: &Path) -> bool {
 
 // ---------- editable settings (shared by TUI, daemon API and bar panel) ----------
 
-pub const SETTINGS: &[(&str, &str)] = &[
-    ("server.host", "Listen address (127.0.0.1 keeps it local)"),
-    ("server.port", "Port (11434 = Ollama's, so clients work unchanged)"),
-    ("server.keep_alive", "Idle time before unloading: 5m, 1h, 0, -1 (forever)"),
-    ("server.max_loaded", "Models resident at once"),
-    ("server.load_timeout_secs", "Max seconds to load a model"),
-    ("server.mem_check", "Refuse loads that would not fit in RAM (true/false)"),
-    ("server.mem_reserve_gib", "RAM kept free for the desktop (GiB)"),
-    ("server.uclamp_boost", "Run backends under uclampset -m 1024 (helps on power-saver profiles)"),
-    ("models.hf_cache", "Hugging Face cache dir (empty = default)"),
-    ("models.extra_dirs", "Extra dirs with loose .gguf files (comma separated)"),
-    ("download.connections", "Parallel connections per large file"),
-    ("download.parallel_files", "Files downloaded at once"),
-    ("download.gguf_default_quant", "Quant used when a GGUF pull has no :tag"),
-    ("download.gguf_mmproj", "Also fetch vision projector (mmproj) for GGUF"),
-    ("mlx.command", "Command that starts the MLX server"),
-    ("mlx.fast_path", "Patch out mlx_lm.server's per-token GPU sync (~2x decode)"),
-    ("mlx.batching", "Batched generator: only for concurrent requests (slower per stream)"),
-    ("mlx.prompt_cache_size", "MLX prompt (KV) cache entries reused across requests (0 = off)"),
-    ("mlx.prompt_cache_gib", "Cap on MLX prompt cache memory in GiB (0 = no cap)"),
-    ("mlx.extra_args", "Extra mlx_lm.server args (e.g. --prompt-cache-size 4)"),
-    ("mlx.env", "Env for MLX backend, K=V,K=V (e.g. MLX_OMARCHY_GDN_RAW_REPEAT=0)"),
-    ("llama.server_path", "llama-server binary (empty = lmdeck build, then PATH)"),
-    ("llama.gpu_layers", "Layers offloaded to the GPU (999 = all)"),
-    ("llama.ctx_size", "Context window for GGUF models"),
-    ("llama.flash_attn", "Flash attention: on / off / auto"),
-    ("llama.threads", "CPU threads (0 = auto)"),
-    ("llama.parallel", "Parallel request slots"),
-    ("llama.cache_type_k", "KV cache type for K: f16 / q8_0 / q4_0 (q8_0 halves KV memory)"),
-    ("llama.cache_type_v", "KV cache type for V: f16 / q8_0 / q4_0 (needs flash attention)"),
-    ("llama.cache_reuse", "Reuse cached prompt chunks ≥ N tokens across requests (0 = off)"),
-    ("llama.extra_args", "Extra llama-server args (e.g. --cache-type-k q8_0)"),
-    ("llama.env", "Env for llama backend, K=V,K=V"),
-    ("llama.git_ref", "llama.cpp branch/tag to build"),
-    ("hooks.on_load", "Shell cmd before first model loads (e.g. tuned-adm profile asahi-performance)"),
-    ("hooks.on_idle", "Shell cmd after last model unloads"),
-    ("usage.omarchy_record", "Show lmdeck token usage in the Omarchy agents bar panel"),
+/// (section, key, help). Sections group the TUI Settings tab and the bar panel.
+pub const SETTINGS: &[(&str, &str, &str)] = &[
+    ("Server", "server.host", "Listen address: 127.0.0.1 = this machine, 0.0.0.0 = LAN"),
+    ("Server", "server.port", "Port (11434 = Ollama's, so clients work unchanged)"),
+    ("Server", "server.load_timeout_secs", "Max seconds to load a model"),
+    ("Server", "server.uclamp_boost", "Run backends under uclampset -m 1024 (helps on power-saver)"),
+    ("Memory & residency", "server.keep_alive", "Idle time before unloading: 5m, 1h, 0, -1 (forever)"),
+    ("Memory & residency", "server.max_loaded", "Models resident at once"),
+    ("Memory & residency", "server.mem_check", "Refuse loads that would not fit in RAM (true/false)"),
+    ("Memory & residency", "server.mem_reserve_gib", "RAM kept free for the desktop (GiB)"),
+    ("Memory & residency", "server.gpu_heap", "GPU heap per model: auto (raise only when needed, per process) / stock (50% of RAM) / N GiB"),
+    ("Memory & residency", "server.gpu_mem_check", "Refuse GPU loads over the GPU memory budget (turning this off can freeze the machine)"),
+    ("KV cache · MLX", "mlx.kv_bits", "MLX KV quantization: 0 = f16, 8 or 4 bits (probed; falls back to f16)"),
+    ("KV cache · MLX", "mlx.kv_group_size", "MLX KV quantization group size (32 / 64 / 128)"),
+    ("KV cache · MLX", "mlx.quantized_kv_start", "MLX: quantize KV once the context passes N tokens"),
+    ("KV cache · MLX", "mlx.max_kv_size", "MLX rotating KV window in tokens (0 = unbounded)"),
+    ("KV cache · MLX", "mlx.prompt_cache_size", "MLX prompt caches kept between requests (0 = no reuse)"),
+    ("KV cache · MLX", "mlx.prompt_cache_gib", "Cap on MLX prompt cache memory in GiB (0 = no cap)"),
+    ("KV cache · GGUF", "llama.ctx_size", "GGUF context window (KV is allocated for all of it)"),
+    ("KV cache · GGUF", "llama.cache_type_k", "GGUF K cache type: f16 / q8_0 / q4_0 (q8_0 halves KV memory)"),
+    ("KV cache · GGUF", "llama.cache_type_v", "GGUF V cache type: f16 / q8_0 / q4_0 (needs flash attention)"),
+    ("KV cache · GGUF", "llama.cache_reuse", "GGUF: reuse cached prompt chunks ≥ N tokens (0 = off)"),
+    ("MLX backend", "mlx.command", "Command that starts the MLX server"),
+    ("MLX backend", "mlx.fast_path", "Patch out mlx_lm.server's per-token GPU sync (~2x decode)"),
+    ("MLX backend", "mlx.batching", "Batched generator: only for concurrent requests (slower per stream)"),
+    ("MLX backend", "mlx.extra_args", "Extra mlx_lm.server args"),
+    ("MLX backend", "mlx.env", "Env for the MLX backend, K=V,K=V (e.g. MLX_OMARCHY_GDN_RAW_REPEAT=0)"),
+    ("llama.cpp backend", "llama.server_path", "llama-server binary (empty = lmdeck build, then PATH)"),
+    ("llama.cpp backend", "llama.gpu_layers", "Layers offloaded to the GPU (999 = all)"),
+    ("llama.cpp backend", "llama.flash_attn", "Flash attention: on / off / auto"),
+    ("llama.cpp backend", "llama.threads", "CPU threads (0 = auto)"),
+    ("llama.cpp backend", "llama.parallel", "Parallel request slots"),
+    ("llama.cpp backend", "llama.extra_args", "Extra llama-server args"),
+    ("llama.cpp backend", "llama.env", "Env for the llama backend, K=V,K=V"),
+    ("llama.cpp backend", "llama.git_ref", "llama.cpp branch/tag to build"),
+    ("Downloads & storage", "models.hf_cache", "Hugging Face cache dir (empty = default)"),
+    ("Downloads & storage", "models.extra_dirs", "Extra dirs with loose .gguf files (comma separated)"),
+    ("Downloads & storage", "download.connections", "Parallel connections per large file"),
+    ("Downloads & storage", "download.parallel_files", "Files downloaded at once"),
+    ("Downloads & storage", "download.gguf_default_quant", "Quant used when a GGUF pull has no :tag"),
+    ("Downloads & storage", "download.gguf_mmproj", "Also fetch the vision projector (mmproj) for GGUF"),
+    ("Integration", "hooks.on_load", "Shell cmd before the first model loads (e.g. tuned-adm profile asahi-performance)"),
+    ("Integration", "hooks.on_idle", "Shell cmd after the last model unloads"),
+    ("Integration", "usage.omarchy_record", "Show lmdeck token usage in the Omarchy agents bar panel"),
 ];
 
 pub fn kv_join(m: &std::collections::BTreeMap<String, String>) -> String {
@@ -391,6 +423,8 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "server.max_loaded" => c.server.max_loaded.to_string(),
         "server.load_timeout_secs" => c.server.load_timeout_secs.to_string(),
         "server.mem_check" => c.server.mem_check.to_string(),
+        "server.gpu_mem_check" => c.server.gpu_mem_check.to_string(),
+        "server.gpu_heap" => c.server.gpu_heap.clone(),
         "server.mem_reserve_gib" => c.server.mem_reserve_gib.to_string(),
         "server.uclamp_boost" => c.server.uclamp_boost.to_string(),
         "models.hf_cache" => c.models.hf_cache.clone(),
@@ -404,6 +438,10 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "mlx.batching" => c.mlx.batching.to_string(),
         "mlx.prompt_cache_size" => c.mlx.prompt_cache_size.to_string(),
         "mlx.prompt_cache_gib" => c.mlx.prompt_cache_gib.to_string(),
+        "mlx.kv_bits" => c.mlx.kv_bits.to_string(),
+        "mlx.kv_group_size" => c.mlx.kv_group_size.to_string(),
+        "mlx.quantized_kv_start" => c.mlx.quantized_kv_start.to_string(),
+        "mlx.max_kv_size" => c.mlx.max_kv_size.to_string(),
         "mlx.extra_args" => c.mlx.extra_args.join(" "),
         "mlx.env" => kv_join(&c.mlx.env),
         "llama.server_path" => c.llama.server_path.clone(),
@@ -440,6 +478,13 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "server.max_loaded" => c.server.max_loaded = num(v)?.max(1) as usize,
         "server.load_timeout_secs" => c.server.load_timeout_secs = num(v)?,
         "server.mem_check" => c.server.mem_check = boolean(v)?,
+        "server.gpu_mem_check" => c.server.gpu_mem_check = boolean(v)?,
+        "server.gpu_heap" => {
+            if v != "auto" && v != "stock" && v.parse::<f64>().map(|g| !(4.0..=60.0).contains(&g)).unwrap_or(true) {
+                return Err("use auto, stock, or a size in GiB (4–60)".into());
+            }
+            c.server.gpu_heap = v.into()
+        }
         "server.mem_reserve_gib" => c.server.mem_reserve_gib = v.parse().map_err(|_| "not a number".to_string())?,
         "server.uclamp_boost" => c.server.uclamp_boost = boolean(v)?,
         "models.hf_cache" => c.models.hf_cache = v.into(),
@@ -453,6 +498,22 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "mlx.batching" => c.mlx.batching = boolean(v)?,
         "mlx.prompt_cache_size" => c.mlx.prompt_cache_size = num(v)? as u32,
         "mlx.prompt_cache_gib" => c.mlx.prompt_cache_gib = v.parse().map_err(|_| "not a number".to_string())?,
+        "mlx.kv_bits" => {
+            let b = num(v)? as u32;
+            if ![0, 4, 8].contains(&b) {
+                return Err("use 0, 4 or 8".into());
+            }
+            c.mlx.kv_bits = b
+        }
+        "mlx.kv_group_size" => {
+            let g = num(v)? as u32;
+            if ![32, 64, 128].contains(&g) {
+                return Err("use 32, 64 or 128".into());
+            }
+            c.mlx.kv_group_size = g
+        }
+        "mlx.quantized_kv_start" => c.mlx.quantized_kv_start = num(v)? as u32,
+        "mlx.max_kv_size" => c.mlx.max_kv_size = num(v)? as u32,
         "mlx.extra_args" => c.mlx.extra_args = words(v),
         "mlx.env" => c.mlx.env = kv_parse(v),
         "llama.server_path" => c.llama.server_path = v.into(),

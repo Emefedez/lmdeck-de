@@ -64,6 +64,21 @@ pub fn tail(p: &Path, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// The most useful line of a crashed backend's log: the last Python exception
+/// or llama.cpp error, else the last non-empty line.
+pub fn error_summary(p: &Path) -> String {
+    let text = read_tail(p, 64 * 1024);
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("-----")).collect();
+    let is_err = |l: &&str| {
+        let head = l.split(':').next().unwrap_or("");
+        (head.ends_with("Error") || head.ends_with("Exception")) && !head.contains(' ')
+            || l.starts_with("error:")
+            || l.contains("failed to load model")
+            || l.contains("error loading model")
+    };
+    lines.iter().rev().find(|l| is_err(l)).or(lines.last()).map(|l| l.chars().take(400).collect()).unwrap_or_default()
+}
+
 pub fn read_tail(p: &Path, max: u64) -> String {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(p) else { return String::new() };
@@ -213,6 +228,35 @@ const HEADER: &str = r#"set -uo pipefail
 say() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mnote:\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Omarchy for Mac lists the upstream [omarchy] repo as `Usage = Sync`: pacman
+# can see omarchy-mlx there but `pacman -S`/omarchy-pkg-add refuse to install
+# from it. Fetch the same signed packages from that repo and install them with
+# `pacman -U` (signatures are still verified against the pacman keyring).
+omarchy_repo_urls() {
+  local server db f p
+  server="$(pacman-conf --repo=omarchy Server 2>/dev/null | head -n1)"
+  db=/var/lib/pacman/sync/omarchy.db
+  [[ -n $server && -r $db ]] || return 1
+  for p in "$@"; do
+    f="$(tar -xOf "$db" --wildcards "$p-[0-9]*/desc" 2>/dev/null | awk '/^%FILENAME%/{getline; print; exit}')"
+    [[ -n $f ]] || { echo "not in [omarchy] repo db: $p" >&2; return 1; }
+    printf '%s/%s\n' "$server" "$f"
+  done
+}
+omarchy_repo_version() {
+  tar -xOf /var/lib/pacman/sync/omarchy.db --wildcards "$1-[0-9]*/desc" 2>/dev/null | awk '/^%VERSION%/{getline; print; exit}'
+}
+install_mlx_pkgs() {
+  if command -v omarchy-pkg-add >/dev/null && omarchy-pkg-add "$@" 2>/dev/null; then
+    return 0
+  fi
+  warn "omarchy-pkg-add can't install from [omarchy] here (repo is sync-only on Omarchy for Mac); installing the signed packages directly"
+  mapfile -t urls < <(omarchy_repo_urls "$@") || return 1
+  ((${#urls[@]})) || return 1
+  printf '   %s\n' "${urls[@]}"
+  sudo pacman -U --needed "${urls[@]}"
+}
 "#;
 
 /// Move a legacy `install.sh` ($HOME venv) install to the Omarchy packages.
@@ -227,15 +271,8 @@ else
   warn "No legacy venv under $HOME/{LEGACY_PREFIX}; installing packages only."
 fi
 
-say "1/4 Installing packages with Omarchy's package helper"
-if command -v omarchy-pkg-add >/dev/null; then
-  omarchy-pkg-add {pkgs} || {{
-    warn "omarchy-pkg-add failed; trying the AUR helper (omarchy-pkg-aur-add)"
-    omarchy-pkg-aur-add {pkgs} || die "could not install {pkgs}"
-  }}
-else
-  sudo pacman -S --needed {pkgs} || die "pacman failed"
-fi
+say "1/4 Installing packages ({pkgs})"
+install_mlx_pkgs {pkgs} || die "could not install {pkgs} (try 'omarchy-update' to refresh package databases, then run this again)"
 
 say "2/4 Verifying the packaged runtime on the Apple GPU"
 /usr/bin/mlx-omarchy -c 'import mlx.core as mx; a=mx.random.normal((256,256)); mx.eval((a@a).sum()); print("  ", mx.__version__, mx.default_device())' \
@@ -268,14 +305,18 @@ pub fn script_update_mlx() -> String {
     format!(
         r#"{HEADER}
 say "Updating omarchy-mlx packages"
-if ! pacman -Q omarchy-mlx >/dev/null 2>&1; then
-  die "omarchy-mlx is not installed as a package; use Migrate first."
+pacman -Q omarchy-mlx >/dev/null 2>&1 || die "omarchy-mlx is not installed as a package; use Migrate first."
+say "Full system upgrade first (Arch does not support partial upgrades)"
+sudo pacman -Syu || die "pacman -Syu failed"
+have="$(pacman -Q omarchy-mlx | awk '{{print $2}}')"
+want="$(omarchy_repo_version omarchy-mlx)"
+if [[ -n $want && $(vercmp "$want" "$have") -le 0 ]]; then
+  say "omarchy-mlx $have is current"
+else
+  say "omarchy-mlx $have -> $want"
+  # [omarchy] is sync-only here, so -Syu never upgrades these; install directly.
+  install_mlx_pkgs {pkgs} || die "update failed"
 fi
-before=$(pacman -Q omarchy-mlx)
-# Sync + upgrade only the mlx packages' dependency closure would be a partial
-# upgrade; Arch only supports full upgrades, so this runs one.
-sudo pacman -Syu --needed {pkgs} || die "pacman failed"
-say "$before -> $(pacman -Q omarchy-mlx)"
 mlx-omarchy -c 'import mlx.core as mx; print("  ", mx.__version__, mx.default_device())' || warn "smoke test failed"
 say "Done. Reload models in lmdeck to pick up the new runtime."
 "#,
@@ -451,6 +492,14 @@ mod tests {
     }
 
     #[test]
+    fn error_summary_picks_exception() {
+        let p = std::env::temp_dir().join("lmdeck-test-errlog.log");
+        std::fs::write(&p, "Traceback:\n  File x\nRuntimeError: [omarchy] Take dtype is not implemented\n----------------------------------------\n").unwrap();
+        assert_eq!(super::error_summary(&p), "RuntimeError: [omarchy] Take dtype is not implemented");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
     fn rfc3339_epoch() {
         assert_eq!(super::rfc3339(std::time::UNIX_EPOCH), "1970-01-01T00:00:00.000000000Z");
     }
@@ -489,4 +538,22 @@ pub fn lan_ips() -> Vec<(String, String)> {
         libc::freeifaddrs(ifap);
     }
     out
+}
+
+/// Resident memory of running muvm/libkrun VMs (FEX/Proton games run inside
+/// them), or None when no VM is up.
+pub fn muvm_rss() -> Option<u64> {
+    let mut total = 0u64;
+    let mut found = false;
+    for e in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        let comm = comm.trim();
+        if comm == "muvm" || comm.starts_with("krun") || comm.starts_with("libkrun") {
+            found = true;
+            total += rss(pid);
+        }
+    }
+    found.then_some(total)
 }

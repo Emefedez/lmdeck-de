@@ -52,6 +52,8 @@ enum Msg {
     Repo(String, Result<Vec<RepoFile>, String>),
     Toast(String),
     Models,
+    /// Load failed for lack of a GPU kernel: (model, recommended download).
+    GpuGap(String, Option<String>),
 }
 
 #[derive(Clone)]
@@ -66,11 +68,13 @@ enum Input {
     Setting(usize),
     Confirm(String, Confirmed),
     Override(String),
+    GpuGap(String, Option<String>),
 }
 
 #[derive(Clone)]
 enum Confirmed {
     ForceStop,
+    Device(String, String),
     Delete(String),
     Run(Action),
 }
@@ -128,7 +132,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         tab: Tab::Dashboard,
         d: Daemon::new(cfg.base_url()),
         models: models::scan(&cfg),
-        catalog: load_catalog(),
+        catalog: crate::compat::catalog().to_vec(),
         cfg,
         status: None,
         versions: Versions::default(),
@@ -233,54 +237,6 @@ fn suspend_run(term: &mut DefaultTerminal, pause: &AtomicBool, a: Action) {
     let _ = term.clear();
     pause.store(false, Ordering::Relaxed);
 }
-
-/// The omarchy-mlx curated serving catalog (qualification status per model).
-fn load_catalog() -> Vec<Value> {
-    let mut cands = vec![
-        crate::config::home().join(".local/share/mlx-omarchy/mlx_omarchy_serve/catalog.json"),
-        crate::config::home().join(".local/share/mlx-omarchy/catalog.json"),
-    ];
-    for root in ["/usr/lib/omarchy-mlx", "/usr/share/omarchy-mlx"] {
-        find_named(std::path::Path::new(root), "catalog.json", 7, &mut cands);
-    }
-    for c in cands {
-        if !c.to_string_lossy().contains("serve") && !c.starts_with(crate::config::home()) {
-            continue;
-        }
-        if let Ok(s) = std::fs::read_to_string(&c) {
-            if let Ok(v) = serde_json::from_str::<Value>(&s) {
-                if let Some(m) = v.get("models").and_then(|m| m.as_array()) {
-                    return m.clone();
-                }
-            }
-        }
-    }
-    vec![]
-}
-
-fn find_named(dir: &std::path::Path, name: &str, depth: u32, out: &mut Vec<std::path::PathBuf>) {
-    if depth == 0 {
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let p = e.path();
-        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            let n = e.file_name();
-            let n = n.to_string_lossy();
-            // Don't crawl all of site-packages; the serve package is what we want.
-            let in_site = dir.file_name().map(|d| d == "site-packages").unwrap_or(false);
-            if n == "__pycache__" || (in_site && !n.starts_with("mlx_omarchy")) {
-                continue;
-            }
-            find_named(&p, name, depth - 1, out);
-        } else if e.file_name() == name {
-            out.push(p);
-        }
-    }
-}
-
-// ---------- settings table ----------
 
 // ---------- state & events ----------
 
@@ -408,7 +364,14 @@ impl Ui {
                 }
             }
             Msg::Toast(s) => self.toast(s),
-            Msg::Models => self.rescan(),
+            Msg::GpuGap(model, rec) => {
+                self.toast(format!("{model}: no GPU kernel for one of its ops"));
+                self.input = Input::GpuGap(model, rec);
+            }
+            Msg::Models => {
+                self.cfg = Config::load().unwrap_or_else(|_| self.cfg.clone());
+                self.rescan();
+            }
             Msg::Key(k) => return self.key(k),
         }
         None
@@ -446,6 +409,21 @@ impl Ui {
 
     fn key_input(&mut self, k: KeyEvent) -> Option<Action> {
         let input = std::mem::replace(&mut self.input, Input::None);
+        if let Input::GpuGap(model, rec) = &input {
+            match k.code {
+                KeyCode::Char('c') => self.set_device_and_load(model.clone(), "cpu"),
+                KeyCode::Char('d') => {
+                    if let Some(r) = rec.clone() {
+                        self.spawn_daemon_op(format!("pulling {r}"), move |d| async move {
+                            d.pull(&r).await?;
+                            Ok(format!("downloading {r} (progress on Dashboard)"))
+                        });
+                    }
+                }
+                _ => {}
+            }
+            return None;
+        }
         match (&input, k.code) {
             (Input::Confirm(_, c), KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter) => {
                 let c = c.clone();
@@ -462,7 +440,7 @@ impl Ui {
                         self.search();
                     }
                     Input::Setting(i) => {
-                        let key = SETTINGS[i].0;
+                        let key = SETTINGS[i].1;
                         let mut c = self.cfg.clone();
                         match set_setting(&mut c, key, &text).and_then(|_| c.save().map_err(|e| e.to_string())) {
                             Ok(()) => {
@@ -501,6 +479,10 @@ impl Ui {
 
     fn confirmed(&mut self, c: Confirmed) -> Option<Action> {
         match c {
+            Confirmed::Device(name, dev) => {
+                self.set_device(name, dev, false);
+                None
+            }
             Confirmed::ForceStop => {
                 let pid = self.status.as_ref().and_then(|s| s["pid"].as_u64()).map(|p| p as u32);
                 match client::force_stop(pid) {
@@ -640,11 +622,20 @@ impl Ui {
             }
             KeyCode::Enter | KeyCode::Char('l') => {
                 if let Some(m) = self.selected_model() {
+                    self.load_model(m.name.clone());
+                }
+            }
+            KeyCode::Char('g') => {
+                if let Some(m) = self.selected_model() {
                     let name = m.name.clone();
-                    self.spawn_daemon_op(format!("loading {name}…"), move |d| async move {
-                        let v = d.load(&name).await?;
-                        Ok(format!("{name} ready ({:.1}s)", v["load_secs"].as_f64().unwrap_or(0.0)))
-                    });
+                    if self.device_of(&name) == "cpu" {
+                        self.set_device(name, "gpu".into(), false);
+                    } else {
+                        self.input = Input::Confirm(
+                            format!("Run {name} on the CPU? Discouraged: much slower than the Apple GPU. [y/N]"),
+                            Confirmed::Device(name, "cpu".into()),
+                        );
+                    }
                 }
             }
             KeyCode::Char('u') => {
@@ -683,6 +674,98 @@ impl Ui {
             _ => {}
         }
         None
+    }
+
+    /// Name plus compatibility marker and CPU tag.
+    fn model_label(&self, m: &LocalModel, name: String) -> Line<'static> {
+        let mut spans = vec![Span::raw(name)];
+        if m.format == Format::Mlx {
+            let v = crate::compat::assess_mlx(&self.cfg, m.repo.as_deref().unwrap_or(&m.name), m.qmode.as_deref());
+            let color = match v.level {
+                "unlikely" => Color::Red,
+                "untested" => Color::Yellow,
+                _ => Color::Green,
+            };
+            let mk = crate::compat::marker(v.level);
+            if !mk.is_empty() {
+                spans.push(Span::styled(format!(" {mk}"), Style::new().fg(color)));
+            }
+        }
+        if self.device_of(&m.name) == "cpu" {
+            spans.push(Span::styled(" cpu", Style::new().fg(Color::Yellow)));
+        }
+        Line::from(spans)
+    }
+
+    fn device_of(&self, name: &str) -> String {
+        self.cfg.overrides.get(name).and_then(|o| o.device.clone()).unwrap_or_else(|| "gpu".into())
+    }
+
+    /// Load through the daemon; a missing-GPU-kernel failure opens the CPU /
+    /// recommended-download choice instead of just a toast.
+    fn load_model(&self, name: String) {
+        let d = self.d.clone();
+        let tx = self.tx.clone();
+        let cfg = self.cfg.clone();
+        let local = self.models.iter().find(|m| m.name == name).cloned();
+        tokio::spawn(async move {
+            if !d.up().await {
+                let _ = client::start_daemon();
+                for _ in 0..50 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if d.up().await {
+                        break;
+                    }
+                }
+            }
+            let _ = tx.send(Msg::Toast(format!("loading {name}…")));
+            match d.load(&name).await {
+                Ok(v) => {
+                    let _ = tx.send(Msg::Toast(format!("{name} ready ({:.1}s)", v["load_secs"].as_f64().unwrap_or(0.0))));
+                }
+                Err(e) if crate::compat::is_gpu_gap(&e.to_string()) => {
+                    let rec = local
+                        .filter(|m| m.format == Format::Mlx)
+                        .and_then(|m| crate::compat::assess_mlx(&cfg, m.repo.as_deref().unwrap_or(&m.name), m.qmode.as_deref()).recommend);
+                    let _ = tx.send(Msg::GpuGap(name, rec));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Toast(format!("error: {e:#}")));
+                }
+            }
+            let _ = tx.send(Msg::Status(d.status().await));
+        });
+    }
+
+    fn set_device(&self, name: String, dev: String, then_load: bool) {
+        let d = self.d.clone();
+        let tx = self.tx.clone();
+        let this_load = then_load.then(|| name.clone());
+        tokio::spawn(async move {
+            match d.set_override(&name, "device", &dev).await {
+                Ok(_) => {
+                    let _ = tx.send(Msg::Toast(format!("{name} will run on the {}", if dev == "cpu" { "CPU (discouraged)" } else { "Apple GPU" })));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Toast(format!("error: {e:#}")));
+                    return;
+                }
+            }
+            let _ = tx.send(Msg::Models);
+            if let Some(n) = this_load {
+                let _ = tx.send(Msg::Toast(format!("loading {n} on the CPU…")));
+                let r = d.load(&n).await;
+                let _ = tx.send(Msg::Toast(match r {
+                    Ok(v) => format!("{n} ready on CPU ({:.1}s)", v["load_secs"].as_f64().unwrap_or(0.0)),
+                    Err(e) => format!("error: {e:#}"),
+                }));
+                let _ = tx.send(Msg::Status(d.status().await));
+            }
+        });
+    }
+
+    fn set_device_and_load(&self, name: String, dev: &str) {
+        self.set_device(name, dev.into(), true);
     }
 
     fn search(&mut self) {
@@ -729,6 +812,14 @@ impl Ui {
             let sel = &mut self.repo.as_mut().unwrap().sel;
             match k.code {
                 KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.repo = None,
+                KeyCode::Char('a') => {
+                    let repo = self.repo.as_ref().unwrap().repo.clone();
+                    match crate::compat::assess_mlx(&self.cfg, &repo, None).recommend {
+                        Some(r) => self.open_repo(r),
+                        None => self.toast("no recommended alternative known"),
+                    }
+                    return None;
+                }
                 KeyCode::Down | KeyCode::Char('j') => move_sel(sel, n, 1),
                 KeyCode::Up | KeyCode::Char('k') => move_sel(sel, n, -1),
                 KeyCode::Enter | KeyCode::Char('p') => {
@@ -794,7 +885,7 @@ impl Ui {
             KeyCode::Up | KeyCode::Char('k') => move_sel(&mut self.settings_sel, SETTINGS.len(), -1),
             KeyCode::Enter | KeyCode::Char('e') => {
                 let i = self.settings_sel.selected().unwrap_or(0);
-                self.buf = get_setting(&self.cfg, SETTINGS[i].0);
+                self.buf = get_setting(&self.cfg, SETTINGS[i].1);
                 self.input = Input::Setting(i);
             }
             KeyCode::Char('o') => {
@@ -849,23 +940,41 @@ impl Ui {
 
     fn draw(&mut self, f: &mut Frame) {
         let [top, body, foot] = Layout::vertical([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)]).areas(f.area());
-        let titles: Vec<Line> = TABS.iter().map(|t| Line::from(t.title())).collect();
+        let narrow = f.area().width < 100;
+        let titles: Vec<Line> = TABS
+            .iter()
+            .map(|t| Line::from(if narrow { t.title().split_whitespace().next().unwrap_or("").to_string() } else { t.title().to_string() }))
+            .collect();
         let idx = TABS.iter().position(|t| *t == self.tab).unwrap();
         let up = self.status.is_some();
-        let [tabs_area, badge] = Layout::horizontal([Constraint::Min(10), Constraint::Length(34)]).areas(top);
+        let [tabs_area, badge] = Layout::horizontal([Constraint::Min(10), Constraint::Length(if narrow { 9 } else { 34 })]).areas(top);
+        let titles = if narrow {
+            // Numbers only, plus the active tab's name.
+            let mut t = titles;
+            t[idx] = Line::from(self.tab.title().to_string());
+            t
+        } else {
+            titles
+        };
         f.render_widget(
             Tabs::new(titles).select(idx).highlight_style(Style::new().fg(Color::Black).bg(Color::Cyan).bold()).divider(" "),
             tabs_area,
         );
-        f.render_widget(
+        let badge_line = if narrow {
+            Line::from(vec![
+                if up { Span::styled("● ", Style::new().fg(Color::Green)) } else { Span::styled("○ ", Style::new().fg(Color::DarkGray)) },
+                Span::styled(format!(":{}", self.cfg.server.port), Style::new().fg(Color::DarkGray)),
+            ])
+            .right_aligned()
+        } else {
             Line::from(vec![
                 Span::raw("lmdeck "),
                 if up { Span::styled("● serving ", Style::new().fg(Color::Green)) } else { Span::styled("○ stopped ", Style::new().fg(Color::DarkGray)) },
                 Span::styled(format!(":{}", self.cfg.server.port), Style::new().fg(Color::DarkGray)),
             ])
-            .right_aligned(),
-            badge,
-        );
+            .right_aligned()
+        };
+        f.render_widget(badge_line, badge);
         match self.tab {
             Tab::Dashboard => self.draw_dashboard(f, body),
             Tab::Models => self.draw_models(f, body),
@@ -875,10 +984,10 @@ impl Ui {
         }
         let help = match self.tab {
             Tab::Dashboard => "s start/stop · X force stop · R reload stale · S service · a unload all · M migrate · U update · B llama.cpp · D launcher · C clear dl",
-            Tab::Models => "⏎ load · u unload · c chat · x context · d delete · y copy name · r rescan",
+            Tab::Models => "⏎ load · u unload · g GPU⇄CPU · c chat · x context · d delete · y copy · ✓ qualified ? untested ✗ GPU-incompatible",
             Tab::Discover => {
                 if self.repo.is_some() {
-                    "⏎ download · esc back"
+                    "⏎ download · a recommended alternative · esc back"
                 } else {
                     "/ search · g MLX⇄GGUF · c catalog⇄search · ⏎ open · x cancel download"
                 }
@@ -898,24 +1007,46 @@ impl Ui {
         let (title, text) = match &self.input {
             Input::None => return,
             Input::Search => (format!("Search Hugging Face ({})", if self.kind_gguf { "GGUF" } else { "MLX" }), format!("{}▏", self.buf)),
-            Input::Setting(i) => (format!("{} — {}", SETTINGS[*i].0, SETTINGS[*i].1), format!("{}▏", self.buf)),
+            Input::Setting(i) => (format!("{} — {}", SETTINGS[*i].1, SETTINGS[*i].2), format!("{}▏", self.buf)),
             Input::Override(n) => (format!("Context size for {n} (empty = default)"), format!("{}▏", self.buf)),
             Input::Confirm(q, _) => ("Confirm".into(), q.clone()),
+            Input::GpuGap(m, rec) => (
+                "No Apple GPU kernel for this model".into(),
+                format!(
+                    "{m} uses an op omarchy-mlx can't run on the GPU yet.  c = run on CPU (discouraged: much slower){}  ·  esc = cancel",
+                    rec.as_ref().map(|r| format!("  ·  d = download {r} instead")).unwrap_or_default()
+                ),
+            ),
         };
         let a = f.area();
         let w = a.width.saturating_sub(8).min(100);
-        let r = Rect { x: a.x + (a.width - w) / 2, y: a.y + a.height / 3, width: w, height: 3 };
+        let lines = (text.chars().count() as u16 / w.saturating_sub(2).max(1)) + 1;
+        let r = Rect { x: a.x + (a.width - w) / 2, y: a.y + a.height / 3, width: w, height: 2 + lines.min(6) };
         f.render_widget(Clear, r);
         f.render_widget(
-            Paragraph::new(text).block(Block::bordered().border_type(BorderType::Rounded).title(title).border_style(Style::new().fg(Color::Cyan))),
+            Paragraph::new(text).wrap(Wrap { trim: true }).block(Block::bordered().border_type(BorderType::Rounded).title(title).border_style(Style::new().fg(Color::Cyan))),
             r,
         );
     }
 
     fn draw_dashboard(&self, f: &mut Frame, area: Rect) {
-        let [left, right] = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
-        let [srv, loaded, usage_area, dls] =
-            Layout::vertical([Constraint::Length(10), Constraint::Min(4), Constraint::Length(9), Constraint::Length(7)]).areas(left);
+        let narrow = area.width < 100;
+        let (srv, loaded, usage_area, dls, right) = if narrow {
+            let [a, b, c, d, e] = Layout::vertical([
+                Constraint::Length(10),
+                Constraint::Length(5),
+                Constraint::Length(8),
+                Constraint::Length(5),
+                Constraint::Min(6),
+            ])
+            .areas(area);
+            (a, b, c, d, e)
+        } else {
+            let [left, right] = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
+            let [a, b, c, d] =
+                Layout::vertical([Constraint::Length(10), Constraint::Min(4), Constraint::Length(9), Constraint::Length(7)]).areas(left);
+            (a, b, c, d, right)
+        };
 
         // Server
         let mut lines = vec![];
@@ -979,7 +1110,9 @@ impl Ui {
                     } else {
                         r["expires_in_secs"].as_u64().map(|s| format!("{}", dur(s))).unwrap_or("∞".into())
                     }),
-                    Cell::from(if r["stale"].as_bool() == Some(true) {
+                    Cell::from(if r["note"].as_str().map(|n| !n.is_empty()).unwrap_or(false) && r["stale"].as_bool() != Some(true) {
+                        Span::styled("⚠", Style::new().fg(Color::Yellow))
+                    } else if r["stale"].as_bool() == Some(true) {
                         Span::styled("⟳ R", Style::new().fg(Color::Yellow))
                     } else {
                         Span::raw(format!("{:.1}s", r["load_secs"].as_f64().unwrap_or(0.0)))
@@ -1132,17 +1265,27 @@ impl Ui {
     }
 
     fn draw_models(&mut self, f: &mut Frame, area: Rect) {
+        let narrow = area.width < 100;
         let running = self.running_names();
         let rows: Vec<Row> = self
             .models
             .iter()
             .map(|m| {
                 let loaded = running.contains(&m.name);
-                let fits = m.size + m.size / 10 < sys::mem().0;
+                let fits = crate::compat::gpu_fit(m.size, self.cfg.llama.ctx_size as u64) != "too big";
                 let caps: Vec<&str> = m.capabilities().into_iter().filter(|c| *c != "completion").collect();
+                let short = m.name.rsplit('/').next().unwrap_or(&m.name).to_string();
+                if narrow {
+                    return Row::new(vec![
+                        Cell::from(if loaded { "●" } else { " " }).fg(Color::Green),
+                        Cell::from(self.model_label(m, short)),
+                        Cell::from(m.format.as_str()).fg(if m.format == Format::Mlx { Color::Magenta } else { Color::Blue }),
+                        Cell::from(human(m.size)).fg(if fits { Color::Reset } else { Color::Red }),
+                    ]);
+                }
                 Row::new(vec![
                     Cell::from(if loaded { "●" } else { " " }).fg(Color::Green),
-                    Cell::from(m.name.clone()),
+                    Cell::from(self.model_label(m, m.name.clone())),
                     Cell::from(m.format.as_str()).fg(if m.format == Format::Mlx { Color::Magenta } else { Color::Blue }),
                     Cell::from(m.quant.clone()),
                     Cell::from(m.params.clone()),
@@ -1160,13 +1303,18 @@ impl Ui {
                 ])
             })
             .collect();
-        let t = Table::new(
-            rows,
-            [Constraint::Length(1), Constraint::Min(30), Constraint::Length(5), Constraint::Length(11), Constraint::Length(8), Constraint::Length(7), Constraint::Length(6), Constraint::Length(22)],
-        )
-        .header(Row::new(["", "Name", "Fmt", "Quant", "Params", "Size", "Ctx", "Caps"]).style(Style::new().fg(Color::DarkGray)))
+        let (widths, header): (Vec<Constraint>, Vec<&str>) = if narrow {
+            (vec![Constraint::Length(1), Constraint::Min(12), Constraint::Length(5), Constraint::Length(6)], vec!["", "Name", "Fmt", "Size"])
+        } else {
+            (
+                vec![Constraint::Length(1), Constraint::Min(30), Constraint::Length(5), Constraint::Length(11), Constraint::Length(8), Constraint::Length(7), Constraint::Length(6), Constraint::Length(22)],
+                vec!["", "Name", "Fmt", "Quant", "Params", "Size", "Ctx", "Caps"],
+            )
+        };
+        let t = Table::new(rows, widths)
+        .header(Row::new(header).style(Style::new().fg(Color::DarkGray)))
         .row_highlight_style(Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
-        .block(panel(&format!("Local models ({})  ·  {}", self.models.len(), self.cfg.hf_cache().display())));
+        .block(panel(&if narrow { format!("Local models ({})", self.models.len()) } else { format!("Local models ({})  ·  {}", self.models.len(), self.cfg.hf_cache().display()) }));
         f.render_stateful_widget(t, area, &mut self.models_sel);
         if self.models.is_empty() {
             let inner = area.inner(ratatui::layout::Margin { horizontal: 2, vertical: 2 });
@@ -1207,8 +1355,15 @@ impl Ui {
                 .hits
                 .iter()
                 .map(|h| {
+                    let v = (!self.kind_gguf).then(|| crate::compat::assess_mlx(&self.cfg, &h.id, None));
+                    let (mk, color) = match v.as_ref().map(|v| v.level) {
+                        Some("unlikely") => ("✗ ", Color::Red),
+                        Some("untested") => ("? ", Color::Yellow),
+                        Some("qualified") => ("✓ ", Color::Green),
+                        _ => ("  ", Color::Reset),
+                    };
                     Row::new(vec![
-                        Cell::from(h.id.clone()),
+                        Cell::from(Line::from(vec![Span::styled(mk, Style::new().fg(color)), Span::raw(h.id.clone())])),
                         Cell::from(compact(h.downloads)),
                         Cell::from(compact(h.likes)),
                         Cell::from(h.last_modified.get(..10).unwrap_or("").to_string()).fg(Color::DarkGray),
@@ -1230,7 +1385,12 @@ impl Ui {
 
         // Detail panel
         let choices = self.repo_choices();
-        let total = sys::mem();
+        let verdict = self
+            .repo
+            .as_ref()
+            .filter(|_| choices.iter().any(|c| !c.0.contains(':')))
+            .map(|rv| crate::compat::assess_mlx(&self.cfg, &rv.repo, None))
+            .filter(|v| v.level != "ok");
         match &mut self.repo {
             None => {
                 let mut l = vec![
@@ -1261,22 +1421,42 @@ impl Ui {
                     let rows: Vec<Row> = choices
                         .iter()
                         .map(|(_, label, size)| {
-                            let need = size + size / 10;
-                            let (fit, color) = if need + (2u64 << 30) < total.1 {
-                                ("fits", Color::Green)
-                            } else if need < total.0 {
-                                ("tight", Color::Yellow)
-                            } else {
-                                ("too big", Color::Red)
+                            let fit = crate::compat::gpu_fit(*size, self.cfg.llama.ctx_size as u64);
+                            let color = match fit {
+                                "fits" => Color::Green,
+                                "tight" => Color::Yellow,
+                                _ => Color::Red,
                             };
                             Row::new(vec![Cell::from(label.clone()), Cell::from(human(*size)), Cell::from(fit).fg(color)])
                         })
                         .collect();
+                    let block = panel(&rv.repo);
+                    let inner = block.inner(detail);
+                    f.render_widget(block, detail);
+                    let vh = if verdict.is_some() { 4 } else { 0 };
+                    let [vrect, trect] = Layout::vertical([Constraint::Length(vh), Constraint::Min(2)]).areas(inner);
+                    if let Some(v) = &verdict {
+                        let color = match v.level {
+                            "unlikely" => Color::Red,
+                            "untested" => Color::Yellow,
+                            _ => Color::Green,
+                        };
+                        let mut l = vec![Line::from(Span::styled(
+                            format!("{} {}", crate::compat::marker(v.level), match v.level { "unlikely" => "likely won't run on the Apple GPU", "untested" => "untested on omarchy-mlx", _ => "qualified on omarchy-mlx" }),
+                            Style::new().fg(color).bold(),
+                        ))];
+                        if !v.reason.is_empty() && v.level != "qualified" {
+                            l.push(Line::from(v.reason.clone()).fg(Color::DarkGray));
+                        }
+                        if let Some(r) = &v.recommend {
+                            l.push(Line::from(vec![Span::raw("recommended: "), Span::styled(r.clone(), Style::new().fg(Color::Cyan)), Span::styled("  (a to open)", Style::new().fg(Color::DarkGray))]));
+                        }
+                        f.render_widget(Paragraph::new(l).wrap(Wrap { trim: true }), vrect);
+                    }
                     let t = Table::new(rows, [Constraint::Min(16), Constraint::Length(7), Constraint::Length(8)])
-                        .header(Row::new(["Variant", "Size", "RAM"]).style(Style::new().fg(Color::DarkGray)))
-                        .row_highlight_style(Style::new().bg(Color::DarkGray).bold())
-                        .block(panel(&rv.repo));
-                    f.render_stateful_widget(t, detail, &mut rv.sel);
+                        .header(Row::new(["Variant", "Size", "GPU mem"]).style(Style::new().fg(Color::DarkGray)))
+                        .row_highlight_style(Style::new().bg(Color::DarkGray).bold());
+                    f.render_stateful_widget(t, trect, &mut rv.sel);
                 }
             }
         }
@@ -1284,14 +1464,46 @@ impl Ui {
     }
 
     fn draw_settings(&mut self, f: &mut Frame, area: Rect) {
-        let rows: Vec<Row> = SETTINGS
-            .iter()
-            .map(|(k, help)| Row::new(vec![Cell::from(*k).fg(Color::Cyan), Cell::from(get_setting(&self.cfg, k)), Cell::from(*help).fg(Color::DarkGray)]))
-            .collect();
-        let t = Table::new(rows, [Constraint::Length(28), Constraint::Percentage(35), Constraint::Min(20)])
+        // Themed groups: a header row per section with a blank spacer before it.
+        let narrow = area.width < 100;
+        let mut rows: Vec<Row> = Vec::new();
+        let mut display_sel = None;
+        let mut section = "";
+        for (i, (sec, k, help)) in SETTINGS.iter().enumerate() {
+            if *sec != section {
+                if !section.is_empty() {
+                    rows.push(Row::new(vec![Cell::from("")]));
+                }
+                section = sec;
+                rows.push(Row::new(vec![Cell::from(Span::styled(format!("▍{}", sec.to_uppercase()), Style::new().fg(Color::Magenta).bold()))]));
+            }
+            if self.settings_sel.selected() == Some(i) {
+                display_sel = Some(rows.len());
+            }
+            let short = k.split_once('.').map(|(_, b)| b).unwrap_or(k);
+            let mut cells = vec![Cell::from(format!("  {short}")).fg(Color::Cyan), Cell::from(get_setting(&self.cfg, k))];
+            if !narrow {
+                cells.push(Cell::from(*help).fg(Color::DarkGray));
+            }
+            rows.push(Row::new(cells));
+        }
+        let widths: Vec<Constraint> = if narrow {
+            vec![Constraint::Percentage(55), Constraint::Percentage(45)]
+        } else {
+            vec![Constraint::Length(26), Constraint::Percentage(30), Constraint::Min(20)]
+        };
+        let mut st = TableState::default().with_selected(display_sel);
+        let t = Table::new(rows, widths)
             .row_highlight_style(Style::new().bg(Color::DarkGray).bold())
             .block(panel(&format!("Settings · {}", crate::config::config_path().display())));
-        f.render_stateful_widget(t, area, &mut self.settings_sel);
+        f.render_stateful_widget(t, area, &mut st);
+        if narrow {
+            // The help text no longer fits a column: show it for the selected row.
+            if let Some(i) = self.settings_sel.selected() {
+                let r = Rect { x: area.x + 1, y: area.y + area.height.saturating_sub(2), width: area.width.saturating_sub(2), height: 1 };
+                f.render_widget(Paragraph::new(SETTINGS[i].2).fg(Color::DarkGray), r);
+            }
+        }
     }
 
     fn draw_logs(&self, f: &mut Frame, area: Rect) {

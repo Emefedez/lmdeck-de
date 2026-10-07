@@ -23,6 +23,9 @@ Item {
   property string searchError: ""
   property string repoId: ""
   property var repoChoices: []
+  property var repoCompat: null
+  // Set when a load failed for lack of a GPU kernel: { model, recommend }.
+  property var offer: null
   property bool repoLoading: false
   property string toast: ""
 
@@ -120,7 +123,18 @@ Item {
   function load(name) {
     say("Loading " + name + "…")
     request("POST", "/lmdeck/load", { model: name }, function(code, data) {
-      say(code === 200 ? name + " ready (" + Number(data.load_secs).toFixed(1) + " s)" : errorText(data, "load failed"))
+      if (code === 200) { lm.offer = null; lm.say(name + " ready (" + Number(data.load_secs).toFixed(1) + " s)"); return }
+      if (data && data.gpu_gap) { lm.offer = { model: data.model || name, recommend: data.recommend || "" }; lm.say(""); return }
+      lm.say(lm.errorText(data, "load failed"))
+    })
+  }
+  function setDevice(name, device, thenLoad) {
+    request("POST", "/lmdeck/override", { model: name, key: "device", value: device }, function(code, data) {
+      if (code !== 200) { lm.say(lm.errorText(data, "could not change device")); return }
+      lm.offer = null
+      lm.refreshModels()
+      if (thenLoad) lm.load(name)
+      else lm.say(name + (device === "cpu" ? " will run on the CPU (discouraged)" : " back on the Apple GPU"))
     })
   }
   function unload(name) {
@@ -163,14 +177,15 @@ Item {
     }, 20000)
   }
   function openRepo(id) {
-    if (repoId === id) { lm.repoId = ""; lm.repoChoices = []; return }
+    if (repoId === id) { lm.repoId = ""; lm.repoChoices = []; lm.repoCompat = null; return }
     lm.repoId = id
     lm.repoChoices = []
+    lm.repoCompat = null
     lm.repoLoading = true
     request("GET", "/lmdeck/repo?id=" + encodeURIComponent(id), null, function(code, data) {
       if (lm.repoId !== id) return
       lm.repoLoading = false
-      if (code === 200 && Array.isArray(data)) lm.repoChoices = data
+      if (code === 200 && data && Array.isArray(data.choices)) { lm.repoChoices = data.choices; lm.repoCompat = data.compat || null }
       else lm.say(lm.errorText(data, "could not list files"))
     }, 20000)
   }

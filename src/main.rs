@@ -1,5 +1,6 @@
 mod backend;
 mod client;
+mod compat;
 mod config;
 mod hf;
 mod models;

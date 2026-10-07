@@ -27,6 +27,8 @@ pub struct Running {
     child: tokio::sync::Mutex<Child>,
     pub loaded_at: SystemTime,
     pub load_secs: f64,
+    /// Launcher notes for this load (e.g. "8-bit KV not supported; using f16").
+    pub note: String,
     last_used: Mutex<Instant>,
     keep_alive: Mutex<Option<Duration>>,
     in_flight: AtomicUsize,
@@ -84,12 +86,16 @@ pub struct RunningView {
     pub log: String,
     /// Settings changed since load; reload the model to apply them.
     pub stale: bool,
+    pub note: String,
+    pub device: String,
 }
 
 pub struct Manager {
     pub cfg: RwLock<Config>,
     running: Mutex<Vec<Arc<Running>>>,
     loading: Mutex<Option<String>>,
+    /// PIDs of backends we killed that had not exited yet.
+    exiting: Mutex<Vec<u32>>,
     load_lock: tokio::sync::Mutex<()>,
     cache: Mutex<Option<(Instant, Arc<Vec<LocalModel>>)>>,
     pub http: reqwest::Client,
@@ -101,6 +107,7 @@ impl Manager {
             cfg: RwLock::new(cfg),
             running: Mutex::new(Vec::new()),
             loading: Mutex::new(None),
+            exiting: Mutex::new(Vec::new()),
             load_lock: tokio::sync::Mutex::new(()),
             cache: Mutex::new(None),
             http: reqwest::Client::builder()
@@ -165,6 +172,8 @@ impl Manager {
                 expires_in_secs: r.expires_in().map(|d| d.as_secs()),
                 log: r.log.display().to_string(),
                 stale: r.sig != backend_sig(&self.cfg(), &r.model),
+                note: r.note.clone(),
+                device: self.cfg().overrides.get(&r.name).and_then(|o| o.device.clone()).unwrap_or_else(|| "gpu".into()),
             })
             .collect()
     }
@@ -210,7 +219,9 @@ impl Manager {
 
     async fn load_locked(&self, m: &LocalModel, ka: Option<Duration>) -> Result<Arc<Running>> {
         self.make_room(m).await?;
-        self.spawn(m, ka).await
+        // After eviction, so freed memory counts toward the heap we may raise.
+        let heap = self.heap_plan(m)?;
+        self.spawn(m, ka, heap).await
     }
 
     /// Model currently being loaded, if any.
@@ -234,8 +245,115 @@ impl Manager {
         Ok(secs)
     }
 
+    fn on_gpu(&self, m: &LocalModel) -> bool {
+        self.cfg().overrides.get(&m.name).and_then(|o| o.device.as_deref()) != Some("cpu")
+    }
+
+    /// Estimated GPU bytes for `m` (weights + runtime + KV at its context).
+    pub fn gpu_need(&self, m: &LocalModel) -> u64 {
+        let cfg = self.cfg();
+        let ctx = match m.format {
+            Format::Gguf => cfg.overrides.get(&m.name).and_then(|o| o.ctx_size).unwrap_or(cfg.llama.ctx_size) as u64,
+            Format::Mlx => 8192,
+        };
+        crate::compat::gpu_need(m.size, ctx)
+    }
+
+    /// Decide the GPU heap (HK_SYSMEM) for loading `m`. Ok(None) = stock heap.
+    /// Per process only: nothing global changes, and it ends with the backend.
+    fn heap_plan(&self, m: &LocalModel) -> Result<Option<u64>> {
+        let cfg = self.cfg();
+        if !self.on_gpu(m) {
+            return Ok(None);
+        }
+        let need = self.gpu_need(m);
+        let stock = crate::compat::gpu_budget();
+        let gi = |b: u64| gib(b);
+        let reserve = (cfg.server.mem_reserve_gib * (1u64 << 30) as f64) as u64
+            + if crate::sys::muvm_rss().is_some() { 2 << 30 } else { 0 };
+        let (total, avail) = sys::mem();
+        let policy = cfg.server.gpu_heap.trim().to_lowercase();
+        let heap = match policy.as_str() {
+            "stock" => stock,
+            "auto" | "" => {
+                if need <= stock * 92 / 100 {
+                    return Ok(None);
+                }
+                // Room the model can really take: what is free now (already net of
+                // muvm/FEX/desktop) minus the reserve, never above MemTotal - reserve.
+                let cap = avail.saturating_sub(reserve).min(total.saturating_sub(reserve));
+                let want = need + need / 12 + (512 << 20);
+                if want > cap {
+                    bail!(
+                        "{} needs ~{:.1} GiB of GPU memory, but only {:.1} GiB can be given to it right now \
+                         ({:.1} GiB free, {:.1} GiB kept for the desktop{}). Close apps or pick a smaller model{}",
+                        m.name,
+                        gi(need),
+                        gi(cap),
+                        gi(avail),
+                        gi(reserve),
+                        if crate::sys::muvm_rss().is_some() { " and a running muvm VM" } else { "" },
+                        crate::compat::recommend_fitting("chat").map(|r| format!(" (e.g. {r})")).unwrap_or_default()
+                    );
+                }
+                want.max(stock) & !((1u64 << 20) - 1)
+            }
+            n => (n.parse::<f64>().unwrap_or(0.0) * (1u64 << 30) as f64) as u64,
+        };
+        if cfg.server.gpu_mem_check && need > heap * 92 / 100 {
+            bail!(
+                "{} is too big for the GPU heap: needs ~{:.1} GiB, heap is {:.1} GiB (server.gpu_heap = {}). \
+                 Overcommitting the GPU can hang the whole machine, so lmdeck refuses. Set server.gpu_heap to auto, or pick a smaller model{}",
+                m.name,
+                gi(need),
+                gi(heap),
+                cfg.server.gpu_heap,
+                crate::compat::recommend_fitting("chat").map(|r| format!(" (e.g. {r})")).unwrap_or_default()
+            );
+        }
+        Ok((heap != stock).then_some(heap))
+    }
+
+    /// Dry run of the admission decision for `name` (nothing is loaded).
+    pub fn plan_preview(&self, name: &str) -> serde_json::Value {
+        let m = match self.resolve(name) {
+            Ok(m) => m,
+            Err(e) => return serde_json::json!({"error": format!("{e:#}")}),
+        };
+        let (need_ram, avail_ram) = self.mem_need(&m);
+        let plan = self.heap_plan(&m);
+        serde_json::json!({
+            "model": m.name,
+            "device": if self.on_gpu(&m) { "gpu" } else { "cpu" },
+            "gpu_need": self.gpu_need(&m),
+            "stock_heap": crate::compat::gpu_budget(),
+            "heap": plan.as_ref().ok().cloned().flatten(),
+            "ram_need": need_ram,
+            "ram_available": avail_ram,
+            "muvm_rss": sys::muvm_rss(),
+            "ok": plan.is_ok() && (!self.cfg().server.mem_check || need_ram <= avail_ram),
+            "error": plan.err().map(|e| format!("{e:#}")),
+        })
+    }
+
+    /// A killed backend that never exited still holds its GPU memory (e.g. a
+    /// hung GPU). Loading another model on top of it can exhaust RAM and
+    /// freeze the machine, so refuse until it is gone.
+    fn check_zombies(&self) -> Result<()> {
+        let mut z = self.exiting.lock().unwrap();
+        z.retain(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
+        if let Some(pid) = z.first() {
+            bail!(
+                "a previous model backend (pid {pid}) was stopped but has not exited, so its GPU memory is still held \
+                 (the GPU may be hung). Loading another model now could freeze the machine; force-stop lmdeck or reboot first"
+            );
+        }
+        Ok(())
+    }
+
     async fn make_room(&self, m: &LocalModel) -> Result<()> {
         let cfg = self.cfg();
+        self.check_zombies()?;
         let deadline = Instant::now() + Duration::from_secs(cfg.server.load_timeout_secs);
         loop {
             let running = self.running();
@@ -289,7 +407,7 @@ impl Manager {
         need <= avail
     }
 
-    async fn spawn(&self, m: &LocalModel, ka: Option<Duration>) -> Result<Arc<Running>> {
+    async fn spawn(&self, m: &LocalModel, ka: Option<Duration>, heap: Option<u64>) -> Result<Arc<Running>> {
         let cfg = self.cfg();
         let ov = cfg.overrides.get(&m.name).cloned().unwrap_or_default();
         let port = free_port()?;
@@ -313,6 +431,11 @@ impl Manager {
                 a.extend(cfg.mlx.extra_args.clone());
                 let mut env: Vec<(String, String)> = cfg.mlx.env.clone().into_iter().collect();
                 env.push(("LMDECK_MLX_BATCH".into(), if cfg.mlx.batching { "1" } else { "0" }.into()));
+                env.push(("LMDECK_MLX_KV_BITS".into(), cfg.mlx.kv_bits.to_string()));
+                env.push(("LMDECK_MLX_KV_GROUP".into(), cfg.mlx.kv_group_size.to_string()));
+                env.push(("LMDECK_MLX_KV_START".into(), cfg.mlx.quantized_kv_start.to_string()));
+                env.push(("LMDECK_MLX_MAX_KV".into(), cfg.mlx.max_kv_size.to_string()));
+                env.push(("LMDECK_MLX_DEVICE".into(), ov.device.clone().unwrap_or_else(|| "gpu".into())));
                 (a, env)
             }
             Format::Gguf => {
@@ -329,7 +452,7 @@ impl Manager {
                     "--port".into(),
                     port.to_string(),
                     "-ngl".into(),
-                    cfg.llama.gpu_layers.to_string(),
+                    if ov.device.as_deref() == Some("cpu") { "0".into() } else { cfg.llama.gpu_layers.to_string() },
                     "-c".into(),
                     ctx.to_string(),
                     "-fa".into(),
@@ -360,6 +483,11 @@ impl Manager {
         };
         argv.extend(ov.extra_args.clone());
         env.extend(ov.env.clone());
+        if let Some(h) = heap {
+            // Per-process GPU heap for this backend only (Honeykrisp HK_SYSMEM).
+            env.push(("HK_SYSMEM".into(), h.to_string()));
+            sys::log(&format!("{}: GPU heap raised to {:.1} GiB for this backend", m.name, gib(h)));
+        }
         if cfg.server.uclamp_boost {
             if let Some(u) = which("uclampset") {
                 argv.splice(0..0, [u.display().to_string(), "-m".into(), "1024".into()]);
@@ -398,6 +526,7 @@ impl Manager {
             child: tokio::sync::Mutex::new(child),
             loaded_at: SystemTime::now(),
             load_secs: 0.0,
+            note: String::new(),
             last_used: Mutex::new(Instant::now()),
             keep_alive: Mutex::new(ka),
             in_flight: AtomicUsize::new(0),
@@ -405,7 +534,19 @@ impl Manager {
         });
         if let Err(e) = self.wait_ready(&r, Duration::from_secs(cfg.server.load_timeout_secs)).await {
             self.kill(&r).await;
-            return Err(e.context(format!("{} failed to start (log: {})\n{}", m.name, log.display(), sys::tail(&log, 15))));
+            let summary = sys::error_summary(&log);
+            let hint = if crate::compat::is_gpu_gap(&summary) {
+                let rec = (m.format == Format::Mlx)
+                    .then(|| crate::compat::assess_mlx(&cfg, m.repo.as_deref().unwrap_or(&m.name), m.qmode.as_deref()).recommend)
+                    .flatten();
+                format!(
+                    " — this model needs a GPU op omarchy-mlx doesn't have yet. Options: run it on the CPU (discouraged, much slower){}",
+                    rec.map(|r| format!(", or download {r} instead")).unwrap_or_default()
+                )
+            } else {
+                String::new()
+            };
+            return Err(anyhow!("{} failed to load: {summary}{hint}  [{e:#}; log: {}]", m.name, log.display()));
         }
         let secs = t0.elapsed().as_secs_f64();
         sys::log(&format!("{} ready in {secs:.1}s", m.name));
@@ -413,6 +554,12 @@ impl Manager {
         let mut r = r;
         if let Some(rm) = Arc::get_mut(&mut r) {
             rm.load_secs = secs;
+            let mut note = launcher_notes(&log);
+            if let Some(h) = heap {
+                let extra = format!("GPU heap {:.1} GiB (raised for this model only)", gib(h));
+                note = if note.is_empty() { extra } else { format!("{note} · {extra}") };
+            }
+            rm.note = note;
         }
         Ok(r)
     }
@@ -480,7 +627,13 @@ impl Manager {
             if pgid > 0 {
                 unsafe { libc::kill(-pgid, libc::SIGKILL) };
             }
-            let _ = child.kill().await;
+            let _ = child.start_kill();
+            // A process stuck in the GPU driver ignores SIGKILL until the GPU
+            // lets go; don't block on it, remember it instead.
+            if tokio::time::timeout(Duration::from_secs(5), child.wait()).await.is_err() {
+                sys::log(&format!("{} backend (pid {}) did not exit after SIGKILL; GPU may be hung", r.name, r.pid));
+                self.exiting.lock().unwrap().push(r.pid);
+            }
         }
     }
 
@@ -545,6 +698,19 @@ impl Manager {
         }
         Ok(false)
     }
+}
+
+/// Warnings the MLX launcher printed for the current load (after the last spawn marker).
+fn launcher_notes(log: &std::path::Path) -> String {
+    let text = sys::read_tail(log, 64 * 1024);
+    let start = text.rfind("===== ").unwrap_or(0);
+    text[start..]
+        .lines()
+        .filter_map(|l| l.strip_prefix("lmdeck: "))
+        .filter(|l| l.contains("not supported") || l.contains("not applicable"))
+        .map(|l| l.split(" (").next().unwrap_or(l).to_string() + l.rsplit(';').next().map(|t| format!(";{t}")).unwrap_or_default().as_str())
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// Fingerprint of everything that shapes a backend process for `m`.

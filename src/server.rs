@@ -34,6 +34,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let app = App { mgr: Manager::new(cfg), dl: Downloads::default(), hf: hf::client(), started: Instant::now() };
 
+    // Probe GPU support for quantization modes once per runtime (a few seconds).
+    let probe_cfg = app.mgr.cfg();
+    tokio::task::spawn_blocking(move || crate::compat::probe(&probe_cfg));
+
     let flusher = app.mgr.clone();
     tokio::spawn(async move {
         loop {
@@ -81,6 +85,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/lmdeck/search", get(lm_search))
         .route("/lmdeck/repo", get(lm_repo))
         .route("/lmdeck/restart", post(lm_restart))
+        .route("/lmdeck/override", post(lm_override))
+        .route("/lmdeck/compat", get(lm_compat))
+        .route("/lmdeck/plan", get(lm_plan))
         .with_state(app.clone());
 
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| anyhow::anyhow!("binding {addr}: {e} (is Ollama or another lmdeck running?)"))?;
@@ -909,8 +916,11 @@ fn status_value(a: &App) -> Value {
         "llama.cache_type_v",
         "llama.cache_reuse",
         "mlx.prompt_cache_size",
+        "mlx.kv_bits",
+        "mlx.max_kv_size",
         "mlx.fast_path",
         "server.mem_check",
+        "server.gpu_heap",
     ]
     .iter()
     .map(|k| (k.to_string(), json!(crate::config::get_setting(&cfg, k))))
@@ -928,7 +938,7 @@ fn status_value(a: &App) -> Value {
         "running": a.mgr.views(),
         "loading": a.mgr.loading(),
         "downloads": a.dl.list(),
-        "mem": {"total": total, "available": avail},
+        "mem": {"total": total, "available": avail, "gpu_budget": crate::compat::gpu_budget(), "muvm": sys::muvm_rss()},
         "usage": USAGE.summary(),
         "settings": quick,
     })
@@ -957,7 +967,7 @@ async fn lm_config_get(State(a): State<App>) -> Json<Value> {
     let cfg = a.mgr.cfg();
     Json(json!(crate::config::SETTINGS
         .iter()
-        .map(|(k, help)| json!({"key": k, "value": crate::config::get_setting(&cfg, k), "help": help, "reload": crate::config::needs_reload(k)}))
+        .map(|(sec, k, help)| json!({"section": sec, "key": k, "value": crate::config::get_setting(&cfg, k), "help": help, "reload": crate::config::needs_reload(k)}))
         .collect::<Vec<_>>()))
 }
 
@@ -994,7 +1004,20 @@ struct SearchQ {
 async fn lm_search(State(a): State<App>, Query(q): Query<SearchQ>) -> Resp {
     let kind = q.kind.unwrap_or_else(|| "mlx".into());
     match hf::search(&a.hf, q.q.as_deref().unwrap_or(""), &kind, q.limit.unwrap_or(30).min(100)).await {
-        Ok(h) => Json(json!(h)).into_response(),
+        Ok(h) => {
+            let cfg = a.mgr.cfg();
+            let out: Vec<Value> = h
+                .iter()
+                .map(|hit| {
+                    let mut v = json!(hit);
+                    if kind != "gguf" {
+                        v["compat"] = json!(crate::compat::assess_mlx(&cfg, &hit.id, None));
+                    }
+                    v
+                })
+                .collect();
+            Json(json!(out)).into_response()
+        }
         Err(e) => err(StatusCode::BAD_GATEWAY, format!("{e:#}")),
     }
 }
@@ -1007,24 +1030,47 @@ struct RepoQ {
 async fn lm_repo(State(a): State<App>, Query(q): Query<RepoQ>) -> Resp {
     let res = async {
         let sha = hf::repo_sha(&a.hf, &q.id, "main").await?;
-        hf::repo_files(&a.hf, &q.id, &sha).await
+        let files = hf::repo_files(&a.hf, &q.id, &sha).await?;
+        // The MLX quantization mode lives in config.json; small, so just read it.
+        let mut qmode = None;
+        if files.iter().any(|f| f.path == "config.json") && files.iter().any(|f| f.path.ends_with(".safetensors")) {
+            if let Ok(r) = a.hf.get(format!("{}/{}/resolve/{sha}/config.json", hf::HF, q.id)).send().await {
+                if let Ok(v) = r.json::<Value>().await {
+                    let qc = v.get("quantization").or_else(|| v.get("quantization_config"));
+                    qmode = qc.and_then(|x| x.get("mode")).and_then(|m| m.as_str()).map(str::to_string).or_else(|| qc.map(|_| "affine".into()));
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>((files, qmode))
     }
     .await;
     match res {
-        Ok(files) => {
+        Ok((files, qmode)) => {
             let (total, avail) = sys::mem();
             let cfg = a.mgr.cfg();
-            let out: Vec<Value> = hf::choices(&q.id, &files, &cfg.download.gguf_default_quant)
+            let choices: Vec<Value> = hf::choices(&q.id, &files, &cfg.download.gguf_default_quant)
                 .into_iter()
                 .map(|c| {
-                    let need = c.size + c.size / 10;
-                    let fit = if need + (2u64 << 30) < avail { "fits" } else if need < total { "tight" } else { "too big" };
+                    // GPU budget is the real limit on Asahi (about half of RAM).
+                    let fit = crate::compat::gpu_fit(c.size, cfg.llama.ctx_size as u64);
+                    let _ = (total, avail);
                     let mut v = json!(c);
                     v["fit"] = json!(fit);
                     v
                 })
                 .collect();
-            Json(json!(out)).into_response()
+            let has_mlx = choices.iter().any(|c| c["format"] == "mlx");
+            let mut compat = has_mlx.then(|| crate::compat::assess_mlx(&cfg, &q.id, qmode.as_deref()));
+            // Only recommend a repo that actually exists.
+            if let Some(v) = compat.as_mut() {
+                if let Some(rec) = v.recommend.clone() {
+                    let ok = a.hf.get(format!("{}/api/models/{rec}", hf::HF)).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+                    if !ok {
+                        v.recommend = None;
+                    }
+                }
+            }
+            Json(json!({"choices": choices, "compat": compat, "qmode": qmode})).into_response()
         }
         Err(e) => err(StatusCode::BAD_GATEWAY, format!("{e:#}")),
     }
@@ -1079,14 +1125,95 @@ fn extract_usage(tail: &[u8]) -> Option<(u64, u64)> {
 
 async fn lm_models(State(a): State<App>) -> Json<Value> {
     a.mgr.invalidate();
-    Json(json!(&*a.mgr.models()))
+    let cfg = a.mgr.cfg();
+    let out: Vec<Value> = a
+        .mgr
+        .models()
+        .iter()
+        .map(|m| {
+            let mut v = json!(m);
+            v["device"] = json!(cfg.overrides.get(&m.name).and_then(|o| o.device.clone()).unwrap_or_else(|| "gpu".into()));
+            v["gpu_fit"] = json!(crate::compat::gpu_fit(m.size, cfg.llama.ctx_size as u64));
+            if m.format == Format::Mlx {
+                v["compat"] = json!(crate::compat::assess_mlx(&cfg, m.repo.as_deref().unwrap_or(&m.name), m.qmode.as_deref()));
+            }
+            v
+        })
+        .collect();
+    Json(json!(out))
+}
+
+/// Per-model override: {model, key: device|ctx_size|keep_alive, value ("" clears)}.
+async fn lm_override(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
+    let (Some(name), Some(key)) = (model_field(&b), b.get("key").and_then(|k| k.as_str())) else {
+        return err(StatusCode::BAD_REQUEST, "model and key are required");
+    };
+    let value = match b.get("value") {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Null) | None => String::new(),
+        Some(v) => v.to_string(),
+    };
+    let m = match a.mgr.resolve(&name) {
+        Ok(m) => m,
+        Err(e) => return not_found_or_500(e),
+    };
+    let mut cfg = a.mgr.cfg();
+    let o = cfg.overrides.entry(m.name.clone()).or_default();
+    match key {
+        "device" => {
+            if !["", "gpu", "cpu"].contains(&value.as_str()) {
+                return err(StatusCode::BAD_REQUEST, "device must be gpu or cpu");
+            }
+            o.device = (value == "cpu").then(|| value.clone());
+        }
+        "ctx_size" => o.ctx_size = value.parse().ok(),
+        "keep_alive" => o.keep_alive = (!value.is_empty()).then(|| value.clone()),
+        _ => return err(StatusCode::BAD_REQUEST, "unknown override key"),
+    }
+    if let Err(e) = cfg.save() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    *a.mgr.cfg.write().unwrap() = cfg;
+    EVENTS.bump();
+    sys::log(&format!("override {}: {key} = {value:?}", m.name));
+    Json(json!({"ok": true})).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct PlanQ {
+    model: String,
+}
+
+async fn lm_plan(State(a): State<App>, Query(q): Query<PlanQ>) -> Json<Value> {
+    Json(a.mgr.plan_preview(&q.model))
+}
+
+async fn lm_compat(State(a): State<App>) -> Json<Value> {
+    let cfg = a.mgr.cfg();
+    let p = tokio::task::spawn_blocking(move || crate::compat::probe(&cfg)).await.ok().flatten();
+    Json(json!({"probe": p, "catalog": crate::compat::catalog()}))
 }
 
 async fn lm_load(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let Some(name) = model_field(&b) else { return err(StatusCode::BAD_REQUEST, "model is required") };
     match a.mgr.acquire(&name, keep_alive_field(&b).as_deref()).await {
         Ok((g, secs)) => Json(json!({"model": g.0.name, "load_secs": secs, "port": g.0.port})).into_response(),
-        Err(e) => not_found_or_500(e),
+        Err(e) => {
+            let text = format!("{e:#}");
+            if !crate::compat::is_gpu_gap(&text) {
+                return not_found_or_500(e);
+            }
+            // Structured so the TUI/panel can offer "run on CPU" or the recommended download.
+            let model = a.mgr.resolve(&name).ok();
+            let recommend = model.as_ref().filter(|m| m.format == Format::Mlx).and_then(|m| {
+                crate::compat::assess_mlx(&a.mgr.cfg(), m.repo.as_deref().unwrap_or(&m.name), m.qmode.as_deref()).recommend
+            });
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": text, "gpu_gap": true, "model": model.map(|m| m.name).unwrap_or(name), "recommend": recommend})),
+            )
+                .into_response()
+        }
     }
 }
 
