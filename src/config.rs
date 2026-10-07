@@ -67,6 +67,11 @@ pub struct DownloadCfg {
 pub struct MlxCfg {
     /// Command prefix that starts an OpenAI-compatible MLX server.
     pub command: Vec<String>,
+    /// Swap `-m mlx_lm.server` for lmdeck's launcher that removes a per-token
+    /// GPU sync in mlx_lm.server (~2x decode on omarchy-mlx).
+    pub fast_path: bool,
+    /// Use mlx_lm's batched generator (only helps with concurrent requests).
+    pub batching: bool,
     pub extra_args: Vec<String>,
     pub env: BTreeMap<String, String>,
 }
@@ -158,6 +163,8 @@ impl Default for MlxCfg {
     fn default() -> Self {
         Self {
             command: vec!["mlx-omarchy".into(), "-m".into(), "mlx_lm.server".into()],
+            fast_path: true,
+            batching: false,
             extra_args: vec![],
             env: BTreeMap::new(),
         }

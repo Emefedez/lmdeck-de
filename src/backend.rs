@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::process::{Child, Command};
 
+const MLX_SHIM: &str = include_str!("mlx_fast_server.py");
+
 pub struct Running {
     pub name: String,
     pub model: LocalModel,
@@ -254,9 +256,20 @@ impl Manager {
         let (mut argv, mut env): (Vec<String>, Vec<(String, String)>) = match m.format {
             Format::Mlx => {
                 let mut a = cfg.mlx.command.clone();
+                if cfg.mlx.fast_path && a.len() >= 2 && a[a.len() - 2..] == ["-m", "mlx_lm.server"] {
+                    let shim = crate::config::data_dir().join("mlx_fast_server.py");
+                    if std::fs::read_to_string(&shim).ok().as_deref() != Some(MLX_SHIM) {
+                        std::fs::create_dir_all(crate::config::data_dir())?;
+                        std::fs::write(&shim, MLX_SHIM)?;
+                    }
+                    a.truncate(a.len() - 2);
+                    a.push(shim.display().to_string());
+                }
                 a.extend(["--model".into(), m.path.display().to_string(), "--host".into(), "127.0.0.1".into(), "--port".into(), port.to_string()]);
                 a.extend(cfg.mlx.extra_args.clone());
-                (a, cfg.mlx.env.clone().into_iter().collect())
+                let mut env: Vec<(String, String)> = cfg.mlx.env.clone().into_iter().collect();
+                env.push(("LMDECK_MLX_BATCH".into(), if cfg.mlx.batching { "1" } else { "0" }.into()));
+                (a, env)
             }
             Format::Gguf => {
                 let bin = cfg.llama_server().ok_or_else(|| {

@@ -87,6 +87,20 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
 // ---------- helpers ----------
 
+/// JSON body extractor that ignores Content-Type (Ollama accepts bare `curl -d`).
+pub struct AnyJson(pub Value);
+
+impl<S: Send + Sync> axum::extract::FromRequest<S> for AnyJson {
+    type Rejection = Response;
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        let b = Bytes::from_request(req, state).await.map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+        if b.is_empty() {
+            return Ok(AnyJson(json!({})));
+        }
+        serde_json::from_slice(&b).map(AnyJson).map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))
+    }
+}
+
 type Resp = Response;
 
 fn err(code: StatusCode, msg: impl std::fmt::Display) -> Resp {
@@ -179,7 +193,7 @@ async fn ps(State(a): State<App>) -> Json<Value> {
     Json(json!({"models": models}))
 }
 
-async fn show(State(a): State<App>, Json(b): Json<Value>) -> Resp {
+async fn show(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let Some(name) = model_field(&b) else { return err(StatusCode::BAD_REQUEST, "model is required") };
     let m = match a.mgr.resolve(&name) {
         Ok(m) => m,
@@ -208,7 +222,7 @@ async fn show(State(a): State<App>, Json(b): Json<Value>) -> Resp {
     .into_response()
 }
 
-async fn copy(State(a): State<App>, Json(b): Json<Value>) -> Resp {
+async fn copy(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let (Some(src), Some(dst)) = (b.get("source").and_then(|v| v.as_str()), b.get("destination").and_then(|v| v.as_str())) else {
         return err(StatusCode::BAD_REQUEST, "source and destination are required");
     };
@@ -225,7 +239,7 @@ async fn copy(State(a): State<App>, Json(b): Json<Value>) -> Resp {
     StatusCode::OK.into_response()
 }
 
-async fn delete_model(State(a): State<App>, Json(b): Json<Value>) -> Resp {
+async fn delete_model(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let Some(name) = model_field(&b) else { return err(StatusCode::BAD_REQUEST, "model is required") };
     let m = match a.mgr.resolve(&name) {
         Ok(m) => m,
@@ -244,7 +258,7 @@ async fn delete_model(State(a): State<App>, Json(b): Json<Value>) -> Resp {
 
 // ---------- pull ----------
 
-async fn pull(State(a): State<App>, Json(b): Json<Value>) -> Resp {
+async fn pull(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let Some(name) = model_field(&b) else { return err(StatusCode::BAD_REQUEST, "model is required") };
     let stream = b.get("stream").and_then(|v| v.as_bool()).unwrap_or(true);
     let d = a.dl.start(a.hf.clone(), a.mgr.cfg(), &name);
@@ -559,12 +573,12 @@ fn final_stats(acc: &Acc, t0: Instant, load: f64, t_sent: Instant) -> Value {
     })
 }
 
-async fn chat(State(a): State<App>, Json(b): Json<Value>) -> Resp {
+async fn chat(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let msgs = b.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default();
     ollama_generate(a, b, convert_messages(&msgs), true).await
 }
 
-async fn generate(State(a): State<App>, Json(b): Json<Value>) -> Resp {
+async fn generate(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let prompt = b.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
     let mut msgs = Vec::new();
     if let Some(s) = b.get("system").and_then(|s| s.as_str()) {
@@ -717,7 +731,7 @@ async fn embed_inner(a: &App, model: &str, input: Value, ka: Option<String>) -> 
     Ok((g.0.name.clone(), embs, n))
 }
 
-async fn embed(State(a): State<App>, Json(b): Json<Value>) -> Resp {
+async fn embed(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let t0 = Instant::now();
     let Some(model) = model_field(&b) else { return err(StatusCode::BAD_REQUEST, "model is required") };
     let input = b.get("input").cloned().unwrap_or(json!(""));
@@ -727,7 +741,7 @@ async fn embed(State(a): State<App>, Json(b): Json<Value>) -> Resp {
     }
 }
 
-async fn embeddings_legacy(State(a): State<App>, Json(b): Json<Value>) -> Resp {
+async fn embeddings_legacy(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let Some(model) = model_field(&b) else { return err(StatusCode::BAD_REQUEST, "model is required") };
     let input = b.get("prompt").cloned().unwrap_or(json!(""));
     match embed_inner(&a, &model, input, keep_alive_field(&b)).await {
@@ -862,7 +876,7 @@ async fn lm_models(State(a): State<App>) -> Json<Value> {
     Json(json!(&*a.mgr.models()))
 }
 
-async fn lm_load(State(a): State<App>, Json(b): Json<Value>) -> Resp {
+async fn lm_load(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let Some(name) = model_field(&b) else { return err(StatusCode::BAD_REQUEST, "model is required") };
     match a.mgr.acquire(&name, keep_alive_field(&b).as_deref()).await {
         Ok((g, secs)) => Json(json!({"model": g.0.name, "load_secs": secs, "port": g.0.port})).into_response(),
@@ -870,7 +884,7 @@ async fn lm_load(State(a): State<App>, Json(b): Json<Value>) -> Resp {
     }
 }
 
-async fn lm_unload(State(a): State<App>, Json(b): Json<Value>) -> Resp {
+async fn lm_unload(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     match model_field(&b) {
         Some(n) => match a.mgr.unload(&n).await {
             Ok(()) => Json(json!({"ok": true})).into_response(),
@@ -883,13 +897,13 @@ async fn lm_unload(State(a): State<App>, Json(b): Json<Value>) -> Resp {
     }
 }
 
-async fn lm_pull(State(a): State<App>, Json(b): Json<Value>) -> Resp {
+async fn lm_pull(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let Some(name) = model_field(&b) else { return err(StatusCode::BAD_REQUEST, "model is required") };
     let d = a.dl.start(a.hf.clone(), a.mgr.cfg(), &name);
     Json(json!(d.view())).into_response()
 }
 
-async fn lm_cancel(State(a): State<App>, Json(b): Json<Value>) -> Resp {
+async fn lm_cancel(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let Some(name) = model_field(&b) else { return err(StatusCode::BAD_REQUEST, "model is required") };
     Json(json!({"ok": a.dl.cancel(&name)})).into_response()
 }
