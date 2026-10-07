@@ -434,3 +434,24 @@ pub fn install_menu() -> anyhow::Result<PathBuf> {
     let _ = std::process::Command::new("omarchy-menu").arg("refresh").output();
     Ok(p)
 }
+
+#[cfg(test)]
+mod tests {
+    fn bash_n(script: &str) {
+        let o = std::process::Command::new("bash").arg("-n").arg("-c").arg(script).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    #[test]
+    fn scripts_parse() {
+        bash_n(&super::script_migrate(false));
+        bash_n(&super::script_migrate(true));
+        bash_n(&super::script_update_mlx());
+        bash_n(&super::script_build_llama(&crate::config::Config::default()));
+    }
+
+    #[test]
+    fn rfc3339_epoch() {
+        assert_eq!(super::rfc3339(std::time::UNIX_EPOCH), "1970-01-01T00:00:00.000000000Z");
+    }
+}
