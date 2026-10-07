@@ -67,7 +67,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SvcCmd,
     },
-    /// Install the desktop/launcher entry
+    /// Install the launcher (.desktop) and Omarchy menu entries
     Desktop,
 }
 
@@ -83,6 +83,8 @@ enum SvcCmd {
     Uninstall,
     Start,
     Stop,
+    /// Start if stopped, stop if running (used by the Omarchy menu)
+    Toggle,
     Status,
 }
 
@@ -185,6 +187,20 @@ async fn async_main(cli: Cli) -> Result<()> {
                 }
                 SvcCmd::Start => client::start_daemon()?,
                 SvcCmd::Stop => client::stop_daemon(d.status().await.and_then(|s| s["pid"].as_u64()).map(|p| p as u32))?,
+                SvcCmd::Toggle => match d.status().await {
+                    Some(s) => {
+                        client::stop_daemon(s["pid"].as_u64().map(|p| p as u32))?;
+                        let _ = std::process::Command::new("notify-send").args(["lmdeck", "Local LLM server stopped"]).status();
+                    }
+                    None => {
+                        if !sys::service_installed() {
+                            sys::install_service()?;
+                        } else {
+                            client::start_daemon()?;
+                        }
+                        let _ = std::process::Command::new("notify-send").args(["lmdeck", &format!("Local LLM server on {}", cfg.base_url())]).status();
+                    }
+                },
                 SvcCmd::Status => {
                     let o = sys::systemctl(&["status", "lmdeck", "--no-pager"])?;
                     std::io::stdout().write_all(&o.stdout)?;
@@ -194,6 +210,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Some(Cmd::Desktop) => {
             println!("wrote {}", sys::desktop_entry()?.display());
+            println!("updated {}", sys::install_menu()?.display());
             Ok(())
         }
     }

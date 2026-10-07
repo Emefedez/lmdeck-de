@@ -68,9 +68,9 @@ pub async fn search(c: &reqwest::Client, query: &str, kind: &str, limit: usize) 
         ("direction", "-1".into()),
         ("limit", limit.to_string()),
     ];
-    match kind {
-        "gguf" => q.push(("filter", "gguf".into())),
-        _ => q.push(("library", "mlx".into())),
+    q.push(("filter", if kind == "gguf" { "gguf" } else { "mlx" }.into()));
+    for f in ["downloads", "likes", "lastModified", "pipeline_tag", "gated"] {
+        q.push(("expand[]", f.into()));
     }
     let r = auth(c.get(format!("{HF}/api/models")).query(&q)).send().await?.error_for_status()?;
     Ok(r.json().await?)
@@ -161,6 +161,7 @@ pub fn gguf_quants(files: &[RepoFile]) -> Vec<(String, u64)> {
             None => m.push((tag, f.size)),
         }
     }
+    m.sort_by_key(|(_, s)| *s);
     m
 }
 

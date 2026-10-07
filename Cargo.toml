@@ -1,4 +1,6 @@
 [package]
+description = "Local model deck for Omarchy: MLX on the Apple GPU + GGUF via llama.cpp, Ollama/OpenAI compatible"
+license = "MIT"
 name = "lmdeck"
 version = "0.1.0"
 edition = "2024"

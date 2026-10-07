@@ -268,7 +268,8 @@ fn find_named(dir: &std::path::Path, name: &str, depth: u32, out: &mut Vec<std::
             let n = e.file_name();
             let n = n.to_string_lossy();
             // Don't crawl all of site-packages; the serve package is what we want.
-            if n == "__pycache__" || (n.contains('-') && n.ends_with("info")) {
+            let in_site = dir.file_name().map(|d| d == "site-packages").unwrap_or(false);
+            if n == "__pycache__" || (in_site && !n.starts_with("mlx_omarchy")) {
                 continue;
             }
             find_named(&p, name, depth - 1, out);
@@ -288,7 +289,7 @@ const SETTINGS: &[(&str, &str)] = &[
     ("server.load_timeout_secs", "Max seconds to load a model"),
     ("server.mem_check", "Refuse loads that would not fit in RAM (true/false)"),
     ("server.mem_reserve_gib", "RAM kept free for the desktop (GiB)"),
-    ("server.uclamp_boost", "Run backends with uclampset -m 1024 (faster decode)"),
+    ("server.uclamp_boost", "Run backends under uclampset -m 1024 (helps on power-saver profiles)"),
     ("models.hf_cache", "Hugging Face cache dir (empty = default)"),
     ("models.extra_dirs", "Extra dirs with loose .gguf files (comma separated)"),
     ("download.connections", "Parallel connections per large file"),
@@ -685,8 +686,8 @@ impl Ui {
                 Ok(()) => self.toast("user service installed & enabled (starts at login)"),
                 Err(e) => self.toast(format!("service install failed: {e}")),
             },
-            KeyCode::Char('D') => match sys::desktop_entry() {
-                Ok(p) => self.toast(format!("launcher entry written: {}", p.display())),
+            KeyCode::Char('D') => match sys::desktop_entry().and_then(|_| sys::install_menu()) {
+                Ok(_) => self.toast("launcher + Omarchy menu entries installed (apps › lmdeck, setup › Local LLM Server)"),
                 Err(e) => self.toast(format!("failed: {e}")),
             },
             KeyCode::Char('a') => self.spawn_daemon_op("unloading all".into(), |d| async move {
@@ -831,7 +832,8 @@ impl Ui {
             out.push((rv.repo.clone(), "MLX / safetensors (whole repo)".into(), size));
         }
         for (q, s) in hf::gguf_quants(files) {
-            out.push((format!("{}:{q}", rv.repo), format!("GGUF {q}"), s));
+            let star = if q.eq_ignore_ascii_case(&self.cfg.download.gguf_default_quant) { " ★" } else { "" };
+            out.push((format!("{}:{q}", rv.repo), format!("GGUF {q}{star}"), s));
         }
         out
     }

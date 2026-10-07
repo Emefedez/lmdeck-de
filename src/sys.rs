@@ -292,7 +292,7 @@ DIR="{dir}"
 REF="{gitref}"
 say "Building llama.cpp ($REF) with the Vulkan backend into $DIR"
 need=()
-for p in git cmake shaderc vulkan-headers vulkan-icd-loader; do pacman -Q "$p" >/dev/null 2>&1 || need+=("$p"); done
+for p in git cmake shaderc spirv-headers vulkan-headers vulkan-icd-loader; do pacman -Q "$p" >/dev/null 2>&1 || need+=("$p"); done
 if ((${{#need[@]}})); then
   say "Installing build deps: ${{need[*]}}"
   if command -v omarchy-pkg-add >/dev/null; then omarchy-pkg-add "${{need[@]}}"; else sudo pacman -S --needed "${{need[@]}}"; fi || die "deps"
@@ -384,7 +384,13 @@ pub fn install_service() -> anyhow::Result<()> {
 pub fn desktop_entry() -> anyhow::Result<PathBuf> {
     let p = home().join(".local/share/applications/lmdeck.desktop");
     std::fs::create_dir_all(p.parent().unwrap())?;
-    let launcher = if which("omarchy-launch-tui").is_some() { "omarchy-launch-tui " } else { "xdg-terminal-exec " };
+    let launcher = if which("omarchy-launch-or-focus-tui").is_some() {
+        "omarchy-launch-or-focus-tui "
+    } else if which("omarchy-launch-tui").is_some() {
+        "omarchy-launch-tui "
+    } else {
+        "xdg-terminal-exec "
+    };
     std::fs::write(
         &p,
         format!(
@@ -392,6 +398,39 @@ pub fn desktop_entry() -> anyhow::Result<PathBuf> {
             exe_path().display()
         ),
     )?;
+    let _ = std::process::Command::new("omarchy-menu").arg("refresh").output();
+    Ok(p)
+}
+
+/// Add (or refresh) lmdeck rows in the Omarchy menu extension file.
+pub fn install_menu() -> anyhow::Result<PathBuf> {
+    let p = home().join(".config/omarchy/extensions/omarchy-menu.jsonc");
+    let exe = exe_path().display().to_string();
+    let launch = if which("omarchy-launch-or-focus-tui").is_some() { "omarchy-launch-or-focus-tui" } else { "omarchy-launch-tui" };
+    let block = format!(
+        r#"  // lmdeck-menu-start
+  "apps.lmdeck": {{"icon":"󰧑","label":"lmdeck","aliases":["lmdeck","llm","models","mlx","ollama","gguf"],"description":"Local models: MLX on the Apple GPU + GGUF, Ollama/OpenAI-compatible server","action":"{launch} {exe}"}},
+  "setup.lmdeck-server": {{"icon":"󰒋","label":"Local LLM Server","aliases":["llm-server","lmdeck-server"],"description":"Toggle the lmdeck model server (port 11434)","action":"{exe} service toggle","checked":"systemctl --user is-active --quiet lmdeck"}},
+  // lmdeck-menu-end
+"#
+    );
+    let cur = std::fs::read_to_string(&p).unwrap_or_else(|_| "{\n}\n".into());
+    let new = if let (Some(a), Some(b)) = (cur.find("  // lmdeck-menu-start"), cur.find("// lmdeck-menu-end\n")) {
+        format!("{}{}{}", &cur[..a], block, &cur[b + "// lmdeck-menu-end\n".len()..])
+    } else if let Some(i) = cur.find("  // Extend the Quickshell") {
+        format!("{}{}\n{}", &cur[..i], block, &cur[i..])
+    } else {
+        let i = cur.rfind('}').unwrap_or(cur.len());
+        format!("{}{}{}", &cur[..i], block, &cur[i..])
+    };
+    if new != cur {
+        if p.exists() {
+            let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            std::fs::copy(&p, p.with_extension(format!("jsonc.bak.lmdeck-{ts}")))?;
+        }
+        std::fs::create_dir_all(p.parent().unwrap())?;
+        std::fs::write(&p, new)?;
+    }
     let _ = std::process::Command::new("omarchy-menu").arg("refresh").output();
     Ok(p)
 }

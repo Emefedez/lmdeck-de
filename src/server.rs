@@ -628,7 +628,7 @@ async fn ollama_generate(a: App, b: Value, messages: Vec<Value>, is_chat: bool) 
     let t_sent = Instant::now();
     let resp = match a.mgr.http.post(format!("{}/v1/chat/completions", guard.0.base())).json(&body).send().await {
         Ok(r) => r,
-        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("backend unreachable: {e}")),
+        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("backend dropped the request: {e}\n{}", sys::tail(&guard.0.log, 4))),
     };
     if !resp.status().is_success() {
         let code = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -799,7 +799,7 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
     }
     let resp = match rb.send().await {
         Ok(r) => r,
-        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("backend unreachable: {e}")),
+        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("backend dropped the request: {e}\n{}", sys::tail(&guard.0.log, 4))),
     };
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let ctype = resp.headers().get("content-type").cloned();
