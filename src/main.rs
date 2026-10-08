@@ -70,7 +70,7 @@ enum Cmd {
     Update,
     /// Select an installed MLX runtime; optionally remove the other runtime
     Runtime {
-        #[arg(value_parser = ["omarchy", "custom"])]
+        #[arg(value_parser = ["omarchy", "custom", "fixed"])]
         source: String,
         /// Keep only this runtime (models, chat data, and GPU driver are kept)
         #[arg(long)]
@@ -229,6 +229,9 @@ async fn async_main(cli: Cli) -> Result<()> {
         Some(Cmd::Migrate { ane }) => run_script(&sys::script_migrate(ane)),
         Some(Cmd::Update) => run_script(&sys::script_update_menu()),
         Some(Cmd::Runtime { source, only }) => {
+            if only && source == "fixed" {
+                bail!("--only is for omarchy/custom; the Fixed runtime lives in its own folder and leaves the others alone");
+            }
             let path = sys::mlx_runtime_path(&source);
             if !path.is_file() {
                 bail!("{} runtime is not installed; run lmdeck update first", source);

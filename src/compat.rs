@@ -303,7 +303,12 @@ pub fn runtime_bins_buffers(python_or_wrapper: &str) -> bool {
         .filter_map(|e| e.file_name().into_string().ok())
         .find_map(|n| n.strip_prefix("mlx_omarchy-").and_then(|r| r.split(".dev").nth(1)).map(|d| d.chars().take(12).collect::<String>()))
         .and_then(|d| d.parse::<u64>().ok());
-    let bins = stamp.is_some_and(|s| s > 202610051840);
+    // lmdeck's Fixed runtime replaces the bins with fine size classes (mlx-omarchy-fixes/0001).
+    let fixed = std::fs::read_dir(&venv).ok().into_iter().flatten().flatten()
+        .filter_map(|pyd| std::fs::read_dir(pyd.path().join("site-packages")).ok())
+        .flatten().flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with("mlx_omarchy-") && e.file_name().to_string_lossy().contains("lmdeckfix"));
+    let bins = !fixed && stamp.is_some_and(|s| s > 202610051840);
     cache.lock().unwrap().insert(python_or_wrapper.to_string(), bins);
     bins
 }
@@ -341,9 +346,21 @@ pub struct HardwareAdvice {
 }
 
 pub fn hardware_advice(cfg: &Config, weights: u64, format: &str) -> HardwareAdvice {
-    let (total, available) = crate::sys::mem();
+    // Reuse one snapshot across all variants in a render/search response.
+    // Scanning /proc once per row would make large result lists expensive.
+    type Snapshot = (std::time::Instant, u64, u64, bool);
+    static MEMORY: LazyLock<Mutex<Option<Snapshot>>> = LazyLock::new(|| Mutex::new(None));
+    let (total, available, vm_running) = {
+        let mut cached = MEMORY.lock().unwrap();
+        if cached.as_ref().is_none_or(|s| s.0.elapsed() >= std::time::Duration::from_secs(1)) {
+            let (total, available) = crate::sys::mem();
+            *cached = Some((std::time::Instant::now(), total, available, crate::sys::muvm_rss().is_some()));
+        }
+        let (_, total, available, vm) = cached.as_ref().unwrap();
+        (*total, *available, *vm)
+    };
     let reserve = (cfg.server.mem_reserve_gib.max(0.0) * (1u64 << 30) as f64) as u64
-        + if crate::sys::muvm_rss().is_some() { (cfg.server.vm_reserve_gib.max(0.0) * (1u64 << 30) as f64) as u64 } else { 0 };
+        + if vm_running { (cfg.server.vm_reserve_gib.max(0.0) * (1u64 << 30) as f64) as u64 } else { 0 };
     hardware_advice_for(cfg, weights, format, total, available, reserve, gpu_budget())
 }
 

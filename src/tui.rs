@@ -594,6 +594,11 @@ impl Ui {
             self.input = match k.code {
                 KeyCode::Char('1') => Input::RuntimeKeep("omarchy".into()),
                 KeyCode::Char('2') => Input::RuntimeKeep("custom".into()),
+                KeyCode::Char('3') => {
+                    // The Fixed runtime has its own folder: select it, nothing to keep or remove.
+                    let exe = std::env::current_exe().ok().map(|p| p.display().to_string()).unwrap_or_else(|| "lmdeck".into());
+                    return Some(Action::Exec("select Fixed MLX runtime".into(), vec![exe, "runtime".into(), "fixed".into()]));
+                }
                 KeyCode::Char('q') | KeyCode::Esc => Input::None,
                 _ => Input::Runtime,
             };
@@ -621,6 +626,7 @@ impl Ui {
             return match k.code {
                 KeyCode::Char('1') => Some(Action::Script("update MLX via Omarchy".into(), sys::script_update_mlx())),
                 KeyCode::Char('2') => Some(Action::Script("update MLX via Custom Installer".into(), sys::script_update_mlx_custom())),
+                KeyCode::Char('3') => Some(Action::Script("build Fixed MLX runtime (release + lmdeck fixes)".into(), sys::script_build_mlx_fixed())),
                 KeyCode::Char('q' | 'Q') | KeyCode::Esc => None,
                 _ => { self.input = Input::Update; None }
             };
@@ -1391,15 +1397,16 @@ impl Ui {
             return;
         }
         if matches!(self.input, Input::Update) {
-            self.draw_choice(f, "Update MLX", "Choose how to install and update the MLX backend.\n\nOmarchy: system-managed packages, full system update first.\nCustom Installer: latest GitHub release in your home folder.\nBoth use the Apple GPU; release and model differences affect speed.\nYou can keep both runtimes or only the selected one afterwards.", &[
+            self.draw_choice(f, "Update MLX", "Choose how to install and update the MLX backend.\n\nOmarchy: system-managed packages, full system update first.\nCustom Installer: latest GitHub release in your home folder.\nFixed: the latest release built from source with lmdeck's fixes\n(GPU buffers sized to fit, so big models load); takes a while to build.\nAll use the Apple GPU; release and model differences affect speed.\nYou can keep both runtimes or only the selected one afterwards.", &[
                 ("1. Omarchy packages", KeyCode::Char('1')),
                 ("2. Custom Installer", KeyCode::Char('2')),
+                ("3. Fixed (build with lmdeck fixes)", KeyCode::Char('3')),
                 ("q. Cancel", KeyCode::Char('q')),
             ]);
             return;
         }
         if matches!(self.input, Input::Runtime) {
-            let description = format!("Choose an already installed runtime; this does not reinstall it.\n\nSelected: {}\nOmarchy package: {}\nCustom Installer: {}\n\n{}\nThe selected launcher is saved explicitly in lmdeck settings. Loaded models need a reload to switch.", self.versions.mlx_selected, self.versions.mlx_pkg.as_deref().unwrap_or("not installed — use Update MLX"), self.versions.mlx_legacy.as_deref().unwrap_or("not installed — use Update MLX"), {
+            let description = format!("Choose an already installed runtime; this does not reinstall it.\n\nSelected: {}\nOmarchy package: {}\nCustom Installer: {}\nFixed (release + lmdeck fixes): {}\n\n{}\nThe selected launcher is saved explicitly in lmdeck settings. Loaded models need a reload to switch.", self.versions.mlx_selected, self.versions.mlx_pkg.as_deref().unwrap_or("not installed — use Update MLX"), self.versions.mlx_legacy.as_deref().unwrap_or("not installed — use Update MLX"), self.versions.mlx_fixed.as_deref().unwrap_or("not built — Update MLX → 3"), {
                 let bins = |s: &str| crate::compat::runtime_bins_buffers(&sys::mlx_runtime_path(s).display().to_string());
                 match (bins("omarchy"), bins("custom")) {
                     (false, true) => "Memory: the Custom build rounds GPU buffers up to powers of two (often +30-40% for big models); the package does not.".to_string(),
@@ -1410,6 +1417,7 @@ impl Ui {
             self.draw_choice(f, "Choose MLX runtime", &description, &[
                 ("1. Use Omarchy package", KeyCode::Char('1')),
                 ("2. Use Custom Installer", KeyCode::Char('2')),
+                ("3. Use Fixed (release + lmdeck fixes)", KeyCode::Char('3')),
                 ("q. Cancel", KeyCode::Char('q')),
             ]);
             return;
@@ -1530,7 +1538,11 @@ impl Ui {
 
     fn draw_dashboard(&mut self, f: &mut Frame, area: Rect) {
         let server = if self.status.is_some() { "Stop server [s]" } else { "Start server [s]" };
-        let runtime = format!("MLX: {} [i]", if self.cfg.mlx.command.first().is_some_and(|c| c.starts_with("/usr/")) { "package" } else { "Custom" });
+        let runtime = format!("MLX: {} [i]", match self.cfg.mlx.command.first() {
+            Some(c) if c.starts_with("/usr/") => "package",
+            Some(c) if c.ends_with("-fixed") => "Fixed",
+            _ => "Custom",
+        });
         let primary = [(server, KeyCode::Char('s')), ("Update MLX [U]", KeyCode::Char('U')), (runtime.as_str(), KeyCode::Char('i')), ("Setup guide [?]", KeyCode::Char('?'))];
         let secondary = [("Models [2]", KeyCode::Char('2')), ("Free memory [f]", KeyCode::Char('f')), ("GGUF setup [B]", KeyCode::Char('B')), ("Reload models [R]", KeyCode::Char('R')), ("Unload all [a]", KeyCode::Char('a')), ("Cancel download [x]", KeyCode::Char('x'))];
         let width = area.width.saturating_sub(4);

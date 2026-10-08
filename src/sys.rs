@@ -344,6 +344,9 @@ pub struct Versions {
     pub mlx_pkg: Option<String>,
     pub mlx_pkg_repo: Option<String>,
     pub mlx_legacy: Option<String>,
+    /// Release built from source with lmdeck's fixes (`lmdeck update` → 3).
+    #[serde(default)]
+    pub mlx_fixed: Option<String>,
     pub mlx_upstream: Option<String>,
     pub mlx_bin: Option<String>,
     #[serde(default)]
@@ -379,7 +382,34 @@ pub fn legacy_version() -> Option<String> {
 }
 
 pub fn mlx_runtime_path(source: &str) -> PathBuf {
-    if source == "custom" { home().join(".local/bin/mlx-omarchy") } else { PathBuf::from("/usr/bin/mlx-omarchy") }
+    match source {
+        "custom" => home().join(".local/bin/mlx-omarchy"),
+        "fixed" => home().join(".local/bin/mlx-omarchy-fixed"),
+        _ => PathBuf::from("/usr/bin/mlx-omarchy"),
+    }
+}
+
+/// Where the Fixed runtime (latest release + lmdeck's fixes) lives.
+pub fn fixed_prefix() -> PathBuf {
+    crate::config::data_dir().join("mlx-fixed")
+}
+
+/// lmdeck's mlx-omarchy fixes, applied on top of the latest release by the Fixed runtime build.
+pub const MLX_FIXES: &[(&str, &str)] = &[(
+    "0001-allocator-size-classes.patch",
+    include_str!("../mlx-omarchy-fixes/0001-allocator-size-classes.patch"),
+)];
+
+fn venv_mlx_version(venv: &Path) -> Option<String> {
+    for py in std::fs::read_dir(venv.join("lib")).ok()?.flatten() {
+        for e in std::fs::read_dir(py.path().join("site-packages")).ok()?.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if let Some(v) = n.strip_prefix("mlx_omarchy-").and_then(|v| v.strip_suffix(".dist-info")) {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub fn set_mlx_executable(cfg: &mut Config, path: &Path) {
@@ -413,6 +443,7 @@ pub fn versions_local(cfg: &Config) -> Versions {
         .and_then(|p| p.canonicalize().ok());
     let mlx_selected = match &mlx_bin {
         Some(bin) if mlx_runtime_path("custom").canonicalize().ok().as_ref() == Some(bin) => "Custom Installer",
+        Some(bin) if mlx_runtime_path("fixed").canonicalize().ok().as_ref() == Some(bin) => "Fixed (release + lmdeck fixes)",
         Some(bin) if mlx_runtime_path("omarchy").canonicalize().ok().as_ref() == Some(bin) => "Omarchy package",
         Some(_) => "Other executable",
         None => "not found",
@@ -422,6 +453,7 @@ pub fn versions_local(cfg: &Config) -> Versions {
         mlx_pkg: pkg,
         mlx_pkg_repo: repo,
         mlx_legacy: legacy,
+        mlx_fixed: venv_mlx_version(&fixed_prefix().join("venv")),
         mlx_upstream: None,
         mlx_bin: mlx_bin.map(|p| p.display().to_string()),
         mlx_selected: mlx_selected.into(),
@@ -582,6 +614,73 @@ say "Done. Reload models in lmdeck to use the selected runtime."
     )
 }
 
+/// Fixed runtime: build the latest release from source with lmdeck's fixes (MLX_FIXES) and install
+/// it beside the other runtimes, in its own venv and launcher (~/.local/bin/mlx-omarchy-fixed).
+pub fn script_build_mlx_fixed() -> String {
+    let prefix = fixed_prefix();
+    let mut write_patches = String::new();
+    for (name, body) in MLX_FIXES {
+        write_patches.push_str(&format!("cat > \"$PREFIX/patches/{name}\" <<'LMDECK_PATCH_EOF'\n{body}LMDECK_PATCH_EOF\n"));
+    }
+    format!(
+        r#"{HEADER}
+PREFIX="{prefix}"
+SRC="$PREFIX/src"
+VENV="$PREFIX/venv"
+for tool in git cmake glslc python3 patch; do command -v "$tool" >/dev/null || die "$tool is missing (needed to build the runtime)"; done
+say "Resolving the latest omarchy-mlx GitHub release"
+release="$(curl -fsSL https://api.github.com/repos/{MLX_REPO}/releases/latest | python3 -c 'import json, re, sys; tag=json.load(sys.stdin)["tag_name"]; assert re.fullmatch(r"v[0-9]+(?:\.[0-9]+)+(?:[-+][A-Za-z0-9.-]+)?", tag), "invalid release tag"; print(tag)')" || die "could not resolve the latest release"
+mkdir -p "$PREFIX/patches" || die "could not create $PREFIX"
+if [[ ! -d "$SRC/.git" ]]; then
+  say "Cloning {MLX_REPO}"
+  git clone --quiet "https://github.com/{MLX_REPO}.git" "$SRC" || die "clone failed"
+fi
+git -C "$SRC" fetch --quiet --tags origin || die "fetch failed"
+git -C "$SRC" checkout --quiet --force "$release" || die "could not check out $release"
+# Keep .work (the prepared upstream tree and build cache) so rebuilds are faster.
+git -C "$SRC" clean -fdxq -e .work || die "could not clean the source tree"
+{write_patches}
+for p in "$PREFIX"/patches/*.patch; do
+  if ! git -C "$SRC" apply --check "$p" 2>/dev/null; then
+    die "lmdeck fix $(basename "$p") does not apply to $release; upstream may have changed or fixed it. Use the Omarchy or Custom runtime."
+  fi
+  git -C "$SRC" apply "$p" || die "could not apply $(basename "$p")"
+  say "Applied $(basename "$p")"
+done
+bundle=""
+for b in "$HOME/{LEGACY_PREFIX}/venv"/lib/python3*/site-packages/mlx/share/mlx-omarchy/parakeet-1/bundles/parakeet-encoder-whole          /usr/lib/omarchy-mlx/venv/lib/python3*/site-packages/mlx/share/mlx-omarchy/parakeet-1/bundles/parakeet-encoder-whole; do
+  [[ -f "$b/program-0.anec" ]] && bundle="$b" && break
+done
+[[ -n "$bundle" ]] || warn "no installed Parakeet encoder bundle found; the build may refuse without one (install the Omarchy or Custom runtime first)"
+commit="$(git -C "$SRC" rev-parse --short=7 HEAD)"
+say "Building $release with lmdeck fixes (this takes a while)"
+( cd "$SRC" && DEV_RELEASE=1 MLX_OMARCHY_WHOLE_BUNDLE_DIR="$bundle" MLX_OMARCHY_LOCAL_VERSION="lmdeckfix.${{commit}}" nice -n 10 ./scripts/build-wheel.sh ) || die "build failed"
+wheel="$(ls "$SRC"/dist/*.whl 2>/dev/null | head -n1)"
+[[ -n "$wheel" ]] || die "the build produced no wheel"
+mlx_lm="$(sed -n 's/^MLX_LM_VERSION=//p' "$SRC/install.sh" | head -n1)"
+transformers="$(sed -n 's/^TRANSFORMERS_VERSION=//p' "$SRC/install.sh" | head -n1)"
+say "Installing into $VENV"
+python3 -m venv --clear "$VENV" || die "could not create the venv"
+export PIP_NO_CACHE_DIR=1
+"$VENV/bin/pip" install --quiet --upgrade pip || die "pip upgrade failed"
+"$VENV/bin/pip" install --quiet "$wheel" || die "wheel install failed"
+"$VENV/bin/pip" install --quiet --no-deps "mlx-lm==${{mlx_lm:-0.31.3}}" || die "mlx-lm install failed"
+"$VENV/bin/pip" install --quiet "transformers[sentencepiece]==${{transformers:-5.16.1}}" numpy protobuf pyyaml jinja2 huggingface_hub || die "dependency install failed"
+( cd "$SRC" && MLX_OMARCHY_CONV_RING=0 bash scripts/apply-mlx-lm-patches.sh "$VENV" ) || die "mlx-lm serve patches failed"
+mkdir -p "$HOME/.local/bin"
+printf '#!/usr/bin/env bash
+# Python with mlx-omarchy %s + lmdeck fixes and mlx-lm (built by lmdeck).
+exec "%s/bin/python" "$@"
+' "$release" "$VENV" > "$HOME/.local/bin/mlx-omarchy-fixed"
+chmod +x "$HOME/.local/bin/mlx-omarchy-fixed"
+"$HOME/.local/bin/mlx-omarchy-fixed" -c 'import mlx.core as mx; a=mx.ones((2,2)); mx.eval(a@a); print("  ", mx.__version__, mx.default_device())' || die "installed runtime failed its smoke test"
+lmdeck runtime fixed || die "could not select the Fixed runtime"
+say "Done. Reload models in lmdeck to use it."
+"#,
+        prefix = prefix.display(),
+    )
+}
+
 fn script_mlx_retention(source: &str) -> String {
     format!(r#"
 printf '\nInstalled runtimes\n1. Keep both\n2. Keep only selected ({source})\n\n'
@@ -618,8 +717,8 @@ fi
 
 pub fn script_update_menu() -> String {
     format!(
-        r#"printf 'Update MLX\n\n1. Omarchy\n2. Custom Installer\nq. Cancel\n\n'
-while read -rp 'Choose [1/2/q]: ' choice; do
+        r#"printf 'Update MLX\n\n1. Omarchy\n2. Custom Installer\n3. Fixed (latest release built with lmdeck fixes)\nq. Cancel\n\n'
+while read -rp 'Choose [1/2/3/q]: ' choice; do
   case "$choice" in
     1)
 {omarchy}
@@ -627,13 +726,17 @@ while read -rp 'Choose [1/2/q]: ' choice; do
     2)
 {custom}
       break ;;
+    3)
+{fixed}
+      break ;;
     q|Q) exit 0 ;;
-    *) printf 'Choose 1, 2, or q.\n' ;;
+    *) printf 'Choose 1, 2, 3, or q.\n' ;;
   esac
 done
 "#,
         omarchy = script_update_mlx(),
         custom = script_update_mlx_custom(),
+        fixed = script_build_mlx_fixed(),
     )
 }
 
@@ -803,6 +906,7 @@ mod tests {
         bash_n(&super::script_migrate(true));
         bash_n(&super::script_update_mlx());
         bash_n(&super::script_update_mlx_custom());
+        bash_n(&super::script_build_mlx_fixed());
         bash_n(&super::script_update_menu());
         bash_n(&super::script_remove_other_mlx("custom"));
         bash_n(&super::script_remove_other_mlx("omarchy"));
@@ -862,7 +966,7 @@ lmdeck() {{ [[ "$*" == 'runtime omarchy' ]] || return 99; echo SMOKE >&2; }}
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
-        for choice in ["1. Omarchy", "2. Custom Installer", "q. Cancel", "Choose 1, 2, or q."] {
+        for choice in ["1. Omarchy", "2. Custom Installer", "3. Fixed", "q. Cancel", "Choose 1, 2, 3, or q."] {
             assert!(stdout.contains(choice), "{stdout}");
         }
     }

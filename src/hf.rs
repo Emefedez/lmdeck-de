@@ -105,9 +105,20 @@ pub async fn search_sorted(c: &reqwest::Client, query: &str, kind: &str, limit: 
     Ok(hits)
 }
 
+fn matches_search_word(id: &str, word: &str) -> bool {
+    if !word.starts_with(|c: char| c.is_ascii_digit()) { return id.contains(word); }
+    // Parameter counts are tokens: searching 4b should not suggest 14b or 4bit.
+    id.match_indices(word).any(|(start, _)| {
+        let before = id[..start].chars().next_back();
+        let after = id[start + word.len()..].chars().next();
+        before.is_none_or(|c| !c.is_ascii_digit())
+            && after.is_none_or(|c| !c.is_ascii_alphabetic())
+    })
+}
+
 fn rank_hits(hits: &mut Vec<RepoHit>, query: &str, sort: &str) {
     let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-    hits.retain(|h| words.iter().all(|w| h.id.to_lowercase().contains(w)));
+    hits.retain(|h| words.iter().all(|w| matches_search_word(&h.id.to_lowercase(), w)));
     let query = query.to_lowercase();
     hits.sort_by(|a, b| {
         let relevance = |h: &RepoHit| {
@@ -754,7 +765,7 @@ mod tests {
     #[test]
     fn search_requires_all_words_deduplicates_and_prioritizes_exact_names() {
         let hit = |id: &str, downloads| RepoHit { id: id.into(), downloads, ..Default::default() };
-        let mut hits = vec![hit("a/Qwen3-4B-4bit", 10), hit("a/Qwen3-8B", 100), hit("a/Qwen3-4B-4bit", 10)];
+        let mut hits = vec![hit("a/Qwen3-4B-4bit", 10), hit("a/Qwen3-8B", 100), hit("a/Qwen3-14B", 100), hit("a/Qwen3-8B-4bit", 100), hit("a/Qwen3-4B-4bit", 10)];
         rank_hits(&mut hits, "qwen 4b", "relevance");
         assert_eq!(hits.len(), 1);
         let mut hits = vec![hit("a/Qwen3-4B-4bit", 100), hit("b/Qwen3-4B", 1)];
