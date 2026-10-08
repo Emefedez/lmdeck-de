@@ -28,27 +28,25 @@ pub struct App {
     pub dl: Downloads,
     pub hf: reqwest::Client,
     pub started: Instant,
+    /// Fallback model the VS Code extension last reported as applied.
+    pub vscode_active: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
-    let app = App { mgr: Manager::new(cfg), dl: Downloads::default(), hf: hf::client(), started: Instant::now() };
+    let app = App {
+        mgr: Manager::new(cfg),
+        dl: Downloads::default(),
+        hf: hf::client(),
+        started: Instant::now(),
+        vscode_active: Arc::new(std::sync::Mutex::new(
+            std::fs::read_to_string(crate::config::state_dir().join("vscode-active")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        )),
+    };
 
     // Probe GPU support for quantization modes once per runtime (a few seconds).
     let probe_cfg = app.mgr.cfg();
     tokio::task::spawn_blocking(move || crate::compat::probe(&probe_cfg));
-
-    // VS Code Copilot fallback: reconcile now and every 5 minutes (one sqlite read).
-    let vs = app.mgr.clone();
-    tokio::spawn(async move {
-        loop {
-            let cfg = vs.cfg();
-            let models = vs.models();
-            let loaded = vs.running().first().map(|r| r.name.clone());
-            let _ = tokio::task::spawn_blocking(move || crate::vscode::sync(&cfg, &models, loaded.as_deref())).await;
-            tokio::time::sleep(Duration::from_secs(300)).await;
-        }
-    });
 
     let flusher = app.mgr.clone();
     tokio::spawn(async move {
@@ -102,7 +100,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/lmdeck/override", post(lm_override))
         .route("/lmdeck/compat", get(lm_compat))
         .route("/lmdeck/plan", get(lm_plan))
-        .route("/lmdeck/vscode", get(lm_vscode).post(lm_vscode_sync))
+        .route("/lmdeck/vscode", get(lm_vscode))
+        .route("/lmdeck/vscode/state", post(lm_vscode_state))
         .layer(axum::middleware::from_fn(log_requests))
         .with_state(app.clone());
 
@@ -1100,6 +1099,7 @@ fn status_value(a: &App) -> Value {
         "mem": {"total": total, "available": avail, "gpu_budget": crate::compat::gpu_budget(), "muvm": sys::muvm_rss()},
         "usage": USAGE.summary(),
         "settings": quick,
+        "vscode_active": a.vscode_active.lock().unwrap().clone(),
     })
 }
 
@@ -1148,12 +1148,6 @@ async fn lm_config_set(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     *a.mgr.cfg.write().unwrap() = cfg;
     a.mgr.invalidate();
     EVENTS.bump();
-    if key.starts_with("vscode.") {
-        let cfg = a.mgr.cfg();
-        let models = a.mgr.models();
-        let loaded = a.mgr.running().first().map(|r| r.name.clone());
-        tokio::task::spawn_blocking(move || crate::vscode::sync(&cfg, &models, loaded.as_deref()));
-    }
     let restart = key == "server.host" || key == "server.port";
     let reload = crate::config::needs_reload(key) && !a.mgr.running().is_empty();
     Json(json!({"ok": true, "reload": reload, "restart_server": restart})).into_response()
@@ -1353,22 +1347,36 @@ async fn lm_plan(State(a): State<App>, Query(q): Query<PlanQ>) -> Json<Value> {
     Json(a.mgr.plan_preview(&q.model))
 }
 
+/// Called by the lmdeck VS Code extension when it decides to check (startup,
+/// window focus, or on request): registers the provider, reads the Copilot
+/// quota state once, and returns what the extension should apply.
 async fn lm_vscode(State(a): State<App>) -> Json<Value> {
-    let cfg = a.mgr.cfg();
-    Json(json!(tokio::task::spawn_blocking(move || crate::vscode::status(&cfg)).await.unwrap_or_default()))
-}
-
-async fn lm_vscode_sync(State(a): State<App>) -> Json<Value> {
     let cfg = a.mgr.cfg();
     let models = a.mgr.models();
     let loaded = a.mgr.running().first().map(|r| r.name.clone());
-    let st = tokio::task::spawn_blocking(move || {
-        crate::vscode::sync(&cfg, &models, loaded.as_deref());
-        crate::vscode::status(&cfg)
+    let active = a.vscode_active.lock().unwrap().clone();
+    let v = tokio::task::spawn_blocking(move || {
+        let _ = crate::vscode::ensure_provider(&cfg);
+        json!({
+            "installed": crate::vscode::installed(),
+            "mode": cfg.vscode.fallback,
+            "quota_blocked": crate::vscode::quota_blocked(),
+            "suggested_model": crate::vscode::pick_model(&cfg, &models, loaded.as_deref()),
+            "active_model": active,
+        })
     })
     .await
     .unwrap_or_default();
-    Json(json!(st))
+    Json(v)
+}
+
+/// The extension reports what it applied, so the TUI and panel can show it.
+async fn lm_vscode_state(State(a): State<App>, AnyJson(b): AnyJson) -> Json<Value> {
+    let active = b.get("active_model").and_then(|m| m.as_str()).map(str::to_string);
+    let _ = std::fs::write(crate::config::state_dir().join("vscode-active"), active.clone().unwrap_or_default());
+    *a.vscode_active.lock().unwrap() = active;
+    EVENTS.bump();
+    Json(json!({"ok": true}))
 }
 
 async fn lm_compat(State(a): State<App>) -> Json<Value> {

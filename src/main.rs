@@ -74,7 +74,7 @@ enum Cmd {
     },
     /// Install the launcher (.desktop) and Omarchy menu entries
     Desktop,
-    /// VS Code / Copilot: show fallback status and apply it now
+    /// VS Code / Copilot fallback status (the lmdeck VS Code extension applies it)
     Vscode,
     /// Run a coding agent on a local model (like `ollama launch`):
     /// claude | codex | opencode | t3 (registers a T3 Code provider, opens t1code)
@@ -242,10 +242,13 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Some(Cmd::Launch { app, model, args }) => launch::run(&cfg, &d, &app, model, args).await,
         Some(Cmd::Vscode) => {
-            let ms = models::scan(&cfg);
-            let loaded = d.status().await.and_then(|s| s["running"].as_array().and_then(|r| r.first()).and_then(|r| r["name"].as_str().map(str::to_string)));
-            vscode::sync(&cfg, &ms, loaded.as_deref());
-            println!("{}", serde_json::to_string_pretty(&vscode::status(&cfg))?);
+            if vscode::reset_settings_lines()? {
+                println!("removed lmdeck lines from VS Code settings.json (the extension manages them now)");
+            }
+            match d.http().get(format!("{}/lmdeck/vscode", d.base)).send().await {
+                Ok(r) => println!("{}", serde_json::to_string_pretty(&r.json::<Value>().await?)?),
+                Err(_) => println!("daemon not running"),
+            }
             Ok(())
         }
         Some(Cmd::Desktop) => {

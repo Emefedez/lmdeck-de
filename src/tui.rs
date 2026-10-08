@@ -111,8 +111,6 @@ struct Ui {
     toast: Option<(String, Instant)>,
     quit: bool,
     tx: mpsc::UnboundedSender<Msg>,
-    /// (quota_blocked, active fallback model) when VS Code is installed.
-    vscode: Option<(Option<bool>, Option<String>)>,
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
@@ -155,7 +153,6 @@ pub async fn run(cfg: Config) -> Result<()> {
         toast: None,
         quit: false,
         tx: tx.clone(),
-        vscode: crate::vscode::installed().then(|| (crate::vscode::quota_blocked(), crate::vscode::active_model())),
     };
     ui.refresh_versions();
     ui.poll_status();
@@ -316,7 +313,7 @@ impl Ui {
     }
 
     fn after_action(&mut self) {
-        self.vscode = crate::vscode::installed().then(|| (crate::vscode::quota_blocked(), crate::vscode::active_model()));
+
         self.cfg = Config::load().unwrap_or_else(|_| self.cfg.clone());
         self.refresh_versions();
         self.rescan();
@@ -1204,14 +1201,16 @@ impl Ui {
         }
         rl.push(kv("  offload", &format!("ngl {} · ctx {} · fa {}", self.cfg.llama.gpu_layers, self.cfg.llama.ctx_size, self.cfg.llama.flash_attn)));
         rl.push(Line::raw(""));
-        if let Some(vs) = self.vscode.as_ref() {
+        let vs_active = self.status.as_ref().and_then(|s| s["vscode_active"].as_str().map(str::to_string));
+        if crate::vscode::installed() {
+            let vs: (Option<bool>, Option<String>) = (None, vs_active);
             rl.push(Line::from(vec![
                 Span::styled("VS Code      ", Style::new().fg(Color::Cyan).bold()),
                 match vs.1.as_deref() {
                     Some(m) => Span::styled(format!("Fix/chat → {}", m.rsplit('/').next().unwrap_or(m)), Style::new().fg(Color::Yellow)),
                     None => Span::raw("Copilot"),
                 },
-                Span::styled(format!("  ({}{})", self.cfg.vscode.fallback, if vs.0 == Some(true) { ", quota exhausted" } else { "" }), Style::new().fg(Color::DarkGray)),
+                Span::styled(format!("  (fallback {}; checked by the VS Code extension)", self.cfg.vscode.fallback), Style::new().fg(Color::DarkGray)),
             ]));
             rl.push(Line::raw(""));
         }

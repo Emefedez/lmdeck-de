@@ -3,6 +3,7 @@
 #   ./install.sh            build + install binary, launcher, Omarchy menu rows
 #   ./install.sh --service  also enable the user service (server starts at login)
 #   ./install.sh --plugin   also install the Omarchy bar panel (replaces omarchy.agents)
+#   ./install.sh --vscode   also build + install the VS Code extension (Copilot fallback)
 set -euo pipefail
 cd "$(dirname "$0")"
 command -v cargo >/dev/null || { echo "cargo not found (pacman -S rust)"; exit 1; }
@@ -25,6 +26,12 @@ for arg in "$@"; do
       omarchy plugin disable omarchy.agents >/dev/null 2>&1 || true
       omarchy restart shell >/dev/null 2>&1 || true
       echo "Omarchy bar: Agents + lmdeck panel installed (stock omarchy.agents disabled)"
+      ;;
+    --vscode)
+      vsix="$(python3 vscode-extension/build-vsix.py)"
+      code --install-extension "$vsix" --force
+      "$HOME/.local/bin/lmdeck" vscode >/dev/null 2>&1 || true
+      echo "VS Code: lmdeck extension installed (status bar: Copilot / local model)"
       ;;
   esac
 done

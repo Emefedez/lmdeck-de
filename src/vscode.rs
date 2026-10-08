@@ -4,21 +4,19 @@
 //!   `chatLanguageModels.json`, so local models appear in Copilot's model
 //!   picker (chat, inline chat, "Fix").
 //! - Copilot fallback: VS Code records `chat.quotaResumeState = "blocked"`
-//!   when the Copilot quota is used up. While that is the case (or always,
-//!   if configured) lmdeck points `inlineChat.defaultModel` and
-//!   `chat.defaultModel` at a local model. The lines it writes carry a
-//!   `// set by lmdeck` marker and are removed again when quota returns;
-//!   values the user set are never touched.
+//!   when the Copilot quota is used up. The lmdeck VS Code extension asks
+//!   for this (only at startup / window focus / on request; lmdeck never
+//!   polls) and switches `inlineChat.defaultModel` / `chat.defaultModel`
+//!   through VS Code's settings API, restoring the previous values later.
+//! - `reset_settings_lines` removes lines older lmdeck builds wrote directly.
 
 use crate::config::Config;
 use crate::models::LocalModel;
 use anyhow::Result;
-use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
 const MARK: &str = "// set by lmdeck";
-const KEYS: [&str; 2] = ["inlineChat.defaultModel", "chat.defaultModel"];
 
 fn user_dir() -> PathBuf {
     crate::config::config_dir_or_home().join("Code/User")
@@ -80,11 +78,6 @@ fn strip_line_comments(s: &str) -> String {
     s.lines().map(|l| if l.trim_start().starts_with("//") { "" } else { l }).collect::<Vec<_>>().join("\n")
 }
 
-/// Name Copilot shows for an lmdeck model (its `general.basename`).
-pub fn qualified(model: &str) -> String {
-    format!("{model} (ollama)")
-}
-
 /// Local model to use: configured, else the loaded one if it can call tools,
 /// else the first local model with tool calling (inline chat requires it).
 pub fn pick_model(cfg: &Config, models: &[LocalModel], loaded: Option<&str>) -> Option<String> {
@@ -100,85 +93,15 @@ pub fn pick_model(cfg: &Config, models: &[LocalModel], loaded: Option<&str>) -> 
     models.iter().filter(tools).filter(|m| crate::compat::gpu_fit(m.size, 8192) != "too big").min_by_key(|m| m.size).map(|m| m.name.clone())
 }
 
-/// Current lmdeck-written default (None = not active).
-pub fn active_model() -> Option<String> {
-    let s = std::fs::read_to_string(user_dir().join("settings.json")).ok()?;
-    s.lines().find(|l| l.contains(MARK) && l.contains("inlineChat.defaultModel")).and_then(|l| {
-        let v = l.split(':').skip(1).collect::<Vec<_>>().join(":");
-        let v = v.split(MARK).next()?.trim().trim_end_matches(',').trim().trim_matches('"').to_string();
-        Some(v.trim_end_matches(" (ollama)").to_string())
-    })
-}
-
-/// Point VS Code's chat/inline defaults at `model`, or remove lmdeck's lines.
-pub fn set_defaults(model: Option<&str>) -> Result<bool> {
+/// Remove `// set by lmdeck` lines earlier builds wrote into settings.json
+/// (the extension now manages those settings through VS Code's API).
+pub fn reset_settings_lines() -> Result<bool> {
     let p = user_dir().join("settings.json");
     let raw = std::fs::read_to_string(&p)?;
-    // Drop our previous lines.
-    let mut lines: Vec<String> = raw.lines().filter(|l| !l.contains(MARK)).map(str::to_string).collect();
-    if let Some(m) = model {
-        let user_has = |k: &str| lines.iter().any(|l| l.contains(&format!("\"{k}\"")));
-        let insert: Vec<String> = KEYS
-            .iter()
-            .filter(|k| !user_has(k))
-            .map(|k| format!("  \"{k}\": {}, {MARK} (Copilot quota exhausted)", json!(qualified(m))))
-            .collect();
-        if let Some(open) = lines.iter().position(|l| l.trim_start().starts_with('{')) {
-            let rest = lines[open].trim_start()[1..].trim().to_string();
-            if rest == "}" {
-                // "{}" on one line
-                lines[open] = "{".into();
-                lines.insert(open + 1, "}".into());
-            }
-            for (i, l) in insert.into_iter().enumerate() {
-                lines.insert(open + 1 + i, l);
-            }
-        }
-    }
-    let new = lines.join("\n") + if raw.ends_with('\n') { "\n" } else { "" };
-    if new == raw {
+    if !raw.contains(MARK) {
         return Ok(false);
     }
-    backup_once(&p);
+    let new = raw.lines().filter(|l| !l.contains(MARK)).collect::<Vec<_>>().join("\n") + if raw.ends_with('\n') { "\n" } else { "" };
     std::fs::write(&p, new)?;
     Ok(true)
-}
-
-#[derive(Serialize, Default)]
-pub struct Status {
-    pub installed: bool,
-    pub mode: String,
-    pub quota_blocked: Option<bool>,
-    pub active_model: Option<String>,
-}
-
-pub fn status(cfg: &Config) -> Status {
-    Status { installed: installed(), mode: cfg.vscode.fallback.clone(), quota_blocked: quota_blocked(), active_model: active_model() }
-}
-
-/// Reconcile VS Code with the policy. Cheap: one sqlite read + file compare.
-pub fn sync(cfg: &Config, models: &[LocalModel], loaded: Option<&str>) {
-    if !installed() || cfg.vscode.fallback == "off" && active_model().is_none() {
-        return;
-    }
-    if let Err(e) = ensure_provider(cfg) {
-        crate::sys::log(&format!("vscode: could not register provider: {e:#}"));
-    }
-    let want = match cfg.vscode.fallback.as_str() {
-        "always" => true,
-        "auto" => quota_blocked().unwrap_or(false),
-        _ => false,
-    };
-    let target = if want { pick_model(cfg, models, loaded) } else { None };
-    if target.as_deref() == active_model().as_deref() {
-        return;
-    }
-    match set_defaults(target.as_deref()) {
-        Ok(true) => crate::sys::log(&match &target {
-            Some(m) => format!("vscode: Copilot quota exhausted -> chat and inline Fix now use {m} via lmdeck"),
-            None => "vscode: Copilot defaults restored".into(),
-        }),
-        Ok(false) => {}
-        Err(e) => crate::sys::log(&format!("vscode: could not update settings: {e:#}")),
-    }
 }

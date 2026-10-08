@@ -1,0 +1,81 @@
+{
+  "name": "lmdeck-vscode",
+  "displayName": "lmdeck",
+  "description": "Use lmdeck's local models for Copilot chat and inline Fix when your Copilot quota runs out.",
+  "publisher": "local-lmdeck",
+  "version": "0.1.2",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "lmdeck.menu",
+        "title": "Copilot fallback\u2026",
+        "category": "lmdeck"
+      },
+      {
+        "command": "lmdeck.checkNow",
+        "title": "Check Copilot quota now",
+        "category": "lmdeck"
+      },
+      {
+        "command": "lmdeck.toggleAutoCheck",
+        "title": "Toggle automatic quota check",
+        "category": "lmdeck"
+      },
+      {
+        "command": "lmdeck.useLocal",
+        "title": "Always use the local model for Fix and chat",
+        "category": "lmdeck"
+      },
+      {
+        "command": "lmdeck.useAuto",
+        "title": "Use the local model only when Copilot quota is exhausted",
+        "category": "lmdeck"
+      },
+      {
+        "command": "lmdeck.useCopilot",
+        "title": "Always use Copilot (fallback off)",
+        "category": "lmdeck"
+      }
+    ],
+    "configuration": {
+      "title": "lmdeck",
+      "properties": {
+        "lmdeck.url": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434",
+          "description": "Where the lmdeck server listens."
+        },
+        "lmdeck.autoCheck": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check the Copilot quota when VS Code starts and when its window regains focus (at most once per interval below). Nothing polls in the background. When off, checks happen only through the lmdeck menu."
+        },
+        "lmdeck.focusCheckMinutes": {
+          "type": "number",
+          "default": 15,
+          "minimum": 1,
+          "description": "Minimum minutes between automatic checks on window focus."
+        }
+      }
+    }
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true,
+      "description": "Only changes user-level Copilot model defaults and talks to the local lmdeck server."
+    },
+    "virtualWorkspaces": true
+  }
+}

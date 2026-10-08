@@ -440,9 +440,11 @@ Column {
     Caption {
       width: parent.width
       visible: !!lm.vscode && lm.vscode.installed
+      readonly property string active: lm.status && lm.status.vscode_active ? lm.status.vscode_active : ""
       text: !lm.vscode ? "" : (lm.vscode.quota_blocked ? "Copilot quota exhausted · " : "Copilot quota available · ")
-        + (lm.vscode.active_model ? "Fix/chat use " + lm.vscode.active_model.split("/").pop() : "VS Code uses Copilot")
-      color: lm.vscode && lm.vscode.active_model ? Color.accent : sec.dim
+        + (active ? "Fix/chat use " + active.split("/").pop() : "VS Code uses Copilot")
+        + " · checked by the lmdeck VS Code extension (startup / focus)"
+      color: active ? Color.accent : sec.dim
       wrapMode: Text.WordWrap
     }
   }

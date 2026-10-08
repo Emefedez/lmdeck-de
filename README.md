@@ -102,16 +102,20 @@ lmdeck launch t3 --no-open               # only (re)write the T3 provider; T3 se
 
 ## VS Code / Copilot fallback
 
-lmdeck registers itself as an **Ollama** model provider in VS Code (`chatLanguageModels.json`), so local models show up in Copilot's model picker. It reports each model under its full name, which keeps quants of one repo apart. It also advertises a capped context window (`mlx.max_context`, default 64k) instead of the native 262k, which would exhaust GPU memory.
+`./install.sh --vscode` installs the **lmdeck VS Code extension** (`vscode-extension/`, packaged without vsce).
 
-With `vscode.fallback = auto` (the default), the daemon reads VS Code's own `chat.quotaResumeState` every 5 minutes. That's a single read-only sqlite query.
+lmdeck registers itself as an **Ollama** model provider in VS Code (`chatLanguageModels.json`), so local models show up in Copilot's model picker. Two details:
 
-- While Copilot reports the quota **blocked**, lmdeck sets `inlineChat.defaultModel` and `chat.defaultModel` to a local tool-calling model, so inline **Fix** and chat keep working.
-- Both lines are marked `// set by lmdeck` and are removed when quota returns. Values you set yourself are never touched.
-- `always` forces the local model; `off` disables the feature.
-- `vscode.model` picks the model. Left empty, lmdeck uses the loaded model if it can call tools, otherwise the smallest local model that can.
-- `lmdeck vscode` shows the status and applies it immediately.
-- The originals are kept once as `*.bak.lmdeck`.
+- Each model is listed under its full name, which keeps quants of one repo apart.
+- It advertises a capped context window (`mlx.max_context`, default 64k) instead of the native 262k, which would exhaust GPU memory.
+
+**Nothing polls.** The extension checks the Copilot quota only when VS Code starts and when its window regains focus (at most every `lmdeck.focusCheckMinutes`, default 15), or when you ask. A check is one request to lmdeck, which reads VS Code's recorded `chat.quotaResumeState` (read-only sqlite).
+
+- While the quota is **blocked** (mode `auto`), the extension sets `inlineChat.defaultModel` and `chat.defaultModel` to a local tool-calling model through VS Code's settings API, so inline **Fix** and chat keep working.
+- When the quota returns, it restores your previous values exactly.
+- The status bar shows `Copilot` or the local model. Click it for: check now, Auto / Always local / Off, the automatic-check toggle, and the log.
+- The mode is lmdeck's `vscode.fallback`, shared with the TUI and the bar panel. `vscode.model` picks the model; left empty, lmdeck uses the loaded model if it can call tools, otherwise the smallest local model that can.
+- `lmdeck vscode` shows the status.
 
 ## Using it from other programs
 
