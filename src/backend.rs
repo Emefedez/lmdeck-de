@@ -46,6 +46,8 @@ pub struct Running {
     keep_alive: Mutex<Option<Duration>>,
     in_flight: AtomicUsize,
     stopping: AtomicBool,
+    /// Backend log size and time when the current burst of requests began (for progress).
+    work_start: Mutex<Option<(u64, Instant)>>,
 }
 
 impl Running {
@@ -79,7 +81,10 @@ impl Drop for InFlight {
 }
 fn enter(r: &Arc<Running>) -> InFlight {
     EVENTS.bump();
-    r.in_flight.fetch_add(1, Ordering::Relaxed);
+    if r.in_flight.fetch_add(1, Ordering::Relaxed) == 0 {
+        let len = std::fs::metadata(&r.log).map(|m| m.len()).unwrap_or(0);
+        *r.work_start.lock().unwrap() = Some((len, Instant::now()));
+    }
     *r.last_used.lock().unwrap() = Instant::now();
     InFlight(r.clone())
 }
@@ -101,6 +106,61 @@ pub struct RunningView {
     pub stale: bool,
     pub note: String,
     pub device: String,
+    /// Progress of the request(s) in flight: phase, prompt tokens read/total, rate, ETA.
+    pub work: Option<serde_json::Value>,
+}
+
+/// Seconds of day from a "YYYY-MM-DD HH:MM:SS,mmm" log prefix.
+fn log_secs(line: &str) -> Option<f64> {
+    let t = line.get(11..23)?;
+    let (hms, ms) = t.split_once(',')?;
+    let mut it = hms.split(':').map(|x| x.parse::<f64>().ok());
+    Some(it.next()?? * 3600.0 + it.next()?? * 60.0 + it.next()?? + ms.parse::<f64>().ok()? / 1000.0)
+}
+
+/// Progress of in-flight work from the backend log written since `offset`.
+fn work_progress(log: &std::path::Path, offset: u64, started: Instant) -> serde_json::Value {
+    let text = sys::read_since(log, offset, 64 * 1024);
+    // (secs of day, done, total); mlx_lm: "Prompt processing progress: a/b",
+    // llama.cpp: "... n_tokens = a, ... progress = f".
+    let mut pts: Vec<(Option<f64>, u64, u64)> = Vec::new();
+    for l in text.lines() {
+        if let Some(r) = l.split("Prompt processing progress:").nth(1) {
+            if let Some((a, b)) = r.trim().split_once('/') {
+                if let (Ok(a), Ok(b)) = (a.trim().parse(), b.trim().parse()) {
+                    pts.push((log_secs(l), a, b));
+                }
+            }
+        } else if l.contains("prompt processing progress") {
+            let num = |k: &str| l.split(k).nth(1).and_then(|r| r.split(|c: char| c == ',' || c.is_whitespace()).find(|s| !s.is_empty())).and_then(|s| s.parse::<f64>().ok());
+            if let (Some(n), Some(p)) = (num("n_tokens ="), num("progress =")) {
+                if p > 0.0 {
+                    pts.push((None, n as u64, (n / p).round() as u64));
+                }
+            }
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let Some(&(t1, done, total)) = pts.last() else {
+        return serde_json::json!({"phase": "waiting", "elapsed_secs": elapsed});
+    };
+    if done >= total {
+        return serde_json::json!({"phase": "generating", "prompt_tokens": total, "elapsed_secs": elapsed});
+    }
+    // Rate from the first and last progress lines of this prompt.
+    let first = pts.iter().rev().take_while(|p| p.2 == total).last().copied();
+    let rate = match (first, t1) {
+        (Some((Some(t0), d0, _)), Some(t1)) if t1 > t0 && done > d0 => Some((done - d0) as f64 / (t1 - t0)),
+        _ => None,
+    };
+    serde_json::json!({
+        "phase": "reading prompt",
+        "prompt_done": done,
+        "prompt_tokens": total,
+        "tokens_per_sec": rate,
+        "eta_secs": rate.map(|r| (total - done) as f64 / r),
+        "elapsed_secs": elapsed,
+    })
 }
 
 pub struct Manager {
@@ -189,6 +249,10 @@ impl Manager {
                 stale: r.sig != backend_sig(&self.cfg(), &r.model),
                 note: r.note.clone(),
                 device: self.cfg().overrides.get(&r.name).and_then(|o| o.device.clone()).unwrap_or_else(|| "gpu".into()),
+                work: (r.in_flight.load(Ordering::Relaxed) > 0)
+                    .then(|| *r.work_start.lock().unwrap())
+                    .flatten()
+                    .map(|(off, t)| work_progress(&r.log, off, t)),
             })
             .collect()
     }
@@ -621,6 +685,7 @@ impl Manager {
             keep_alive: Mutex::new(ka),
             in_flight: AtomicUsize::new(0),
             stopping: AtomicBool::new(false),
+            work_start: Mutex::new(None),
         });
         if let Err(e) = self.wait_ready(&r, Duration::from_secs(cfg.server.load_timeout_secs)).await {
             self.kill(&r).await;
@@ -925,6 +990,23 @@ pub fn gguf_block_count(path: &std::path::Path) -> Option<u32> {
         skip(&mut f, ty)?;
     }
     None
+}
+
+#[cfg(test)]
+mod work_tests {
+    #[test]
+    fn prefill_progress_from_log() {
+        let p = std::env::temp_dir().join("lmdeck-work-test.log");
+        std::fs::write(&p, "old\n2026-10-09 00:13:13,000 - INFO - Prompt processing progress: 0/6000\n2026-10-09 00:13:23,000 - INFO - Prompt processing progress: 1000/6000\n").unwrap();
+        let w = super::work_progress(&p, 4, std::time::Instant::now());
+        assert_eq!(w["phase"], "reading prompt");
+        assert_eq!(w["prompt_done"], 1000);
+        assert_eq!(w["tokens_per_sec"], 100.0);
+        assert_eq!(w["eta_secs"], 50.0);
+        std::fs::write(&p, "2026-10-09 00:13:13,000 - INFO - Prompt processing progress: 6000/6000\n").unwrap();
+        assert_eq!(super::work_progress(&p, 0, std::time::Instant::now())["phase"], "generating");
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 pub fn backend_sig(cfg: &Config, m: &LocalModel) -> String {
