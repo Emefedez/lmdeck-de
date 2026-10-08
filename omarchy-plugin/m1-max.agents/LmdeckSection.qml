@@ -342,16 +342,19 @@ Column {
     SettingRow {
       label: "Quantization"
       key: "mlx.kv_bits"
+      info: "Precision of the attention cache (the model's memory of the conversation), not of the weights. f16: exact, biggest. 8-bit: about half the memory, practically no quality loss. 4-bit: about a quarter, faster on long chats but can drift on long or precise tasks (code, numbers). Weights keep their own quant (the 4bit in the model name)."
       options: [{ value: "0", label: "f16" }, { value: "8", label: "8-bit" }, { value: "4", label: "4-bit" }]
     }
     SettingRow {
       label: "Window"
       key: "mlx.max_kv_size"
+      info: "How many tokens of conversation the cache keeps. \u221e keeps everything (memory grows with the chat). A window (4k/8k/32k) caps memory; older tokens are dropped, so the model forgets the start of very long chats."
       options: [{ value: "0", label: "∞" }, { value: "4096", label: "4k" }, { value: "8192", label: "8k" }, { value: "32768", label: "32k" }]
     }
     SettingRow {
       label: "Prompt cache"
       key: "mlx.prompt_cache_size"
+      info: "How many previous prompts stay cached so a follow-up that starts the same way (agents, long system prompts) skips re-reading them. More = faster repeats, more RAM; off = always reprocess."
       options: [{ value: "0", label: "off" }, { value: "4", label: "4" }, { value: "10", label: "10" }, { value: "32", label: "32" }]
     }
 
@@ -361,17 +364,20 @@ Column {
     SettingRow {
       label: "Type"
       key: "llama.cache_type_k"
+      info: "GGUF attention-cache precision. f16: exact. q8_0: half the memory, near-lossless. q4_0: a quarter, some quality loss. Needs flash attention for the V cache."
       options: ["f16", "q8_0", "q4_0"]
       handler: function(v) { lm.setSetting("llama.cache_type_k", v); lm.setSetting("llama.cache_type_v", v) }
     }
     SettingRow {
       label: "Context"
       key: "llama.ctx_size"
+      info: "Maximum context for GGUF models. llama.cpp reserves cache for all of it up front, so bigger means more memory even for short chats."
       options: [{ value: "4096", label: "4k" }, { value: "8192", label: "8k" }, { value: "16384", label: "16k" }, { value: "32768", label: "32k" }, { value: "65536", label: "64k" }]
     }
     SettingRow {
       label: "Prefix reuse"
       key: "llama.cache_reuse"
+      info: "Reuse cached chunks when a prompt shifts (agent loops re-send history). 256/1k = minimum matching chunk in tokens; off disables it."
       options: [{ value: "0", label: "off" }, { value: "256", label: "256" }, { value: "1024", label: "1k" }]
     }
 
@@ -390,12 +396,15 @@ Column {
     SettingRow {
       label: "Keep loaded"
       key: "server.keep_alive"
+      info: "How long an idle model stays loaded. Longer = instant replies, but the memory stays taken; 0 unloads right after each answer; \u221e never unloads."
       options: [{ value: "0", label: "0" }, { value: "5m", label: "5m" }, { value: "30m", label: "30m" }, { value: "2h", label: "2h" }, { value: "-1", label: "∞" }]
     }
-    SettingRow { label: "Max models"; key: "server.max_loaded"; options: ["1", "2", "3"] }
+    SettingRow { label: "Max models"; key: "server.max_loaded"
+      info: "How many models can be resident at once. On 32 GB unified memory, more than one big model risks swapping; the least recently used one is unloaded when needed."; options: ["1", "2", "3"] }
     SettingRow {
       label: "GPU heap"
       key: "server.gpu_heap"
+      info: "How much RAM the GPU driver may use for a model. Asahi gives the GPU 50% of RAM by default. auto raises it just for the backend that needs it, capped by free RAM minus the reserves; stock never raises it."
       options: [{ value: "auto", label: "auto", tooltip: "Raise the GPU heap per model only when it needs more than the stock 50% of RAM; capped by free RAM" },
                 { value: "stock", label: "stock", tooltip: "Never raise: GPU gets 50% of RAM" }]
     }
@@ -404,13 +413,14 @@ Column {
       visible: !!lm.status
       readonly property var mem: lm.status ? lm.status.mem : null
       text: mem ? "Stock GPU heap " + lm.bytes(mem.gpu_budget) + " · raised per model only, restored when it unloads"
-        + (mem.muvm ? " · muvm VM running (" + lm.bytes(mem.muvm) + "): 2 GiB extra kept free" : "") : ""
+        + (mem.muvm ? " · muvm VM running (" + lm.bytes(mem.muvm) + "): its VM reserve is kept free too" : "") : ""
       color: sec.dim
       wrapMode: Text.WordWrap
     }
     SettingRow {
       label: "RAM check"
       key: "server.mem_check"
+      info: "Refuse a load when free RAM can't hold the model plus overhead. Off lets you try anyway (risk of swapping or a frozen desktop)."
       options: [{ value: "true", label: "on" }, { value: "false", label: "off" }]
     }
   }
@@ -778,32 +788,60 @@ Column {
     }
   }
 
-  component SettingRow: Item {
+  component SettingRow: Column {
     id: row
     property string label: ""
     property string key: ""
     property var options: []
     property var handler: null
+    // What changing this does; shown under the row when the ⓘ is clicked.
+    property string info: ""
+    property bool infoOpen: false
     width: parent ? parent.width : 0
-    implicitHeight: Math.max(rowLabel.implicitHeight, group.implicitHeight)
-    Caption {
-      id: rowLabel
-      anchors.left: parent.left
-      anchors.verticalCenter: parent.verticalCenter
-      text: row.label
-      color: sec.foreground
+    spacing: 2
+    Item {
+      width: parent.width
+      implicitHeight: Math.max(rowLabel.implicitHeight, group.implicitHeight)
+      Row {
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: 4
+        Caption {
+          id: rowLabel
+          text: row.label
+          color: sec.foreground
+        }
+        Caption {
+          visible: row.info !== ""
+          text: "ⓘ"
+          color: row.infoOpen ? sec.foreground : sec.dim
+          MouseArea {
+            anchors.fill: parent
+            anchors.margins: -3
+            cursorShape: Qt.PointingHandCursor
+            onClicked: row.infoOpen = !row.infoOpen
+          }
+        }
+      }
+      ButtonGroup {
+        id: group
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        options: row.options
+        value: sec.setting(row.key)
+        foreground: sec.foreground
+        fontFamily: sec.fontFamily
+        fontSize: Style.font.caption
+        focusable: false
+        onChanged: function(v) { if (row.handler) row.handler(v); else lm.setSetting(row.key, v) }
+      }
     }
-    ButtonGroup {
-      id: group
-      anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
-      options: row.options
-      value: sec.setting(row.key)
-      foreground: sec.foreground
-      fontFamily: sec.fontFamily
-      fontSize: Style.font.caption
-      focusable: false
-      onChanged: function(v) { if (row.handler) row.handler(v); else lm.setSetting(row.key, v) }
+    Caption {
+      visible: row.infoOpen && row.info !== ""
+      width: parent.width
+      text: row.info
+      color: sec.dim
+      wrapMode: Text.WordWrap
     }
   }
 }
