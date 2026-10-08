@@ -405,7 +405,7 @@ impl Ui {
                 self.load_model(model);
             }
             Msg::NeedMemory(model, why) => {
-                self.toast(format!("{model}: not enough free memory"));
+                if why.contains("needs ~") { self.toast(format!("{model}: not enough free memory")); }
                 let groups = sys::proc_groups(unsafe { libc::getuid() }, true);
                 self.input = Input::Free(groups, 0, Some((model, why)));
             }
@@ -703,6 +703,22 @@ impl Ui {
         }
     }
 
+    /// Open the memory popup for `model` with the planner's current verdict.
+    fn open_make_room(&self, model: String) {
+        let d = self.d.clone();
+        let tx = self.tx.clone();
+        let url = format!("{}/lmdeck/plan?model={model}", self.cfg.base_url());
+        tokio::spawn(async move {
+            let v: Option<Value> = match d.http().get(url).send().await { Ok(r) => r.json().await.ok(), Err(_) => None };
+            let why = match v {
+                Some(v) if v["ok"].as_bool() == Some(true) => format!("{model} fits right now; press l to load it."),
+                Some(v) => v["error"].as_str().unwrap_or("not enough memory").to_string(),
+                None => "daemon not reachable".into(),
+            };
+            let _ = tx.send(Msg::NeedMemory(model, why));
+        });
+    }
+
     /// Slider step for the memory settings; returns false for other keys.
     fn nudge_setting(&mut self, key: &str, dir: f64) -> bool {
         let mut c = self.cfg.clone();
@@ -884,6 +900,11 @@ impl Ui {
     fn key_models(&mut self, k: KeyEvent) -> Option<Action> {
         let n = self.models.len();
         match k.code {
+            KeyCode::Char('m') => {
+                if let Some(m) = self.selected_model() {
+                    self.open_make_room(m.name.clone());
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => move_sel(&mut self.models_sel, n, 1),
             KeyCode::Up | KeyCode::Char('k') => move_sel(&mut self.models_sel, n, -1),
             KeyCode::Char('r') => {
@@ -1457,7 +1478,7 @@ impl Ui {
         let server = if self.status.is_some() { "Stop server [s]" } else { "Start server [s]" };
         let runtime = format!("MLX: {} [i]", if self.cfg.mlx.command.first().is_some_and(|c| c.starts_with("/usr/")) { "package" } else { "Custom" });
         let primary = [(server, KeyCode::Char('s')), ("Update MLX [U]", KeyCode::Char('U')), (runtime.as_str(), KeyCode::Char('i')), ("Setup guide [?]", KeyCode::Char('?'))];
-        let secondary = [("Models [2]", KeyCode::Char('2')), ("GGUF setup [B]", KeyCode::Char('B')), ("Reload models [R]", KeyCode::Char('R')), ("Unload all [a]", KeyCode::Char('a'))];
+        let secondary = [("Models [2]", KeyCode::Char('2')), ("Free memory [f]", KeyCode::Char('f')), ("GGUF setup [B]", KeyCode::Char('B')), ("Reload models [R]", KeyCode::Char('R')), ("Unload all [a]", KeyCode::Char('a'))];
         let width = area.width.saturating_sub(4);
         let primary_height = button_height(width, &primary);
         let secondary_height = button_height(width, &secondary);
@@ -1717,7 +1738,7 @@ impl Ui {
     }
 
     fn draw_models(&mut self, f: &mut Frame, area: Rect) {
-        let buttons = [("Load [Enter]", KeyCode::Enter), ("Unload [u]", KeyCode::Char('u')), ("Chat [c]", KeyCode::Char('c')), ("Context [x]", KeyCode::Char('x')), ("Delete [d]", KeyCode::Char('d'))];
+        let buttons = [("Load [Enter]", KeyCode::Enter), ("Make room [m]", KeyCode::Char('m')), ("Unload [u]", KeyCode::Char('u')), ("Chat [c]", KeyCode::Char('c')), ("Context [x]", KeyCode::Char('x')), ("Delete [d]", KeyCode::Char('d'))];
         let height = button_height(area.width.saturating_sub(2), &buttons);
         let [actions, area] = Layout::vertical([Constraint::Length(height + 1), Constraint::Min(0)]).areas(area);
         self.draw_buttons(f, actions.inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 }), &buttons);
