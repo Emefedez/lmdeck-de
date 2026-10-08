@@ -214,6 +214,97 @@ pub fn to_openai(b: &Value, model_id: &str, mode: ToolMode) -> Value {
     o
 }
 
+/// Remove a markdown section that starts with `heading` (a line) up to the next top-level
+/// "# " heading or the end; returns (text without it, removed section).
+fn cut_section(text: &str, heading: &str) -> (String, Option<String>) {
+    let Some(start) = text.find(heading) else { return (text.to_string(), None) };
+    if start > 0 && !text[..start].ends_with('\n') {
+        return (text.to_string(), None);
+    }
+    let after = start + heading.len();
+    let end = text[after..].find("\n# ").map(|i| after + i + 1).or_else(|| text[after..].find("\n<").map(|i| after + i + 1)).unwrap_or(text.len());
+    (format!("{}{}", &text[..start], &text[end..]), Some(text[start..end].to_string()))
+}
+
+/// MCP server instructions ("## server" subsections) from a removed section.
+fn mcp_instructions(section: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for part in section.split("\n## ").skip(1) {
+        let (name, body) = part.split_once('\n').unwrap_or((part, ""));
+        out.push((name.trim().to_string(), body.trim().to_string()));
+    }
+    out
+}
+
+/// Lean prompt for local models: drop Claude Code text that only applies to Claude itself or to
+/// tools the local model doesn't get. Returns the MCP server instructions that were removed.
+pub fn lean_prompt(b: &mut Value) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut fix = |t: &str| -> String {
+        let (t, mcp) = cut_section(t, "# MCP Server Instructions\n");
+        if let Some(m) = mcp {
+            found.extend(mcp_instructions(&m));
+        }
+        let (t, _) = cut_section(&t, "# Environment\n - The most recent Claude models");
+        t
+    };
+    let mut walk = |v: &mut Value| match v {
+        Value::String(s) => *s = fix(s),
+        Value::Array(blocks) => {
+            for blk in blocks.iter_mut() {
+                if let Some(Value::String(s)) = blk.get_mut("text") {
+                    *s = fix(s);
+                }
+            }
+        }
+        _ => {}
+    };
+    if let Some(sys) = b.get_mut("system") {
+        walk(sys);
+    }
+    if let Some(Value::Array(msgs)) = b.get_mut("messages") {
+        for m in msgs.iter_mut() {
+            if let Some(c) = m.get_mut("content") {
+                walk(c);
+            }
+        }
+    }
+    // The memory section names a per-project path, which made the system prompt (and its cached
+    // prefill) differ per project. Move it next to the per-conversation environment text.
+    let mut moved = Vec::new();
+    match b.get_mut("system") {
+        Some(Value::String(s)) => {
+            let (t, m) = cut_section(s, "# Memory\n");
+            *s = t;
+            moved.extend(m);
+        }
+        Some(Value::Array(blocks)) => {
+            for blk in blocks.iter_mut() {
+                if let Some(Value::String(s)) = blk.get_mut("text") {
+                    let (t, m) = cut_section(s, "# Memory\n");
+                    *s = t;
+                    moved.extend(m);
+                }
+            }
+        }
+        _ => {}
+    }
+    if !moved.is_empty() {
+        let text = moved.join("\n");
+        if let Some(Value::Array(msgs)) = b.get_mut("messages") {
+            let target = msgs.iter().position(|m| m["role"] == "system").or_else(|| msgs.iter().position(|m| m["role"] == "user"));
+            if let Some(i) = target {
+                match msgs[i].get_mut("content") {
+                    Some(Value::String(s)) => s.push_str(&format!("\n{text}")),
+                    Some(Value::Array(c)) => c.push(json!({"type": "text", "text": text})),
+                    _ => {}
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Prompt size by part (~4 chars per token): (system, messages, tools, mcp tools, mcp tool count).
 pub fn prompt_breakdown(b: &Value) -> (u64, u64, u64, u64, usize) {
     let len = |v: Option<&Value>| v.map(|v| v.to_string().len() as u64 / 4).unwrap_or(0);
@@ -491,6 +582,34 @@ mod tests {
         assert!(out.contains("input_json_delta"));
         assert!(out.contains("\"stop_reason\":\"tool_use\""));
         assert_eq!(s.message()["content"][1]["input"]["a"], 1);
+    }
+}
+
+#[cfg(test)]
+mod lean_prompt_tests {
+    use serde_json::json;
+
+    #[test]
+    fn drops_mcp_instructions_and_claude_model_notes() {
+        let sys = "# Harness\nkeep\n# Environment\n - The most recent Claude models are X\n - fast mode\n# Context management\nkeep too\n";
+        let env = "# Environment\nYou have been invoked: cwd /x\n# MCP Server Instructions\n\nintro\n## rea\nREA notes\n## hypruse\nH notes\n<total_tokens>1</total_tokens>\n";
+        let mut b = json!({"system": [{"type": "text", "text": sys}], "messages": [{"role": "user", "content": "hi"}, {"role": "system", "content": [{"type": "text", "text": env}]}]});
+        let found = super::lean_prompt(&mut b);
+        let s = b["system"][0]["text"].as_str().unwrap();
+        assert!(s.contains("keep") && s.contains("keep too") && !s.contains("Claude models"));
+        let e = b["messages"][1]["content"][0]["text"].as_str().unwrap();
+        assert!(e.contains("cwd /x") && e.contains("<total_tokens>") && !e.contains("REA notes"));
+        assert_eq!(found, vec![("rea".to_string(), "REA notes".to_string()), ("hypruse".to_string(), "H notes".to_string())]);
+    }
+
+    #[test]
+    fn memory_section_moves_out_of_the_system_prompt() {
+        let sys = "# Harness\nkeep\n# Memory\nmemory at /home/u/.claude/projects/-tmp-x/memory\n# Context management\nctx\n";
+        let mut b = json!({"system": [{"type": "text", "text": sys}], "messages": [{"role": "user", "content": "hi"}, {"role": "system", "content": [{"type": "text", "text": "# Environment\ncwd"}]}]});
+        super::lean_prompt(&mut b);
+        let s = b["system"][0]["text"].as_str().unwrap();
+        assert!(!s.contains("-tmp-x") && s.contains("ctx"));
+        assert!(b["messages"][1]["content"][1]["text"].as_str().unwrap().contains("-tmp-x/memory"));
     }
 }
 

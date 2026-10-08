@@ -69,6 +69,8 @@ fn render(server: &str, tools: &[&Value], sig: &str) -> String {
 pub struct Groups {
     /// server -> markdown
     docs: BTreeMap<String, String>,
+    /// server -> the server's own usage instructions (moved out of the system prompt)
+    notes: BTreeMap<String, String>,
 }
 
 impl Groups {
@@ -99,7 +101,14 @@ impl Groups {
             };
             docs.insert(server, doc);
         }
-        Groups { docs }
+        Groups { docs, notes: BTreeMap::new() }
+    }
+
+    /// Attach MCP server instructions; they are shown with the server's group instead of
+    /// sitting in every prompt.
+    pub fn with_notes(mut self, notes: Vec<(String, String)>) -> Self {
+        self.notes = notes.into_iter().filter(|(s, _)| self.docs.contains_key(s)).collect();
+        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -120,8 +129,13 @@ impl Groups {
         let Some(doc) = self.docs.get(server.trim()) else {
             return format!("No group '{group}'. Groups:\n{}", self.index());
         };
+        let notes = self.notes.get(server.trim());
         if sub.is_empty() {
-            return doc.lines().filter(|l| !l.starts_with(AUTO_MARKER)).collect::<Vec<_>>().join("\n");
+            let body = doc.lines().filter(|l| !l.starts_with(AUTO_MARKER)).collect::<Vec<_>>().join("\n");
+            return match notes {
+                Some(n) => format!("Usage notes from the {server} server:\n{n}\n\n{body}"),
+                None => body,
+            };
         }
         let mut out = Vec::new();
         let mut on = false;
@@ -133,7 +147,13 @@ impl Groups {
                 out.push(l);
             }
         }
-        if out.is_empty() { format!("No subgroup '{sub}' in {server}. Groups:\n{}", self.index()) } else { out.join("\n") }
+        if out.is_empty() {
+            format!("No subgroup '{sub}' in {server}. Groups:\n{}", self.index())
+        } else if notes.is_some() {
+            format!("{}\n\n(Usage notes for {server}: tool_group(\"{server}\").)", out.join("\n"))
+        } else {
+            out.join("\n")
+        }
     }
 
     /// The two meta tools, in Anthropic form.
@@ -176,7 +196,7 @@ mod tests {
         let mut tools: Vec<Value> = (0..14).map(|i| tool(&format!("mcp__srv__inspect_x{i}"))).collect();
         tools.push(tool("mcp__srv__trace_y"));
         let docs: BTreeMap<String, String> = [("srv".to_string(), render("srv", &tools.iter().collect::<Vec<_>>(), "sig"))].into();
-        let g = Groups { docs };
+        let g = Groups { docs, notes: BTreeMap::new() };
         assert!(g.index().contains("srv/inspect"));
         let seg = g.segment("srv/trace");
         assert!(seg.contains("mcp__srv__trace_y(path: string): Does a thing"));

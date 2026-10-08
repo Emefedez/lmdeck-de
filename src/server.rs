@@ -857,6 +857,14 @@ async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         }
     };
     let mode = crate::anthropic::ToolMode::parse(&a.mgr.cfg().server.local_tools);
+    // Last request as received, for inspecting what clients send (local file, overwritten).
+    let _ = std::fs::write(crate::config::log_dir().join("last-messages.json"), serde_json::to_vec_pretty(&b).unwrap_or_default());
+    let mut b = b;
+    let mcp_notes = if a.mgr.cfg().server.local_prompt == "lean" && mode != crate::anthropic::ToolMode::All {
+        crate::anthropic::lean_prompt(&mut b)
+    } else {
+        Vec::new()
+    };
     let (sys_t, msg_t, tools_t, mcp_t, mcp_n) = crate::anthropic::prompt_breakdown(&b);
     let sent_tools: u64 = b.get("tools").and_then(|t| t.as_array())
         .map(|t| crate::anthropic::filter_tools(t, mode).iter().map(|t| t.to_string().len() as u64 / 4).sum())
@@ -869,7 +877,7 @@ async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     ));
     let mut body = crate::anthropic::to_openai(&b, guard.0.backend_model_id(), mode);
     let groups = (mode == crate::anthropic::ToolMode::Groups)
-        .then(|| crate::toolgroups::Groups::sync(b.get("tools").and_then(|t| t.as_array()).map(|t| t.as_slice()).unwrap_or(&[])))
+        .then(|| crate::toolgroups::Groups::sync(b.get("tools").and_then(|t| t.as_array()).map(|t| t.as_slice()).unwrap_or(&[])).with_notes(mcp_notes))
         .filter(|g| !g.is_empty());
     if let Some(g) = groups.as_ref() {
         let meta: Vec<Value> = g.meta_tools().iter().map(|t| json!({"type": "function", "function": {
@@ -1250,6 +1258,7 @@ fn status_value(a: &App) -> Value {
         "mlx.fast_path",
         "mlx.prefix_checkpoints",
         "server.local_tools",
+        "server.local_prompt",
         "server.mem_check",
         "server.gpu_heap",
         "vscode.fallback",

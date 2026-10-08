@@ -400,6 +400,12 @@ Column {
       options: [{ value: "lean", label: "lean" }, { value: "groups", label: "groups" }, { value: "core", label: "core" }, { value: "all", label: "all" }]
     }
     SettingRow {
+      label: "Prompt"
+      key: "server.local_prompt"
+      info: "lean: before Claude Code's prompt reaches a local model, drop the parts it can't use (MCP server instructions, notes about Claude models) and move the per-project memory paragraph out of the system prompt so every project shares one cached system prompt. In groups mode the MCP instructions are shown with that server's group. ~8.1k -> ~4.5k tokens; a new conversation went from ~104 s to ~25 s on Qwen3.8-27B. original: send it unchanged. Real Claude is never affected."
+      options: [{ value: "lean", label: "lean" }, { value: "original", label: "original" }]
+    }
+    SettingRow {
       label: "Reuse between turns"
       key: "mlx.prefix_checkpoints"
       info: "Saves the conversation's cache at the start of each answer so the next turn only reads what is new. Needed for hybrid models such as Qwen3.5/3.8, whose cache can't be rewound: an agent follow-up drops from ~99 s to ~13 s. Costs some RAM per saved conversation (bounded by the prompt cache size). Takes effect after a model reload."

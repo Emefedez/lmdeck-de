@@ -41,6 +41,9 @@ pub struct ServerCfg {
     /// tools and non-essential tools and shortens descriptions; "core" drops only MCP tools
     /// (mcp__*, which can add 100k+ tokens); "all" keeps everything.
     pub local_tools: String,
+    /// "lean": drop Claude Code prompt sections a local model can't use (MCP server
+    /// instructions, Claude model notes); in groups mode the MCP notes move into the groups.
+    pub local_prompt: String,
     /// Skip the memory admission check entirely.
     pub mem_check: bool,
     /// Refuse GPU loads that exceed the GPU memory budget (Asahi gives the GPU
@@ -219,6 +222,7 @@ impl Default for ServerCfg {
             mem_reserve_gib: 3.0,
             vm_reserve_gib: 2.0,
             local_tools: "lean".into(),
+            local_prompt: "lean".into(),
             mem_check: true,
             gpu_mem_check: true,
             gpu_heap: "auto".into(),
@@ -417,6 +421,7 @@ pub const SETTINGS: &[(&str, &str, &str)] = &[
     ("Memory & residency", "server.max_loaded", "Models resident at once"),
     ("Memory & residency", "server.mem_check", "Refuse loads that would not fit in RAM (true/false)"),
     ("Memory & residency", "server.mem_reserve_gib", "RAM kept free for the desktop (GiB)"),
+    ("Coding agents", "server.local_prompt", "Claude Code prompt for local models: lean (drop MCP instructions and Claude model notes) / original"),
     ("Coding agents", "server.local_tools", "Claude Code tools sent to local models: lean (no MCP, essential tools, short descriptions) / groups (lean + MCP on demand) / core (no MCP) / all"),
     ("Memory & residency", "server.vm_reserve_gib", "Extra RAM kept free while the muvm VM runs (GiB)"),
     ("Memory & residency", "server.gpu_heap", "GPU heap per model: auto (raise only when needed, per process) / stock (50% of RAM) / N GiB"),
@@ -480,6 +485,7 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "server.load_timeout_secs" => c.server.load_timeout_secs.to_string(),
         "server.mem_check" => c.server.mem_check.to_string(),
         "server.local_tools" => c.server.local_tools.clone(),
+        "server.local_prompt" => c.server.local_prompt.clone(),
         "server.gpu_mem_check" => c.server.gpu_mem_check.to_string(),
         "server.gpu_heap" => c.server.gpu_heap.clone(),
         "server.mem_reserve_gib" => c.server.mem_reserve_gib.to_string(),
@@ -542,6 +548,10 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "server.max_loaded" => c.server.max_loaded = num(v)?.max(1) as usize,
         "server.load_timeout_secs" => c.server.load_timeout_secs = num(v)?,
         "server.mem_check" => c.server.mem_check = boolean(v)?,
+        "server.local_prompt" => match v {
+            "lean" | "original" => c.server.local_prompt = v.into(),
+            _ => return Err("lean or original".into()),
+        },
         "server.local_tools" => match v {
             "lean" | "groups" | "core" | "all" => c.server.local_tools = v.into(),
             _ => return Err("lean, groups, core or all".into()),
