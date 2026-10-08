@@ -83,6 +83,23 @@ The downloader opens 6 parallel range connections per large file. It resumes aft
 
 The Discover tab has two sources. The first is the **omarchy-mlx curated catalog**, which shows which models the project has qualified on this GPU backend. The second is a live **Hugging Face search** (`g` switches between MLX and GGUF). Opening a repo lists its quants with sizes and whether each fits in RAM.
 
+## Coding agents: `lmdeck launch`
+
+Like `ollama launch`, this runs an agent against a local model. Settings are passed through the process's environment or command-line flags, so the agent's own config files are never rewritten:
+
+```bash
+lmdeck launch claude   -m mlx-community/Qwen3-4B-Instruct-2507-4bit   # Claude Code via /v1/messages
+lmdeck launch codex    -m <model>        # codex --oss against lmdeck's Ollama API
+lmdeck launch opencode -m <model>        # OPENCODE_CONFIG_CONTENT with an "lmdeck" provider
+lmdeck launch t3       -m <model>        # T3 Code: adds an "lmdeck (local)" provider, opens t1code
+lmdeck launch t3 --no-open               # only (re)write the T3 provider; T3 sees it on next start
+```
+
+- **Claude Code** gets `ANTHROPIC_BASE_URL`, a dummy token, and every model slot (opus, sonnet, haiku, subagent) pointed at the local model. lmdeck serves the **Anthropic Messages API** (`/v1/messages`, plus `count_tokens`) by translating to the backend's chat API, with streaming, tool use and thinking.
+- Requests for `claude-*` names that don't exist locally are answered by the loaded model.
+- **T3 Code**: the provider instance uses T3's stock Claude driver plus those environment overrides, and lists your local models as custom models. `settings.json` is backed up first.
+- Agent system prompts are large (Claude Code's is about 21k tokens), so the first turn spends most of its time in prefill. That took about 2.5 minutes for a 4B model on an M1 Max. MLX prompt caching makes later turns with the same prefix much faster.
+
 ## Using it from other programs
 
 ```bash
@@ -137,6 +154,13 @@ Token usage is counted for both Ollama and OpenAI requests. It lives in memory a
   - `llama.cache_type_k`/`_v` take `q8_0` to halve KV memory, or `q4_0`.
   - `llama.cache_reuse` reuses KV for shifted prompts; it defaults to 256 and helps agent loops.
   - Changing any of these marks loaded models stale. Reload from the panel, or press `R` in the TUI.
+- **GPU memory guard**: Asahi gives the GPU about half of RAM (Honeykrisp heap). Overcommitting it can hang the whole machine, so every GPU load is planned first (`/lmdeck/plan?model=` shows the decision without loading anything):
+  - `server.gpu_heap = auto` (the default) raises `HK_SYSMEM` for that one backend process only when the model needs more. The cap is free RAM minus the reserve, with 2 GiB extra held back while a muvm VM runs. It never applies globally and ends when the model unloads.
+  - `stock` never raises the heap. A number sets a fixed size in GiB.
+  - A load that doesn't fit is refused with an explanation and a recommended model that does fit.
+  - If a killed backend hasn't exited (for example a hung GPU), further loads are blocked so they can't stack another model's memory on top.
+- **Long-prompt memory**: `mlx.prefill_step_size` (default 512) bounds prefill memory, and the MLX prompt cache is capped by size (default: a quarter of the GPU heap).
+- **Compatibility**: lmdeck probes which MLX quantization modes the installed omarchy-mlx can run on the GPU. On 0.7.28 that's affine only; nvfp4, mxfp4 and mxfp8 fail. Combined with the omarchy-mlx catalog, every model gets a marker: ✓ qualified, ? untested, ✗ won't run. Each ✗ comes with a recommended alternative, and the per-model **Run on CPU (discouraged)** option is there as a last resort.
 - **One model resident by default** (`server.max_loaded = 1`). Unified memory makes a second big model a swap risk. The least-recently-used idle model is evicted when another is requested.
 - **Memory admission**: a load is refused with a clear error when weights plus overhead plus KV estimate exceed `MemAvailable − server.mem_reserve_gib`.
 - **Warm-up on load**: MLX models get a 1-token request before they are marked ready. That loads the weights and compiles the Vulkan pipelines, so the first real request doesn't pay for it.

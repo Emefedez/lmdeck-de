@@ -1,8 +1,10 @@
+mod anthropic;
 mod backend;
 mod client;
 mod compat;
 mod config;
 mod hf;
+mod launch;
 mod models;
 mod server;
 mod sys;
@@ -71,6 +73,16 @@ enum Cmd {
     },
     /// Install the launcher (.desktop) and Omarchy menu entries
     Desktop,
+    /// Run a coding agent on a local model (like `ollama launch`):
+    /// claude | codex | opencode | t3 (registers a T3 Code provider, opens t1code)
+    Launch {
+        app: String,
+        #[arg(long, short)]
+        model: Option<String>,
+        /// Extra arguments passed to the app
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -210,6 +222,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Some(Cmd::Launch { app, model, args }) => launch::run(&cfg, &d, &app, model, args).await,
         Some(Cmd::Desktop) => {
             println!("wrote {}", sys::desktop_entry()?.display());
             println!("updated {}", sys::install_menu()?.display());

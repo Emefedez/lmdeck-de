@@ -83,8 +83,11 @@ pub struct MlxCfg {
     pub batching: bool,
     /// mlx_lm prompt (KV) cache entries kept between requests; 0 disables reuse.
     pub prompt_cache_size: u32,
-    /// Cap on prompt cache memory in GiB (0 = no cap).
+    /// Cap on prompt cache memory in GiB (0 = auto: a quarter of the GPU heap).
     pub prompt_cache_gib: f64,
+    /// Prompt tokens processed per step. Smaller = less peak memory on long
+    /// prompts (agent system prompts are 20k+ tokens), slightly slower prefill.
+    pub prefill_step_size: u32,
     /// Quantize the KV cache to 4 or 8 bits (0 = f16). Needs runtime support;
     /// the launcher probes it and falls back to f16.
     pub kv_bits: u32,
@@ -212,6 +215,7 @@ impl Default for MlxCfg {
             batching: false,
             prompt_cache_size: 10,
             prompt_cache_gib: 0.0,
+            prefill_step_size: 512,
             kv_bits: 0,
             kv_group_size: 64,
             quantized_kv_start: 512,
@@ -376,7 +380,8 @@ pub const SETTINGS: &[(&str, &str, &str)] = &[
     ("KV cache · MLX", "mlx.quantized_kv_start", "MLX: quantize KV once the context passes N tokens"),
     ("KV cache · MLX", "mlx.max_kv_size", "MLX rotating KV window in tokens (0 = unbounded)"),
     ("KV cache · MLX", "mlx.prompt_cache_size", "MLX prompt caches kept between requests (0 = no reuse)"),
-    ("KV cache · MLX", "mlx.prompt_cache_gib", "Cap on MLX prompt cache memory in GiB (0 = no cap)"),
+    ("KV cache · MLX", "mlx.prompt_cache_gib", "Cap on MLX prompt cache memory in GiB (0 = auto: ¼ of the GPU heap)"),
+    ("KV cache · MLX", "mlx.prefill_step_size", "Prompt tokens per prefill step (smaller = less peak memory on long prompts)"),
     ("KV cache · GGUF", "llama.ctx_size", "GGUF context window (KV is allocated for all of it)"),
     ("KV cache · GGUF", "llama.cache_type_k", "GGUF K cache type: f16 / q8_0 / q4_0 (q8_0 halves KV memory)"),
     ("KV cache · GGUF", "llama.cache_type_v", "GGUF V cache type: f16 / q8_0 / q4_0 (needs flash attention)"),
@@ -438,6 +443,7 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "mlx.batching" => c.mlx.batching.to_string(),
         "mlx.prompt_cache_size" => c.mlx.prompt_cache_size.to_string(),
         "mlx.prompt_cache_gib" => c.mlx.prompt_cache_gib.to_string(),
+        "mlx.prefill_step_size" => c.mlx.prefill_step_size.to_string(),
         "mlx.kv_bits" => c.mlx.kv_bits.to_string(),
         "mlx.kv_group_size" => c.mlx.kv_group_size.to_string(),
         "mlx.quantized_kv_start" => c.mlx.quantized_kv_start.to_string(),
@@ -498,6 +504,7 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "mlx.batching" => c.mlx.batching = boolean(v)?,
         "mlx.prompt_cache_size" => c.mlx.prompt_cache_size = num(v)? as u32,
         "mlx.prompt_cache_gib" => c.mlx.prompt_cache_gib = v.parse().map_err(|_| "not a number".to_string())?,
+        "mlx.prefill_step_size" => c.mlx.prefill_step_size = (num(v)? as u32).clamp(64, 8192),
         "mlx.kv_bits" => {
             let b = num(v)? as u32;
             if ![0, 4, 8].contains(&b) {

@@ -70,6 +70,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/api/embeddings", post(embeddings_legacy))
         .route("/v1/models", get(v1_models))
         .route("/v1/models/{*id}", get(v1_model))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/messages/count_tokens", post(anthropic_count))
         .route("/v1/{*rest}", any(v1_proxy))
         .route("/lmdeck/status", get(status))
         .route("/lmdeck/models", get(lm_models))
@@ -88,6 +90,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/lmdeck/override", post(lm_override))
         .route("/lmdeck/compat", get(lm_compat))
         .route("/lmdeck/plan", get(lm_plan))
+        .layer(axum::middleware::from_fn(log_requests))
         .with_state(app.clone());
 
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| anyhow::anyhow!("binding {addr}: {e} (is Ollama or another lmdeck running?)"))?;
@@ -109,6 +112,19 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 }
 
 // ---------- helpers ----------
+
+/// One line per API call in lmdeck.log (control/status polling is skipped).
+async fn log_requests(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+    let quiet = path.starts_with("/lmdeck/") || path == "/" || path == "/api/version" || path == "/api/ps" || path == "/api/tags";
+    let t0 = Instant::now();
+    let resp = next.run(req).await;
+    if !quiet {
+        sys::log(&format!("{method} {path} -> {} ({:.0} ms to headers)", resp.status().as_u16(), t0.elapsed().as_secs_f64() * 1000.0));
+    }
+    resp
+}
 
 /// JSON body extractor that ignores Content-Type (Ollama accepts bare `curl -d`).
 pub struct AnyJson(pub Value);
@@ -713,6 +729,10 @@ async fn ollama_generate(a: App, b: Value, messages: Vec<Value>, is_chat: bool) 
             let _ = tx.send(json!({"error": e.to_string()})).await;
             return;
         }
+        if acc.finish.is_none() && acc.chunks == 0 && acc.tools.is_empty() {
+            let _ = tx.send(json!({"error": format!("local model backend failed: {}", sys::error_summary(&_g.0.log))})).await;
+            return;
+        }
         let tc = tool_calls_json(&acc);
         if !tc.is_empty() {
             let mut v = mk("", "", &model_name);
@@ -775,6 +795,123 @@ async fn embeddings_legacy(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         Ok((_, e, _)) => Json(json!({"embedding": e.into_iter().next().unwrap_or(json!([]))})).into_response(),
         Err(r) => r,
     }
+}
+
+// ---------- Anthropic Messages (Claude Code, T3 Code) ----------
+
+fn anth_err(code: StatusCode, kind: &str, msg: impl std::fmt::Display) -> Resp {
+    (code, Json(json!({"type": "error", "error": {"type": kind, "message": msg.to_string()}}))).into_response()
+}
+
+async fn anthropic_count(AnyJson(b): AnyJson) -> Json<Value> {
+    Json(json!({"input_tokens": crate::anthropic::count_tokens(&b)}))
+}
+
+async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
+    let t0 = Instant::now();
+    let Some(mut name) = model_field(&b) else { return anth_err(StatusCode::BAD_REQUEST, "invalid_request_error", "model is required") };
+    // Claude Code makes background calls with claude-* names; serve them with
+    // whatever local model is loaded rather than failing the session.
+    if name.starts_with("claude") && a.mgr.resolve(&name).is_err() {
+        if let Some(r) = a.mgr.running().first() {
+            name = r.name.clone();
+        }
+    }
+    let stream = b.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    let (guard, _) = match a.mgr.acquire(&name, None).await {
+        Ok(x) => x,
+        Err(e) => {
+            let s = format!("{e:#}");
+            let code = if s.contains("not found") { StatusCode::NOT_FOUND } else { StatusCode::INTERNAL_SERVER_ERROR };
+            return anth_err(code, if code == StatusCode::NOT_FOUND { "not_found_error" } else { "api_error" }, s);
+        }
+    };
+    let body = crate::anthropic::to_openai(&b, guard.0.backend_model_id());
+    let resp = match a.mgr.http.post(format!("{}/v1/chat/completions", guard.0.base())).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => return anth_err(StatusCode::BAD_GATEWAY, "api_error", format!("backend unreachable: {e}")),
+    };
+    if !resp.status().is_success() {
+        let t = resp.text().await.unwrap_or_default();
+        return anth_err(StatusCode::BAD_GATEWAY, "api_error", format!("backend: {t}"));
+    }
+    let model_name = guard.0.name.clone();
+
+    // Shared SSE reader: OpenAI chunks -> Anthropic Stream state.
+    async fn pump(resp: reqwest::Response, st: &mut crate::anthropic::Stream, tx: Option<&mpsc::Sender<Result<Bytes, std::io::Error>>>) -> Option<Instant> {
+        let mut s = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut first = None;
+        while let Some(chunk) = s.next().await {
+            let Ok(chunk) = chunk else { break };
+            buf.extend_from_slice(&chunk);
+            let mut out = String::new();
+            while let Some(pos) = buf.iter().position(|&c| c == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line);
+                let Some(data) = line.trim().strip_prefix("data:") else { continue };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                    let piece = st.feed(&v);
+                    if !piece.is_empty() {
+                        first.get_or_insert_with(Instant::now);
+                    }
+                    out.push_str(&piece);
+                }
+            }
+            if let Some(tx) = tx {
+                if !out.is_empty() && tx.send(Ok(Bytes::from(out))).await.is_err() {
+                    return first; // client went away
+                }
+            }
+        }
+        first
+    }
+
+    let mut st = crate::anthropic::Stream::new(&model_name);
+    if !stream {
+        let first = pump(resp, &mut st, None).await;
+        if st.failed() {
+            let msg = format!("local model backend failed: {}", sys::error_summary(&guard.0.log));
+            return anth_err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", msg);
+        }
+        drop(guard);
+        let gen_secs = first.map(|f| f.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let ttft = first.map(|f| f.duration_since(t0).as_secs_f64()).unwrap_or(0.0);
+        USAGE.record(&model_name, st.input_tokens, st.output_tokens, ttft, gen_secs, ttft);
+        return Json(st.message()).into_response();
+    }
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    tokio::spawn(async move {
+        let _g = guard;
+        let _ = tx.send(Ok(Bytes::from(st.start()))).await;
+        let first = pump(resp, &mut st, Some(&tx)).await;
+        if st.failed() {
+            let msg = format!("local model backend failed: {}", sys::error_summary(&_g.0.log));
+            sys::log(&format!("/v1/messages {model_name}: {msg}"));
+            let ev = crate::anthropic::sse("error", &json!({"type": "error", "error": {"type": "api_error", "message": msg}}));
+            let _ = tx.send(Ok(Bytes::from(ev))).await;
+            return;
+        }
+        let _ = tx.send(Ok(Bytes::from(st.finish()))).await;
+        sys::log(&format!(
+            "/v1/messages {model_name}: {} in / {} out, stop={}, {:.1}s",
+            st.input_tokens,
+            st.output_tokens,
+            st.anthropic_stop(),
+            t0.elapsed().as_secs_f64()
+        ));
+        let gen_secs = first.map(|f| f.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let ttft = first.map(|f| f.duration_since(t0).as_secs_f64()).unwrap_or(0.0);
+        USAGE.record(&model_name, st.input_tokens, st.output_tokens, ttft, gen_secs, ttft);
+    });
+    let mut r = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+    r.headers_mut().insert("content-type", HeaderValue::from_static("text/event-stream"));
+    r.headers_mut().insert("cache-control", HeaderValue::from_static("no-cache"));
+    r
 }
 
 // ---------- OpenAI ----------

@@ -425,9 +425,14 @@ impl Manager {
                 }
                 a.extend(["--model".into(), m.path.display().to_string(), "--host".into(), "127.0.0.1".into(), "--port".into(), port.to_string()]);
                 a.extend(["--prompt-cache-size".into(), cfg.mlx.prompt_cache_size.to_string()]);
-                if cfg.mlx.prompt_cache_gib > 0.0 {
-                    a.extend(["--prompt-cache-bytes".into(), ((cfg.mlx.prompt_cache_gib * (1u64 << 30) as f64) as u64).to_string()]);
-                }
+                // Each cached prompt can hold GBs of KV; always bound the total.
+                let cache_bytes = if cfg.mlx.prompt_cache_gib > 0.0 {
+                    (cfg.mlx.prompt_cache_gib * (1u64 << 30) as f64) as u64
+                } else {
+                    heap.unwrap_or_else(crate::compat::gpu_budget) / 4
+                };
+                a.extend(["--prompt-cache-bytes".into(), cache_bytes.to_string()]);
+                a.extend(["--prefill-step-size".into(), cfg.mlx.prefill_step_size.max(64).to_string()]);
                 a.extend(cfg.mlx.extra_args.clone());
                 let mut env: Vec<(String, String)> = cfg.mlx.env.clone().into_iter().collect();
                 env.push(("LMDECK_MLX_BATCH".into(), if cfg.mlx.batching { "1" } else { "0" }.into()));
