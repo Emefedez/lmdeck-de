@@ -359,7 +359,9 @@ impl Manager {
                         crate::compat::recommend_fitting("chat").map(|r| format!(" (e.g. {r})")).unwrap_or_default()
                     );
                 }
-                want.max(stock) & !((1u64 << 20) - 1)
+                // The heap is a ceiling, not an allocation: give the backend everything that is
+                // safe (free RAM minus the reserves) so long prompts have room for their KV cache.
+                cap.max(want).max(stock) & !((1u64 << 20) - 1)
             }
             n => (n.parse::<f64>().unwrap_or(0.0) * (1u64 << 30) as f64) as u64,
         };

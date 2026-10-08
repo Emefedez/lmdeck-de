@@ -5,7 +5,84 @@
 use serde_json::{json, Value};
 
 /// Anthropic request -> OpenAI chat request (streaming, usage included).
-pub fn to_openai(b: &Value, model_id: &str) -> Value {
+/// How much of Claude Code's tool list a local model gets.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ToolMode {
+    /// Everything as sent.
+    All,
+    /// Drop MCP tools (mcp__*).
+    Core,
+    /// Core minus tools a local model rarely needs, with descriptions cut to their first
+    /// paragraph and parameter docs to one line: far fewer prompt tokens, same schemas.
+    Lean,
+    /// Lean plus MCP tools on demand through tool groups (see toolgroups.rs).
+    Groups,
+}
+
+impl ToolMode {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "all" => ToolMode::All,
+            "core" => ToolMode::Core,
+            "groups" => ToolMode::Groups,
+            _ => ToolMode::Lean,
+        }
+    }
+}
+
+/// Claude Code tools dropped in lean mode (orchestration, scheduling, notebooks, MCP plumbing).
+const LEAN_DROP: &[&str] = &[
+    "Agent", "Task", "TaskOutput", "TaskStop", "NotebookEdit", "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+    "Skill", "SlashCommand", "ListMcpResourcesTool", "ReadMcpResourceTool", "CronCreate", "CronDelete", "CronList", "Monitor",
+    "RemoteTrigger", "ScheduleWakeup", "PushNotification", "SendMessage", "ListAgents", "ToolSearch", "LSP", "SendFeedback",
+    "ReportFindings", "Artifact", "ArtifactComments", "ArtifactData", "DesignSync",
+];
+
+fn shorten(text: &str, max: usize) -> String {
+    let first = text.split("\n\n").next().unwrap_or(text).trim();
+    if first.chars().count() <= max {
+        first.to_string()
+    } else {
+        let cut: String = first.chars().take(max).collect();
+        format!("{}…", cut.rsplit_once(' ').map(|(a, _)| a).unwrap_or(&cut))
+    }
+}
+
+/// Lean JSON schema: parameter descriptions cut to one short line, structure untouched.
+fn lean_schema(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => Value::Object(m.iter().map(|(k, v)| {
+            let v = if k == "description" { v.as_str().map(|s| json!(shorten(s, 160))).unwrap_or_else(|| v.clone()) } else { lean_schema(v) };
+            (k.clone(), v)
+        }).collect()),
+        Value::Array(a) => Value::Array(a.iter().map(lean_schema).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Tools after applying `mode`, still in Anthropic form.
+pub fn filter_tools(tools: &[Value], mode: ToolMode) -> Vec<Value> {
+    tools.iter().filter(|t| t.get("input_schema").is_some()).filter_map(|t| {
+        let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if mode != ToolMode::All && name.starts_with("mcp__") {
+            return None;
+        }
+        if matches!(mode, ToolMode::Lean | ToolMode::Groups) {
+            if LEAN_DROP.contains(&name) {
+                return None;
+            }
+            let mut t = t.clone();
+            if let Some(d) = t.get("description").and_then(|d| d.as_str()) {
+                t["description"] = json!(shorten(d, 600));
+            }
+            t["input_schema"] = lean_schema(&t["input_schema"]);
+            return Some(t);
+        }
+        Some(t.clone())
+    }).collect()
+}
+
+pub fn to_openai(b: &Value, model_id: &str, mode: ToolMode) -> Value {
     let mut messages: Vec<Value> = Vec::new();
     match b.get("system") {
         Some(Value::String(s)) if !s.is_empty() => messages.push(json!({"role": "system", "content": s})),
@@ -107,9 +184,8 @@ pub fn to_openai(b: &Value, model_id: &str) -> Value {
         }
     }
     if let Some(tools) = b.get("tools").and_then(|t| t.as_array()).filter(|t| !t.is_empty()) {
-        let t: Vec<Value> = tools
+        let t: Vec<Value> = filter_tools(tools, mode)
             .iter()
-            .filter(|t| t.get("input_schema").is_some()) // skip server tools (web_search etc.)
             .map(|t| {
                 json!({"type": "function", "function": {
                     "name": t.get("name").cloned().unwrap_or(json!("")),
@@ -136,6 +212,15 @@ pub fn to_openai(b: &Value, model_id: &str) -> Value {
         _ => {}
     }
     o
+}
+
+/// Prompt size by part (~4 chars per token): (system, messages, tools, mcp tools, mcp tool count).
+pub fn prompt_breakdown(b: &Value) -> (u64, u64, u64, u64, usize) {
+    let len = |v: Option<&Value>| v.map(|v| v.to_string().len() as u64 / 4).unwrap_or(0);
+    let tools = b.get("tools").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+    let mcp: Vec<&Value> = tools.iter().filter(|t| t.get("name").and_then(|n| n.as_str()).unwrap_or("").starts_with("mcp__")).collect();
+    let mcp_tokens = mcp.iter().map(|t| t.to_string().len() as u64 / 4).sum();
+    (len(b.get("system")), len(b.get("messages")), len(b.get("tools")), mcp_tokens, mcp.len())
 }
 
 /// Rough token estimate for /v1/messages/count_tokens (~4 chars per token).
@@ -353,7 +438,7 @@ mod tests {
             "tools": [{"name": "get", "description": "d", "input_schema": {"type": "object"}}],
             "tool_choice": {"type": "any"}
         });
-        let o = to_openai(&b, "default_model");
+        let o = to_openai(&b, "default_model", ToolMode::All);
         let m = o["messages"].as_array().unwrap();
         assert_eq!(m[0]["role"], "system");
         assert_eq!(m[2]["tool_calls"][0]["function"]["arguments"], "{\"city\":\"Madrid\"}");
@@ -375,5 +460,40 @@ mod tests {
         assert!(out.contains("input_json_delta"));
         assert!(out.contains("\"stop_reason\":\"tool_use\""));
         assert_eq!(s.message()["content"][1]["input"]["a"], 1);
+    }
+}
+
+#[cfg(test)]
+mod mcp_tool_tests {
+    #[test]
+    fn core_mode_drops_mcp_tools() {
+        let b = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"name": "Bash", "description": "d", "input_schema": {"type": "object"}},
+                {"name": "mcp__rea__open_binary", "description": "d", "input_schema": {"type": "object"}}
+            ]
+        });
+        let core = super::to_openai(&b, "m", super::ToolMode::Core);
+        assert_eq!(core["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(core["tools"][0]["function"]["name"], "Bash");
+        assert_eq!(super::to_openai(&b, "m", super::ToolMode::All)["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(super::prompt_breakdown(&b).4, 1);
+        let lean = super::to_openai(&b, "m", super::ToolMode::Lean);
+        assert_eq!(lean["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lean_shortens_descriptions_but_keeps_schema() {
+        let long = format!("Runs a command.\n\n{}", "detail ".repeat(500));
+        let tools = vec![
+            serde_json::json!({"name": "Bash", "description": long, "input_schema": {"type": "object", "properties": {"command": {"type": "string", "description": "x ".repeat(300)}}, "required": ["command"]}}),
+            serde_json::json!({"name": "Agent", "description": "d", "input_schema": {"type": "object"}}),
+        ];
+        let out = super::filter_tools(&tools, super::ToolMode::Lean);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["description"], "Runs a command.");
+        assert_eq!(out[0]["input_schema"]["required"][0], "command");
+        assert!(out[0]["input_schema"]["properties"]["command"]["description"].as_str().unwrap().chars().count() <= 161);
     }
 }

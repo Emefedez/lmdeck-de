@@ -104,6 +104,21 @@ lmdeck launch t3 --no-open               # only (re)write the T3 provider; T3 se
 - **T3 Code**: the provider instance uses T3's stock Claude driver plus those environment overrides, and lists your local models as custom models. `settings.json` is backed up first.
 - Agent system prompts are large (Claude Code's is about 21k tokens), so the first turn spends most of its time in prefill. That took about 2.5 minutes for a 4B model on an M1 Max. MLX prompt caching makes later turns with the same prefix much faster.
 
+### Prompt size for local models
+
+Claude Code sends every tool it knows, MCP tools included. With a few MCP servers that is easily 140k+ tokens, which at ~60 tokens/s of prefill on a 27B model means an hour before the first answer (and an out-of-memory crash on the way). `server.local_tools` decides what a local model gets on `/v1/messages`:
+
+| Mode | What the model sees | Claude Code request seen here |
+|---|---|---|
+| `lean` (default) | No MCP tools; essential Claude Code tools only, descriptions cut to their first paragraph, parameter docs to one line. Schemas are untouched, so tool calls work as before. | ~148k → ~6.6k tokens, first answer in ~100 s on Qwen3.8-27B |
+| `groups` | `lean` plus two meta tools. `tool_group` lists your MCP servers (split into subgroups like `rea/inspect` when a server has many tools); lmdeck answers it itself with that section of `~/.config/lmdeck/tool-groups/<server>.md`. `call_tool(name, arguments)` is rewritten into the real MCP tool call for Claude Code. The group files are generated from the tool list and can be edited; delete the `lmdeck:auto` line to keep your edits. | MCP tools available at ~6.6k tokens; a hypruse call end to end in ~2 min |
+| `core` | Everything except MCP tools. | ~17k tokens |
+| `all` | Everything. | as sent |
+
+Every `/v1/messages` request logs the breakdown (system, messages, tools before and after) in `lmdeck.log`. In `groups` mode responses are delivered when complete rather than streamed token by token.
+
+**Prefix checkpoints.** Hybrid models such as Qwen3.5/3.8 keep part of their state in a cache that can't be rewound, so mlx_lm's single-request path (which caches prompt + answer) never reused anything and every agent turn re-read the whole prompt. lmdeck's shim now saves a checkpoint at the start of each answer, so the next turn (or the next `tool_group` round) only processes what is new: a follow-up turn went from ~99 s to ~13 s.
+
 ## VS Code / Copilot fallback
 
 `./install.sh --vscode` installs the **lmdeck VS Code extension** (`vscode-extension/`, packaged without vsce).
@@ -176,7 +191,7 @@ Token usage is counted for both Ollama and OpenAI requests. It lives in memory a
   - `llama.cache_reuse` reuses KV for shifted prompts; it defaults to 256 and helps agent loops.
   - Changing any of these marks loaded models stale. Reload from the panel, or press `R` in the TUI.
 - **GPU memory guard**: Asahi gives the GPU about half of RAM (Honeykrisp heap). Overcommitting it can hang the whole machine, so every GPU load is planned first (`/lmdeck/plan?model=` shows the decision without loading anything):
-  - `server.gpu_heap = auto` (the default) raises `HK_SYSMEM` for that one backend process only when the model needs more. The cap is free RAM minus `server.mem_reserve_gib` (desktop), plus `server.vm_reserve_gib` while a muvm VM runs. It never applies globally and ends when the model unloads.
+  - `server.gpu_heap = auto` (the default) raises `HK_SYSMEM` for that one backend process only when the model needs more. The heap is set to the whole safe cap, free RAM minus `server.mem_reserve_gib` (desktop) and `server.vm_reserve_gib` while a muvm VM runs, since it's a ceiling and long prompts need the room for their KV cache. It never applies globally and ends when the model unloads.
   - `stock` never raises the heap. A number sets a fixed size in GiB.
   - A load that doesn't fit is refused with an explanation and a recommended model that does fit.
   - If a killed backend hasn't exited (for example a hung GPU), further loads are blocked so they can't stack another model's memory on top.

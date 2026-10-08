@@ -173,6 +173,52 @@ def install_kv_options(mod):
     return ", ".join(notes)
 
 
+# Optional: checkpoint the conversation prefix before generating. The stock single-request
+# path only caches prompt+output, which a hybrid model (non-trimmable cache, e.g. Qwen3.5/3.8)
+# can never reuse, so every agent turn re-read the whole prompt.
+OPTIONAL_PATCHES = [
+    (
+        "            # Process the prompt and generate tokens\n            for gen in stream_generate(",
+        "            if self.model_provider.draft_model is None:\n"
+        "                rest = _lmdeck_checkpoint(self, model, tokenizer, prompt, rest, cache, progress)\n"
+        "            # Process the prompt and generate tokens\n            for gen in stream_generate(",
+    ),
+]
+
+
+def lmdeck_checkpoint(server, model, tokenizer, prompt, rest, cache, progress):
+    """Prefill up to the last <|im_start|> (the start of the answer being generated), save
+    that cache as a prefix entry, and return the tokens still to process."""
+    import copy
+
+    import mlx.core as mx
+
+    try:
+        im = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    except Exception:
+        return rest
+    if not isinstance(im, int) or im < 0:
+        return rest
+    start = len(prompt) - len(rest)
+    try:
+        boundary = len(prompt) - 1 - prompt[::-1].index(im)
+    except ValueError:
+        return rest
+    if boundary - start < 256:
+        return rest
+    step = getattr(server.cli_args, "prefill_step_size", None) or 512
+    toks = prompt[start:boundary]
+    for i in range(0, len(toks), step):
+        chunk = toks[i : i + step]
+        model(mx.array(chunk)[None], cache=cache)
+        mx.eval([c.state for c in cache])
+        progress(start + i + len(chunk), len(prompt))
+    server.prompt_cache.insert_cache(
+        server.model_provider.model_key, prompt[:boundary], copy.deepcopy(cache), cache_type="user"
+    )
+    return prompt[boundary:]
+
+
 def main():
     if os.environ.get("LMDECK_MLX_DEVICE") == "cpu":
         enable_cpu_mode()
@@ -183,6 +229,11 @@ def main():
         if src.count(old) == 1:
             src = src.replace(old, new)
             applied += 1
+    checkpoint = False
+    for old, new in OPTIONAL_PATCHES:
+        if applied == len(PATCHES) and src.count(old) == 1:
+            src = src.replace(old, new)
+            checkpoint = True
     if applied != len(PATCHES):
         print(
             f"lmdeck: mlx_lm.server fast path not applicable ({applied}/{len(PATCHES)} patches matched); running stock server",
@@ -194,6 +245,7 @@ def main():
     mod.__file__ = path
     mod.__package__ = "mlx_lm"
     sys.modules["mlx_lm.server"] = mod
+    mod.__dict__["_lmdeck_checkpoint"] = lmdeck_checkpoint
     exec(compile(src, path, "exec"), mod.__dict__)
     # The BatchGenerator path is ~40% slower per stream than stream_generate on
     # this backend; a desktop rarely runs concurrent requests, so default to the
@@ -204,7 +256,8 @@ def main():
         rg._is_batchable = lambda self, args: False
     kv = install_kv_options(mod)
     print(
-        f"lmdeck: mlx_lm.server fast path active (no per-token logprob sync, batching {'on' if batching else 'off'}, {kv})",
+        f"lmdeck: mlx_lm.server fast path active (no per-token logprob sync, batching {'on' if batching else 'off'}, {kv}"
+        f"{', prefix checkpoints' if checkpoint else ''})",
         file=sys.stderr,
         flush=True,
     )

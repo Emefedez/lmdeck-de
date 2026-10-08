@@ -8,6 +8,7 @@ mod launch;
 mod models;
 mod server;
 mod sys;
+mod toolgroups;
 mod tui;
 mod usage;
 mod vscode;
