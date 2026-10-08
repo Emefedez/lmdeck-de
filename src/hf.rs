@@ -62,18 +62,69 @@ pub struct RepoHit {
 
 /// kind: "mlx" | "gguf"
 pub async fn search(c: &reqwest::Client, query: &str, kind: &str, limit: usize) -> Result<Vec<RepoHit>> {
-    let mut q: Vec<(&str, String)> = vec![
-        ("search", query.to_string()),
-        ("sort", "downloads".into()),
-        ("direction", "-1".into()),
-        ("limit", limit.to_string()),
-    ];
-    q.push(("filter", if kind == "gguf" { "gguf" } else { "mlx" }.into()));
-    for f in ["downloads", "likes", "lastModified", "pipeline_tag", "gated"] {
-        q.push(("expand[]", f.into()));
+    search_sorted(c, query, kind, limit, "relevance").await
+}
+
+pub async fn search_sorted(c: &reqwest::Client, query: &str, kind: &str, limit: usize, sort: &str) -> Result<Vec<RepoHit>> {
+    if !matches!(kind, "mlx" | "gguf") { bail!("kind must be mlx or gguf"); }
+    if !matches!(sort, "relevance" | "downloads" | "likes" | "lastModified") { bail!("invalid search sort"); }
+    let query = query.trim().trim_end_matches('/');
+    let query = query.strip_prefix("https://huggingface.co/")
+        .or_else(|| query.strip_prefix("https://hf.co/"))
+        .or_else(|| query.strip_prefix("hf.co/")).unwrap_or(query);
+    let query = query.split("/tree/").next().unwrap_or(query);
+    let query = query.split(':').next().unwrap_or(query);
+    let limit = limit.clamp(1, 100);
+    // Search each word against the Hub's substring index, then require all words
+    // locally. This finds "qwen 4b" in names such as "Qwen3-4B-4bit".
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    if words.len() > 8 { bail!("use at most 8 search words"); }
+    let mut searches = Vec::new();
+    for word in if words.is_empty() { vec![String::new()] } else { words.clone() } {
+        let q = vec![
+            ("search", word), ("sort", if sort == "relevance" { "downloads" } else { sort }.into()),
+            ("direction", "-1".into()), ("limit", if words.len() > 1 { 100 } else { limit }.to_string()),
+            ("filter", kind.into()),
+            ("expand[]", "downloads".into()), ("expand[]", "likes".into()),
+            ("expand[]", "lastModified".into()), ("expand[]", "pipeline_tag".into()), ("expand[]", "gated".into()),
+        ];
+        searches.push(async move {
+            let r = auth(c.get(format!("{HF}/api/models")).query(&q)).send().await?.error_for_status()?;
+            Ok::<Vec<RepoHit>, anyhow::Error>(r.json().await?)
+        });
     }
-    let r = auth(c.get(format!("{HF}/api/models")).query(&q)).send().await?.error_for_status()?;
-    Ok(r.json().await?)
+    let mut hits: Vec<RepoHit> = futures_util::future::try_join_all(searches).await?.into_iter().flatten().collect();
+    // An explicit repo or pasted URL should work even if its format tag is missing.
+    if query.split('/').count() == 2 && !query.contains(char::is_whitespace) {
+        let r = auth(c.get(format!("{HF}/api/models/{query}"))).send().await?;
+        if r.status().is_success() { hits.push(r.json().await?); }
+        else if r.status() != 404 { r.error_for_status()?; }
+    }
+    rank_hits(&mut hits, query, sort);
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+fn rank_hits(hits: &mut Vec<RepoHit>, query: &str, sort: &str) {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    hits.retain(|h| words.iter().all(|w| h.id.to_lowercase().contains(w)));
+    let query = query.to_lowercase();
+    hits.sort_by(|a, b| {
+        let relevance = |h: &RepoHit| {
+            let id = h.id.to_lowercase();
+            let name = id.rsplit('/').next().unwrap_or(&id);
+            if id == query || name == query { 0 } else if name.starts_with(&query) { 1 } else { 2 }
+        };
+        let order = match sort {
+            "likes" => b.likes.cmp(&a.likes),
+            "lastModified" => b.last_modified.cmp(&a.last_modified),
+            "downloads" => b.downloads.cmp(&a.downloads),
+            _ => relevance(a).cmp(&relevance(b)).then(b.downloads.cmp(&a.downloads)),
+        };
+        order.then(a.id.cmp(&b.id))
+    });
+    let mut seen = std::collections::HashSet::new();
+    hits.retain(|h| seen.insert(h.id.clone()));
 }
 
 // ---------- repo tree ----------
@@ -311,7 +362,8 @@ pub struct Download {
     pub done: AtomicU64,
     pub status: Mutex<DlStatus>,
     pub file: Mutex<String>,
-    pub cancel: AtomicBool,
+    pub cancel: Arc<AtomicBool>,
+    cancelled: tokio::sync::Notify,
     pub started: Instant,
 }
 
@@ -341,6 +393,12 @@ impl Download {
     fn set(&self, s: DlStatus) {
         *self.status.lock().unwrap() = s;
     }
+    async fn cancelled(&self) {
+        let notified = self.cancelled.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.cancel.load(Ordering::Relaxed) { notified.await; }
+    }
     pub fn finished(&self) -> bool {
         matches!(*self.status.lock().unwrap(), DlStatus::Done | DlStatus::Failed(_) | DlStatus::Cancelled)
     }
@@ -368,7 +426,8 @@ impl Downloads {
             done: AtomicU64::new(0),
             status: Mutex::new(DlStatus::Resolving),
             file: Mutex::new(String::new()),
-            cancel: AtomicBool::new(false),
+            cancel: Arc::new(AtomicBool::new(false)),
+            cancelled: tokio::sync::Notify::new(),
             started: Instant::now(),
         });
         map.insert(key.clone(), d.clone());
@@ -391,11 +450,13 @@ impl Downloads {
     pub fn cancel(&self, spec: &str) -> bool {
         let key = crate::models::normalize(spec);
         match self.map.lock().unwrap().get(&key) {
-            Some(d) => {
+            Some(d) if !d.finished() => {
                 d.cancel.store(true, Ordering::Relaxed);
+                d.cancelled.notify_waiters();
+                crate::usage::EVENTS.bump();
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -411,7 +472,11 @@ impl Downloads {
 }
 
 async fn pull(c: &reqwest::Client, cfg: &Config, spec: &str, d: &Download) -> Result<()> {
-    let plan = plan(c, cfg, spec).await?;
+    let plan = tokio::select! {
+        biased;
+        _ = d.cancelled() => bail!("cancelled"),
+        p = plan(c, cfg, spec) => p?,
+    };
     *d.name.lock().unwrap() = plan.name.clone();
     d.total.store(plan.total(), Ordering::Relaxed);
     d.set(DlStatus::Downloading);
@@ -452,6 +517,7 @@ async fn pull(c: &reqwest::Client, cfg: &Config, spec: &str, d: &Download) -> Re
     for r in results {
         r?;
     }
+    if d.cancel.load(Ordering::Relaxed) { bail!("cancelled"); }
     tokio::fs::write(repo_dir.join("refs").join("main"), &plan.sha).await.or_else(|_| {
         std::fs::create_dir_all(repo_dir.join("refs"))?;
         std::fs::write(repo_dir.join("refs/main"), &plan.sha)
@@ -570,6 +636,8 @@ async fn fetch_file(
         }
     };
     let res = tokio::select! {
+        biased;
+        _ = d.cancelled() => Err(anyhow!("cancelled")),
         r = futures_util::future::try_join_all(futs) => r,
         _ = saver => unreachable!(),
     };
@@ -580,7 +648,8 @@ async fn fetch_file(
     if let Some(want) = sha256 {
         d.set(DlStatus::Verifying);
         let p = part.clone();
-        let got = tokio::task::spawn_blocking(move || sha256_file(&p)).await??;
+        let cancel = d.cancel.clone();
+        let got = tokio::task::spawn_blocking(move || sha256_file_cancellable(&p, Some(&cancel))).await??;
         d.set(DlStatus::Downloading);
         if !got.eq_ignore_ascii_case(want) {
             let _ = std::fs::remove_file(&part);
@@ -589,6 +658,7 @@ async fn fetch_file(
             bail!("sha256 mismatch (got {got}, want {want}); partial removed, pull again");
         }
     }
+    if d.cancel.load(Ordering::Relaxed) { bail!("cancelled"); }
     std::fs::rename(&part, blob)?;
     let _ = std::fs::remove_file(&state_path);
     Ok(())
@@ -651,13 +721,16 @@ async fn fetch_range(
     Ok(())
 }
 
-pub fn sha256_file(p: &Path) -> std::io::Result<String> {
+fn sha256_file_cancellable(p: &Path, cancel: Option<&AtomicBool>) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     let mut f = std::fs::File::open(p)?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 8 << 20];
     loop {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+        }
         let n = f.read(&mut buf)?;
         if n == 0 {
             break;
@@ -665,4 +738,88 @@ pub fn sha256_file(p: &Path) -> std::io::Result<String> {
         h.update(&buf[..n]);
     }
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn download(spec: &str) -> Arc<Download> {
+        Arc::new(Download { name: Mutex::new(spec.into()), spec: spec.into(),
+            total: AtomicU64::new(0), done: AtomicU64::new(0), status: Mutex::new(DlStatus::Downloading),
+            file: Mutex::new(String::new()), cancel: Arc::new(AtomicBool::new(false)),
+            cancelled: tokio::sync::Notify::new(), started: Instant::now() })
+    }
+
+    #[test]
+    fn search_requires_all_words_deduplicates_and_prioritizes_exact_names() {
+        let hit = |id: &str, downloads| RepoHit { id: id.into(), downloads, ..Default::default() };
+        let mut hits = vec![hit("a/Qwen3-4B-4bit", 10), hit("a/Qwen3-8B", 100), hit("a/Qwen3-4B-4bit", 10)];
+        rank_hits(&mut hits, "qwen 4b", "relevance");
+        assert_eq!(hits.len(), 1);
+        let mut hits = vec![hit("a/Qwen3-4B-4bit", 100), hit("b/Qwen3-4B", 1)];
+        rank_hits(&mut hits, "Qwen3-4B", "relevance");
+        assert_eq!(hits[0].id, "b/Qwen3-4B");
+        rank_hits(&mut hits, "Qwen3-4B", "downloads");
+        assert_eq!(hits[0].downloads, 100);
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_all_waiters_and_ignores_completed_downloads() {
+        let downloads = Downloads::default();
+        let d = download("org/model");
+        downloads.map.lock().unwrap().insert(d.spec.clone(), d.clone());
+        let a = d.clone(); let b = d.clone();
+        let one = tokio::spawn(async move { a.cancelled().await });
+        let two = tokio::spawn(async move { b.cancelled().await });
+        tokio::task::yield_now().await;
+        assert!(downloads.cancel("org/model"));
+        tokio::time::timeout(Duration::from_secs(1), async { one.await.unwrap(); two.await.unwrap(); }).await.unwrap();
+        d.set(DlStatus::Done);
+        assert!(!downloads.cancel("org/model"));
+        assert!(!downloads.cancel("org/missing"));
+    }
+
+    #[tokio::test]
+    async fn stalled_download_cancels_promptly_and_resumes_from_saved_offset() {
+        use axum::{body::Body, http::{HeaderMap, StatusCode}, routing::get, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let size = 5 << 20;
+        let app = Router::new().route("/file", get(move |headers: HeaderMap| async move {
+            let range = headers["range"].to_str().unwrap();
+            let start: usize = range.trim_start_matches("bytes=").split('-').next().unwrap().parse().unwrap();
+            if start == 0 {
+                let stream = futures_util::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from(vec![7u8; 3 << 20])) })
+                    .chain(futures_util::stream::pending());
+                (StatusCode::PARTIAL_CONTENT, Body::from_stream(stream))
+            } else {
+                (StatusCode::PARTIAL_CONTENT, Body::from(vec![7u8; size - start]))
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("lmdeck-cancel-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blob = dir.join("blob");
+        let downloads = Downloads::default();
+        let d = download("org/model");
+        downloads.map.lock().unwrap().insert(d.spec.clone(), d.clone());
+        let dd = d.clone(); let path = blob.clone();
+        let url = format!("http://{addr}/file"); let first_url = url.clone();
+        let task = tokio::spawn(async move { fetch_file(&client(), &first_url, &path, size as u64, None, 1, &dd).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while d.done.load(Ordering::Relaxed) == 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.unwrap();
+        downloads.cancel("org/model");
+        assert!(tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap().is_err());
+        assert!(!blob.exists());
+        let state: SegState = serde_json::from_slice(&std::fs::read(dir.join("blob.incomplete.lmdeck")).unwrap()).unwrap();
+        assert!(state.segs[0][2] > 0 && state.segs[0][2] < size as u64);
+        let resumed = download("org/model");
+        fetch_file(&client(), &url, &blob, size as u64, None, 1, &resumed).await.unwrap();
+        assert_eq!(std::fs::read(&blob).unwrap(), vec![7u8; size]);
+        assert_eq!(resumed.done.load(Ordering::Relaxed), size as u64);
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -261,6 +261,26 @@ pub fn mlx_weight_bytes(dir: &std::path::Path, binned: bool) -> Option<u64> {
     (files > 0).then_some(total)
 }
 
+/// Attention-cache bytes per token for an MLX model, from its config.json (f16 K and V on the
+/// full-attention layers only; hybrid models such as Qwen3.5/3.6/3.8 keep a fixed-size state on
+/// their linear-attention layers instead).
+pub fn mlx_kv_per_token(dir: &std::path::Path) -> Option<u64> {
+    let c: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).ok()?).ok()?;
+    let t = c.get("text_config").filter(|t| t.is_object()).unwrap_or(&c);
+    let layers = t["num_hidden_layers"].as_u64()?;
+    let heads = t["num_attention_heads"].as_u64().unwrap_or(1);
+    let kv_heads = t["num_key_value_heads"].as_u64().unwrap_or(heads);
+    let head_dim = t["head_dim"].as_u64().or_else(|| t["hidden_size"].as_u64().map(|h| h / heads.max(1)))?;
+    let full = if let Some(types) = t["layer_types"].as_array() {
+        types.iter().filter(|l| l.as_str().is_some_and(|s| s.contains("full") || s == "attention")).count() as u64
+    } else if let Some(every) = t["full_attention_interval"].as_u64().filter(|n| *n > 0) {
+        layers / every
+    } else {
+        layers
+    };
+    Some(2 * full * kv_heads * head_dim * 2)
+}
+
 /// Whether the MLX runtime behind `python` rounds GPU buffers up to powers of two
 /// (mlx-omarchy dev builds stamped after 2026-10-05 18:40 UTC).
 pub fn runtime_bins_buffers(python_or_wrapper: &str) -> bool {
@@ -292,17 +312,71 @@ pub fn gpu_need(weights: u64, ctx_tokens: u64) -> u64 {
     weights + weights / 12 + (ctx_tokens * 96 * 1024).min(4 << 30) + (768 << 20)
 }
 
-/// "fits" | "tight" | "too big" against the GPU budget (with 8% headroom).
+/// "fits" (stock heap) | "tight" (needs a raised heap and free memory) | "too big" against the
+/// GPU budget.
 pub fn gpu_fit(weights: u64, ctx_tokens: u64) -> &'static str {
     let budget = gpu_budget() as f64;
     let need = gpu_need(weights, ctx_tokens) as f64;
+    // lmdeck raises the heap per load, so the ceiling is RAM minus the desktop, not the stock 50%.
+    let ceiling = crate::sys::mem().0.saturating_sub(8 << 30) as f64;
     if need <= budget * 0.80 {
         "fits"
-    } else if need <= budget * 0.92 {
+    } else if need <= ceiling.max(budget * 0.92) {
         "tight"
     } else {
         "too big"
     }
+}
+
+/// Approximate download-time sizing; actual architecture and tensor allocation
+/// are only known after download. Include context and today's free memory.
+#[derive(Debug, Clone, Serialize)]
+pub struct HardwareAdvice {
+    pub fit: &'static str,
+    pub estimated_bytes: u64,
+    pub gpu_budget_bytes: u64,
+    pub available_bytes: u64,
+    pub context_tokens: u64,
+    pub advice: String,
+}
+
+pub fn hardware_advice(cfg: &Config, weights: u64, format: &str) -> HardwareAdvice {
+    let (total, available) = crate::sys::mem();
+    let reserve = (cfg.server.mem_reserve_gib.max(0.0) * (1u64 << 30) as f64) as u64
+        + if crate::sys::muvm_rss().is_some() { (cfg.server.vm_reserve_gib.max(0.0) * (1u64 << 30) as f64) as u64 } else { 0 };
+    hardware_advice_for(cfg, weights, format, total, available, reserve, gpu_budget())
+}
+
+fn hardware_advice_for(cfg: &Config, weights: u64, format: &str, total: u64, available: u64, reserve: u64, stock: u64) -> HardwareAdvice {
+    let context = if format == "mlx" {
+        if cfg.mlx.max_kv_size > 0 { cfg.mlx.max_context.min(cfg.mlx.max_kv_size) } else { cfg.mlx.max_context }
+    } else { cfg.llama.ctx_size } as u64;
+    let need = gpu_need(weights, context);
+    let available = available.saturating_sub(reserve);
+    let budget = match cfg.server.gpu_heap.trim().to_lowercase().as_str() {
+        "stock" => stock,
+        "auto" | "" => stock.max(available.min(total.saturating_sub(reserve))),
+        value => value.parse::<f64>().ok().filter(|g| g.is_finite() && *g > 0.0)
+            .map(|g| (g * (1u64 << 30) as f64) as u64).unwrap_or(stock),
+    };
+    let capacity = budget.min(available);
+    let fit = if weights == 0 { "unknown" } else if need <= capacity * 80 / 100 { "fits" }
+        else if need <= capacity * 92 / 100 { "tight" } else { "too big" };
+    let advice = match fit {
+        "unknown" => "Weight size is unavailable; check the model before loading.",
+        "fits" => "Estimated to fit with room for context and runtime buffers.",
+        "tight" => "Limited headroom: reduce context or choose a smaller quant.",
+        _ if need <= budget * 92 / 100 => "Close apps or unload models to free memory, then check again.",
+        _ if format == "gguf" && cfg.llama.auto_offload => "Choose a smaller quant, reduce context, or use partial GPU offload (slower).",
+        _ => "Choose a smaller model or quant, or reduce context.",
+    };
+    HardwareAdvice { fit, estimated_bytes: need, gpu_budget_bytes: budget, available_bytes: available,
+        context_tokens: context, advice: advice.into() }
+}
+
+pub fn recommended_choice(choices: &[crate::hf::Choice], advice: &[HardwareAdvice]) -> Option<usize> {
+    choices.iter().zip(advice).enumerate().filter(|(_, (_, a))| a.fit == "fits")
+        .max_by_key(|(_, (c, _))| (c.default, c.size)).map(|(i, _)| i)
 }
 
 /// Largest qualified catalog chat model that fits the GPU budget.
@@ -322,6 +396,15 @@ pub fn recommend_fitting(kind: &str) -> Option<String> {
 #[cfg(test)]
 mod sizing_tests {
     #[test]
+    fn kv_per_token_counts_full_attention_layers_only() {
+        let d = std::env::temp_dir().join("lmdeck-kv-test");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("config.json"), r#"{"text_config": {"num_hidden_layers": 40, "num_key_value_heads": 2, "num_attention_heads": 16, "head_dim": 256, "full_attention_interval": 4}}"#).unwrap();
+        assert_eq!(super::mlx_kv_per_token(&d), Some(20480)); // Qwen3.6-35B-A3B: 10 layers x 2 heads x 256 x K,V x f16
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
     fn binned_weights_on_local_27b() {
         let home = std::env::var("HOME").unwrap();
         let Some(dir) = std::fs::read_dir(format!("{home}/.cache/huggingface/hub/models--mlx-community--Qwen3.8-27B-4bit/snapshots")).ok().and_then(|mut d| d.next()).and_then(|e| e.ok()).map(|e| e.path()) else { return };
@@ -331,5 +414,31 @@ mod sizing_tests {
         assert!(binned >= plain);
         assert!(super::runtime_bins_buffers(&format!("{home}/.local/bin/mlx-omarchy")));
         assert!(!super::runtime_bins_buffers("/usr/bin/mlx-omarchy"));
+    }
+}
+
+#[cfg(test)]
+mod hardware_tests {
+    use super::*;
+    const GIB: u64 = 1 << 30;
+    #[test]
+    fn advice_obeys_free_ram_heap_policy_and_backend_context() {
+        let mut cfg = Config::default();
+        cfg.server.gpu_heap = "stock".into();
+        cfg.mlx.max_context = 16384;
+        cfg.llama.ctx_size = 4096;
+        let a = hardware_advice_for(&cfg, 4 * GIB, "mlx", 32 * GIB, 20 * GIB, 2 * GIB, 16 * GIB);
+        assert_eq!(a.fit, "fits");
+        assert_eq!(a.context_tokens, 16384);
+        let low = hardware_advice_for(&cfg, 4 * GIB, "mlx", 32 * GIB, 6 * GIB, 2 * GIB, 16 * GIB);
+        assert_eq!(low.fit, "too big");
+        assert!(low.advice.contains("Close apps"));
+        let g = hardware_advice_for(&cfg, 4 * GIB, "gguf", 32 * GIB, 20 * GIB, 2 * GIB, 16 * GIB);
+        assert!(g.estimated_bytes < a.estimated_bytes);
+        cfg.server.gpu_heap = "4".into();
+        assert_eq!(hardware_advice_for(&cfg, 4 * GIB, "gguf", 32 * GIB, 20 * GIB, 2 * GIB, 16 * GIB).fit, "too big");
+        cfg.server.gpu_heap = "auto".into();
+        assert_eq!(hardware_advice_for(&cfg, 16 * GIB, "gguf", 64 * GIB, 40 * GIB, 2 * GIB, 16 * GIB).fit, "fits");
+        assert_eq!(hardware_advice_for(&cfg, 0, "gguf", 32 * GIB, 20 * GIB, 2 * GIB, 16 * GIB).fit, "unknown");
     }
 }

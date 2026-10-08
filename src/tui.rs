@@ -49,7 +49,7 @@ enum Msg {
     Tick,
     Status(Option<Value>),
     Versions(Box<Versions>),
-    Search(Result<Vec<RepoHit>, String>),
+    Search(u64, Result<Vec<RepoHit>, String>),
     Repo(String, Result<Vec<RepoFile>, String>),
     Toast(String),
     Models,
@@ -74,6 +74,7 @@ fn fmt_gib(b: u64) -> String {
 enum Input {
     None,
     Search,
+    Downloads(Vec<String>, usize),
     Setting(usize),
     Confirm(String, Confirmed),
     Update,
@@ -115,6 +116,8 @@ struct Ui {
     hits: Vec<RepoHit>,
     hits_sel: TableState,
     searching: bool,
+    search_generation: u64,
+    search_sort: usize,
     repo: Option<RepoView>,
     settings_sel: TableState,
     input: Input,
@@ -261,6 +264,8 @@ impl Ui {
             hits: vec![],
             hits_sel: TableState::default().with_selected(Some(0)),
             searching: false,
+        search_generation: 0,
+        search_sort: 0,
             repo: None,
             settings_sel: TableState::default().with_selected(Some(0)),
             input: Input::None,
@@ -379,14 +384,15 @@ impl Ui {
                 }
             }
             Msg::Versions(v) => self.versions = *v,
-            Msg::Search(r) => {
+            Msg::Search(generation, r) => {
+                if generation != self.search_generation { return None; }
                 self.searching = false;
                 match r {
                     Ok(h) => {
                         self.hits = h;
                         self.hits_sel.select(Some(0));
                     }
-                    Err(e) => self.toast(format!("search failed: {e}")),
+                    Err(e) => { self.hits.clear(); self.toast(format!("search failed: {e}")); },
                 }
             }
             Msg::Repo(repo, r) => {
@@ -433,6 +439,11 @@ impl Ui {
             return self.key_input(k);
         }
         match k.code {
+            KeyCode::Char('x') if matches!(self.tab, Tab::Dashboard | Tab::Discover) => {
+                let specs: Vec<_> = active_downloads(&self.status).into_iter().map(|d| d.0).collect();
+                if specs.is_empty() { self.toast("no active downloads"); }
+                else { self.input = Input::Downloads(specs, 0); }
+            }
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char(c @ '1'..='5') => self.tab = TABS[(c as u8 - b'1') as usize],
             KeyCode::Tab => self.tab = TABS[(TABS.iter().position(|t| *t == self.tab).unwrap() + 1) % TABS.len()],
@@ -493,6 +504,25 @@ impl Ui {
                 KeyCode::Up | KeyCode::PageUp => { self.popup_scroll = self.popup_scroll.saturating_sub(3); self.input = Input::Guide; None }
                 _ => { self.input = Input::Guide; None }
             };
+        }
+        if let Input::Downloads(specs, mut sel) = input {
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => return None,
+                KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1).min(specs.len().saturating_sub(1)),
+                KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
+                KeyCode::Enter | KeyCode::Char('x') => {
+                    if let Some(spec) = specs.get(sel).cloned() {
+                        self.spawn_daemon_op(format!("cancelling {spec}"), move |d| async move {
+                            let result = d.cancel(&spec).await?;
+                            Ok(if result["ok"] == true { format!("cancelled {spec}; pull again to resume") } else { "download already finished".into() })
+                        });
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+            self.input = Input::Downloads(specs, sel);
+            return None;
         }
         if let Input::Free(mut groups, mut sel, ctx) = input {
             match k.code {
@@ -1067,10 +1097,13 @@ impl Ui {
         let kind = if self.kind_gguf { "gguf" } else { "mlx" };
         let tx = self.tx.clone();
         self.searching = true;
+        self.search_generation += 1;
+        let generation = self.search_generation;
+        let sort = ["relevance", "downloads", "likes", "lastModified"][self.search_sort];
         self.repo = None;
         tokio::spawn(async move {
-            let r = hf::search(&hf::client(), &q, kind, 60).await.map_err(|e| e.to_string());
-            let _ = tx.send(Msg::Search(r));
+            let r = hf::search_sorted(&hf::client(), &q, kind, 60, sort).await.map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Search(generation, r));
         });
     }
 
@@ -1093,10 +1126,14 @@ impl Ui {
     fn repo_choices(&self) -> Vec<(String, String, u64)> {
         let Some(rv) = &self.repo else { return vec![] };
         let Some(files) = &rv.files else { return vec![] };
-        hf::choices(&rv.repo, files, &self.cfg.download.gguf_default_quant)
-            .into_iter()
-            .map(|c| (c.spec, if c.default && c.format == "gguf" { format!("{} ★", c.label) } else { c.label }, c.size))
-            .collect()
+        let choices = hf::choices(&rv.repo, files, &self.cfg.download.gguf_default_quant);
+        let advice: Vec<_> = choices.iter().map(|c| crate::compat::hardware_advice(&self.cfg, c.size, c.format)).collect();
+        let recommended = crate::compat::recommended_choice(&choices, &advice);
+        let recommended = recommended.filter(|&i| choices[i].format != "mlx" || crate::compat::assess_mlx(&self.cfg, &rv.repo, None).level != "unlikely");
+        choices.into_iter().enumerate().map(|(i, c)| {
+            (c.spec, if recommended == Some(i) { format!("{} · recommended", c.label) }
+                else if c.default && c.format == "gguf" { format!("{} ★", c.label) } else { c.label }, c.size)
+        }).collect()
     }
 
     fn key_discover(&mut self, k: KeyEvent) -> Option<Action> {
@@ -1140,6 +1177,11 @@ impl Ui {
                 self.catalog_mode = false;
                 self.search();
             }
+            KeyCode::Char('o') => {
+                self.search_sort = (self.search_sort + 1) % 4;
+                self.catalog_mode = false;
+                self.search();
+            }
             KeyCode::Char('c') => {
                 self.catalog_mode = !self.catalog_mode;
                 if !self.catalog_mode && self.hits.is_empty() {
@@ -1157,15 +1199,6 @@ impl Ui {
                 };
                 if let Some(r) = repo {
                     self.open_repo(r);
-                }
-            }
-            KeyCode::Char('x') => {
-                let active: Vec<String> = active_downloads(&self.status).into_iter().map(|d| d.0).collect();
-                if let Some(spec) = active.first().cloned() {
-                    self.spawn_daemon_op(format!("cancelling {spec}"), move |d| async move {
-                        d.cancel(&spec).await?;
-                        Ok(format!("cancelled {spec}"))
-                    });
                 }
             }
             _ => {}
@@ -1297,9 +1330,9 @@ impl Ui {
             Tab::Models => "⏎ load · u unload · g GPU⇄CPU · c chat · x context · d delete · y copy · ✓ qualified ? untested ✗ GPU-incompatible",
             Tab::Discover => {
                 if self.repo.is_some() {
-                    "⏎ download · a recommended alternative · esc back"
+                    "⏎ download · a recommended alternative · x cancel download · esc back"
                 } else {
-                    "/ search · g MLX⇄GGUF · c catalog⇄search · ⏎ open · x cancel download"
+                    "/ search · g MLX⇄GGUF · o sort · c catalog⇄search · ⏎ open · x cancel download"
                 }
             }
             Tab::Settings => "⏎ edit · o open config in $EDITOR",
@@ -1439,6 +1472,26 @@ impl Ui {
             f.render_widget(Paragraph::new(format!("{}\n↑↓ select · Enter/x run or quit (SIGTERM) · X force kill · [ ] desktop / {{ }} VM reserve · - + GPU heap · p preset · r refresh · l retry · esc close\nRows group same-named processes; RSS counts shared pages.",hint.unwrap_or_default())).wrap(Wrap { trim: true }), help);
             return;
         }
+        if let Input::Downloads(specs, sel) = &self.input {
+            let area = f.area();
+            let width = area.width.saturating_sub(4).min(100);
+            let height = (specs.len() as u16 + 5).min(area.height.saturating_sub(2));
+            let rect = Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height);
+            self.clicks.clear();
+            f.render_widget(Clear, rect);
+            let block = panel("Cancel download — partial files kept for resume");
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            let [list, help] = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(inner);
+            let count = list.height as usize;
+            let start = sel.saturating_sub(count.saturating_sub(1));
+            let lines: Vec<Line> = specs.iter().enumerate().skip(start).take(count).map(|(i, s)| {
+                Line::styled(format!("{} {s}", if i == *sel { "▶" } else { " " }), if i == *sel { Style::new().fg(Color::Cyan).bold() } else { Style::new() })
+            }).collect();
+            f.render_widget(Paragraph::new(lines), list);
+            f.render_widget(Paragraph::new("↑↓ select · Enter/x cancel · Esc close\nDownload the same model again to resume.").fg(Color::DarkGray), help);
+            return;
+        }
         if matches!(self.input, Input::Guide) {
             self.draw_choice(f, "Setup guide", "MLX / safetensors\nRuns compatible MLX models on your Apple GPU. Omarchy and Custom\nInstaller are two installation sources for this same backend.\n\nGGUF / llama.cpp — optional\nRuns GGUF models with Vulkan GPU offload. Set it up only if you want\nGGUF models; MLX inference does not need a llama.cpp build.\n\nPerformance\nSpeed depends on the model, quantization, context length and GPU\noffload. CPU execution can be much slower. Compare the same workload\nusing generation tokens/s, prompt tokens/s and first-token latency\nin Usage. A newer release is not a guarantee of faster inference.", &[
                 ("Update MLX [U]", KeyCode::Char('U')),
@@ -1450,6 +1503,7 @@ impl Ui {
         let (title, text) = match &self.input {
             Input::Update | Input::Runtime | Input::RuntimeKeep(_) | Input::Guide | Input::Free(..) => unreachable!(),
             Input::None => return,
+            Input::Downloads(..) => unreachable!(),
             Input::Search => (format!("Search Hugging Face ({})", if self.kind_gguf { "GGUF" } else { "MLX" }), format!("{}▏", self.buf)),
             Input::Setting(i) => (format!("{} — {}", SETTINGS[*i].1, SETTINGS[*i].2), format!("{}▏", self.buf)),
             Input::Override(n) => (format!("Context size for {n} (empty = default)"), format!("{}▏", self.buf)),
@@ -1478,7 +1532,7 @@ impl Ui {
         let server = if self.status.is_some() { "Stop server [s]" } else { "Start server [s]" };
         let runtime = format!("MLX: {} [i]", if self.cfg.mlx.command.first().is_some_and(|c| c.starts_with("/usr/")) { "package" } else { "Custom" });
         let primary = [(server, KeyCode::Char('s')), ("Update MLX [U]", KeyCode::Char('U')), (runtime.as_str(), KeyCode::Char('i')), ("Setup guide [?]", KeyCode::Char('?'))];
-        let secondary = [("Models [2]", KeyCode::Char('2')), ("Free memory [f]", KeyCode::Char('f')), ("GGUF setup [B]", KeyCode::Char('B')), ("Reload models [R]", KeyCode::Char('R')), ("Unload all [a]", KeyCode::Char('a'))];
+        let secondary = [("Models [2]", KeyCode::Char('2')), ("Free memory [f]", KeyCode::Char('f')), ("GGUF setup [B]", KeyCode::Char('B')), ("Reload models [R]", KeyCode::Char('R')), ("Unload all [a]", KeyCode::Char('a')), ("Cancel download [x]", KeyCode::Char('x'))];
         let width = area.width.saturating_sub(4);
         let primary_height = button_height(width, &primary);
         let secondary_height = button_height(width, &secondary);
@@ -1749,7 +1803,7 @@ impl Ui {
             .iter()
             .map(|m| {
                 let loaded = running.contains(&m.name);
-                let fits = crate::compat::gpu_fit(m.size, self.cfg.llama.ctx_size as u64) != "too big";
+                let fits = crate::compat::hardware_advice(&self.cfg, m.size, if m.format == Format::Mlx { "mlx" } else { "gguf" }).fit != "too big";
                 let caps: Vec<&str> = m.capabilities().into_iter().filter(|c| *c != "completion").collect();
                 let short = m.name.rsplit('/').next().unwrap_or(&m.name).to_string();
                 if narrow {
@@ -1805,13 +1859,12 @@ impl Ui {
     }
 
     fn draw_discover(&mut self, f: &mut Frame, area: Rect) {
-        let buttons = [("Search [/]", KeyCode::Char('/')), ("MLX / GGUF [g]", KeyCode::Char('g')), ("Catalog / HF [c]", KeyCode::Char('c')), ("Open [Enter]", KeyCode::Enter)];
+        let buttons = [("Search [/]", KeyCode::Char('/')), ("MLX / GGUF [g]", KeyCode::Char('g')), ("Catalog / HF [c]", KeyCode::Char('c')), ("Open [Enter]", KeyCode::Enter), ("Sort [o]", KeyCode::Char('o')), ("Cancel download [x]", KeyCode::Char('x'))];
         let height = button_height(area.width.saturating_sub(2), &buttons);
         let [actions, area] = Layout::vertical([Constraint::Length(height + 1), Constraint::Min(0)]).areas(area);
         self.draw_buttons(f, actions.inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 }), &buttons);
         let [main, dl] = Layout::vertical([Constraint::Min(6), Constraint::Length(5)]).areas(area);
         let [list, detail] = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).areas(main);
-        let total_mem = sys::mem().0;
 
         if self.catalog_mode {
             let rows: Vec<Row> = self
@@ -1825,7 +1878,7 @@ impl Ui {
                     Row::new(vec![
                         Cell::from(c["id"].as_str().unwrap_or("").to_string()),
                         Cell::from(c["kind"].as_str().unwrap_or("").to_string()),
-                        Cell::from(human(size)).fg(if size * 5 / 4 < total_mem { Color::Reset } else { Color::Red }),
+                        Cell::from(human(size)).fg(if crate::compat::hardware_advice(&self.cfg, size, "mlx").fit == "fits" { Color::Reset } else { Color::Yellow }),
                         Cell::from(qual).fg(if qual.starts_with('✓') { Color::Green } else { Color::DarkGray }),
                     ])
                 })
@@ -1860,7 +1913,7 @@ impl Ui {
                 "Hugging Face · {} · \"{}\"{}",
                 if self.kind_gguf { "GGUF" } else { "MLX" },
                 self.query,
-                if self.searching { " · searching…" } else { "" }
+                format!(" · {}{}", ["relevance", "downloads", "likes", "updated"][self.search_sort], if self.searching { " · searching…" } else { "" })
             );
             let t = Table::new(rows, [Constraint::Min(30), Constraint::Length(7), Constraint::Length(6), Constraint::Length(10)])
                 .header(Row::new(["Repo", "⬇", "♥", "Updated"]).style(Style::new().fg(Color::DarkGray)))
@@ -1913,20 +1966,25 @@ impl Ui {
                     let rows: Vec<Row> = choices
                         .iter()
                         .map(|(_, label, size)| {
-                            let fit = crate::compat::gpu_fit(*size, self.cfg.llama.ctx_size as u64);
+                            let hw = crate::compat::hardware_advice(&self.cfg, *size, if label.starts_with("GGUF") { "gguf" } else { "mlx" });
+                            let fit = hw.fit;
                             let color = match fit {
                                 "fits" => Color::Green,
                                 "tight" => Color::Yellow,
                                 _ => Color::Red,
                             };
-                            Row::new(vec![Cell::from(label.clone()), Cell::from(human(*size)), Cell::from(fit).fg(color)])
+                            Row::new(vec![Cell::from(label.clone()), Cell::from(format!("{} / ~{}", human(*size), human(hw.estimated_bytes))), Cell::from(fit).fg(color)])
                         })
                         .collect();
                     let block = panel(&rv.repo);
                     let inner = block.inner(detail);
                     f.render_widget(block, detail);
                     let vh = if verdict.is_some() { 4 } else { 0 };
-                    let [vrect, trect] = Layout::vertical([Constraint::Length(vh), Constraint::Min(2)]).areas(inner);
+                    let [vrect, hrect, trect] = Layout::vertical([Constraint::Length(vh), Constraint::Length(3), Constraint::Min(2)]).areas(inner);
+                    if let Some((spec, _, size)) = rv.sel.selected().and_then(|i| choices.get(i)) {
+                        let hw = crate::compat::hardware_advice(&self.cfg, *size, if spec.contains(':') { "gguf" } else { "mlx" });
+                        f.render_widget(Paragraph::new(format!("Est. RAM {} · free {} · GPU budget {} · {} context tokens. {}", human(hw.estimated_bytes), human(hw.available_bytes), human(hw.gpu_budget_bytes), hw.context_tokens, hw.advice)).fg(Color::DarkGray).wrap(Wrap { trim: true }), hrect);
+                    }
                     if let Some(v) = &verdict {
                         let color = match v.level {
                             "unlikely" => Color::Red,
@@ -1945,8 +2003,8 @@ impl Ui {
                         }
                         f.render_widget(Paragraph::new(l).wrap(Wrap { trim: true }), vrect);
                     }
-                    let t = Table::new(rows, [Constraint::Min(16), Constraint::Length(7), Constraint::Length(8)])
-                        .header(Row::new(["Variant", "Size", "GPU mem"]).style(Style::new().fg(Color::DarkGray)))
+                    let t = Table::new(rows, [Constraint::Min(12), Constraint::Length(17), Constraint::Length(8)])
+                        .header(Row::new(["Variant", "Disk / est. RAM", "Fit now"]).style(Style::new().fg(Color::DarkGray)))
                         .row_highlight_style(Style::new().bg(Color::DarkGray).bold());
                     f.render_stateful_widget(t, trect, &mut rv.sel);
                 }
@@ -2191,6 +2249,40 @@ mod tests {
             _ => None,
         }).expect("button must be visible and clickable");
         ui.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: r.x + r.width / 2, row: r.y, modifiers: KeyModifiers::NONE })
+    }
+
+    #[test]
+    fn cancel_picker_selects_downloads_from_dashboard_and_open_repo() {
+        for tab in [Tab::Dashboard, Tab::Discover] {
+            let mut ui = ui();
+            ui.tab = tab;
+            ui.status = Some(serde_json::json!({"downloads": [
+                {"spec": "org/a", "name": "org/a", "status": {"state": "downloading"}},
+                {"spec": "org/finished", "status": {"state": "done"}},
+                {"spec": "org/b", "name": "org/b", "status": {"state": "resolving"}}
+            ]}));
+            ui.repo = Some(RepoView { repo: "org/a".into(), files: None, err: None, sel: TableState::default() });
+            ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            assert!(matches!(&ui.input, Input::Downloads(specs, 0) if specs == &vec!["org/a".to_string(), "org/b".to_string()]));
+            ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            assert!(matches!(ui.input, Input::Downloads(_, 1)));
+            assert!(draw(&mut ui, 80, 24).contains("org/b"));
+            ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(matches!(ui.input, Input::None));
+        }
+    }
+
+    #[test]
+    fn stale_search_cannot_replace_newer_results() {
+        let mut ui = ui();
+        ui.search_generation = 2;
+        ui.searching = true;
+        ui.handle(Msg::Search(1, Ok(vec![RepoHit { id: "org/old".into(), ..Default::default() }])));
+        assert!(ui.hits.is_empty());
+        assert!(ui.searching);
+        ui.handle(Msg::Search(2, Ok(vec![RepoHit { id: "org/new".into(), ..Default::default() }])));
+        assert_eq!(ui.hits[0].id, "org/new");
+        assert!(!ui.searching);
     }
 
     #[test]

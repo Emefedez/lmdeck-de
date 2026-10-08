@@ -18,6 +18,7 @@ Column {
   readonly property bool searchFocused: searchField.activeFocus
 
   property string searchKind: "mlx"
+  property string searchSort: "relevance"
 
   spacing: Style.space(14)
 
@@ -279,13 +280,13 @@ Column {
       Column {
         id: dl
         required property var modelData
-        readonly property string state: modelData.status ? modelData.status.state : ""
-        readonly property bool active: ["downloading", "resolving", "verifying"].indexOf(state) >= 0
+        readonly property string downloadState: modelData.status ? modelData.status.state : ""
+        readonly property bool active: ["downloading", "resolving", "verifying"].indexOf(downloadState) >= 0
         width: parent.width
         spacing: Style.space(3)
         Item {
           width: parent.width
-          implicitHeight: dlName.implicitHeight
+          implicitHeight: Math.max(dlName.implicitHeight, cancelDownload.visible ? cancelDownload.implicitHeight : 0)
           Caption {
             id: dlName
             anchors.left: parent.left
@@ -297,25 +298,28 @@ Column {
           }
           Caption {
             id: dlState
-            anchors.right: parent.right
+            anchors.right: cancelDownload.visible ? cancelDownload.left : parent.right
+            anchors.rightMargin: Style.spacing.sm
             text: {
               var d = dl.modelData
-              if (dl.state === "done") return "✓ " + lm.bytes(d.total)
-              if (dl.state === "failed") return "failed"
-              if (dl.state === "cancelled") return "cancelled"
-              return lm.bytes(d.completed) + "/" + lm.bytes(d.total) + " · " + lm.bytes(d.completed / Math.max(0.1, d.elapsed_secs)) + "/s  ✕"
+              if (dl.downloadState === "done") return "✓ " + lm.bytes(d.total)
+              if (dl.downloadState === "failed") return "failed"
+              if (dl.downloadState === "cancelled") return "cancelled"
+              return lm.bytes(d.completed) + "/" + lm.bytes(d.total) + " · " + lm.bytes(d.completed / Math.max(0.1, d.elapsed_secs)) + "/s"
             }
-            color: dl.state === "failed" ? sec.urgent : sec.dim
-            MouseArea {
-              anchors.fill: parent
-              enabled: dl.active
-              cursorShape: Qt.PointingHandCursor
-              onClicked: lm.cancel(dl.modelData.spec)
-            }
+            color: dl.downloadState === "failed" ? sec.urgent : sec.dim
+          }
+          SmallButton {
+            id: cancelDownload
+            anchors.right: parent.right
+            visible: dl.active
+            text: "Cancel"
+            tooltipText: "Stop this download; partial files are kept for resume"
+            onClicked: lm.cancel(dl.modelData.spec)
           }
         }
         Caption {
-          visible: dl.state === "failed"
+          visible: dl.downloadState === "failed"
           width: parent.width
           text: dl.modelData.status ? String(dl.modelData.status.detail || "") : ""
           color: sec.urgent
@@ -325,7 +329,7 @@ Column {
         Bar {
           width: parent.width
           value: dl.modelData.total > 0 ? dl.modelData.completed / dl.modelData.total : 0
-          alarming: dl.state === "failed"
+          alarming: dl.downloadState === "failed"
         }
       }
     }
@@ -559,11 +563,11 @@ Column {
       TextField {
         id: searchField
         width: parent.width - kindGroup.width - parent.spacing
-        placeholderText: "Search models…"
+        placeholderText: "Model name, org/repo or HF URL…"
         font.family: sec.fontFamily
         font.pixelSize: Style.font.bodySmall
         foreground: sec.foreground
-        onAccepted: if (text.trim() !== "") lm.search(text.trim(), sec.searchKind)
+        onAccepted: lm.search(text.trim(), sec.searchKind, sec.searchSort)
         Keys.onEscapePressed: focus = false
       }
       ButtonGroup {
@@ -576,9 +580,31 @@ Column {
         focusable: false
         onChanged: function(v) {
           sec.searchKind = v
-          if (searchField.text.trim() !== "") lm.search(searchField.text.trim(), v)
+          lm.search(searchField.text.trim(), v, sec.searchSort)
         }
       }
+    }
+
+    Row {
+      spacing: Style.spacing.sm
+      SmallButton {
+        text: "Search"
+        onClicked: lm.search(searchField.text.trim(), sec.searchKind, sec.searchSort)
+      }
+      ButtonGroup {
+        options: [{ value: "relevance", label: "Relevant" }, { value: "downloads", label: "Popular" }, { value: "lastModified", label: "Recent" }, { value: "likes", label: "Likes" }]
+        value: sec.searchSort
+        foreground: sec.foreground
+        fontFamily: sec.fontFamily
+        fontSize: Style.font.caption
+        focusable: false
+        onChanged: function(v) { sec.searchSort = v; lm.search(searchField.text.trim(), sec.searchKind, v) }
+      }
+    }
+    Caption {
+      visible: lm.searchDone && !lm.searching && lm.searchError === "" && lm.searchResults.length === 0
+      text: "No matches. Try fewer words or paste an exact org/repo."
+      color: sec.dim
     }
 
     Caption {
@@ -675,7 +701,7 @@ Column {
             id: choice
             required property var modelData
             width: hit.width
-            implicitHeight: choiceText.implicitHeight + Style.spacing.sm
+            implicitHeight: choiceText.implicitHeight + choiceAdvice.implicitHeight + Style.spacing.md
             Rectangle {
               anchors.fill: parent
               anchors.leftMargin: Style.space(14)
@@ -686,16 +712,33 @@ Column {
               id: choiceText
               anchors.left: parent.left
               anchors.leftMargin: Style.space(20)
-              anchors.verticalCenter: parent.verticalCenter
-              text: choice.modelData.label + (choice.modelData.default ? " ★" : "")
+              anchors.top: parent.top
+              anchors.right: choiceStats.left
+              anchors.rightMargin: Style.spacing.sm
+              elide: Text.ElideRight
+              text: choice.modelData.label + (choice.modelData.recommended ? " · recommended" : choice.modelData.default ? " ★" : "")
               color: sec.foreground
             }
             Caption {
+              id: choiceStats
               anchors.right: parent.right
               anchors.rightMargin: Style.space(6)
-              anchors.verticalCenter: parent.verticalCenter
+              anchors.top: parent.top
               text: lm.bytes(choice.modelData.size) + " · " + choice.modelData.fit + "  ⤓"
               color: choice.modelData.fit === "too big" ? sec.urgent : sec.dim
+            }
+            Caption {
+              id: choiceAdvice
+              anchors.top: choiceText.bottom
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(20)
+              anchors.right: parent.right
+              wrapMode: Text.WordWrap
+              readonly property var hw: choice.modelData.hardware
+              text: !hw ? "" : "Est. RAM " + lm.bytes(hw.estimated_bytes) + " · available " + lm.bytes(hw.available_bytes)
+                + " · GPU budget " + lm.bytes(hw.gpu_budget_bytes) + " · " + lm.count(hw.context_tokens) + " context tokens. " + hw.advice
+              color: sec.dim
+              font.pixelSize: Style.font.caption
             }
             MouseArea {
               id: choiceHover

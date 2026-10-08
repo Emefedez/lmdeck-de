@@ -1344,11 +1344,15 @@ struct SearchQ {
     q: Option<String>,
     kind: Option<String>,
     limit: Option<usize>,
+    sort: Option<String>,
 }
 
 async fn lm_search(State(a): State<App>, Query(q): Query<SearchQ>) -> Resp {
     let kind = q.kind.unwrap_or_else(|| "mlx".into());
-    match hf::search(&a.hf, q.q.as_deref().unwrap_or(""), &kind, q.limit.unwrap_or(30).min(100)).await {
+    if !matches!(kind.as_str(), "mlx" | "gguf") || !matches!(q.sort.as_deref().unwrap_or("relevance"), "relevance" | "downloads" | "likes" | "lastModified") {
+        return err(StatusCode::BAD_REQUEST, "invalid search kind or sort");
+    }
+    match hf::search_sorted(&a.hf, q.q.as_deref().unwrap_or(""), &kind, q.limit.unwrap_or(30), q.sort.as_deref().unwrap_or("relevance")).await {
         Ok(h) => {
             let cfg = a.mgr.cfg();
             let out: Vec<Value> = h
@@ -1391,19 +1395,18 @@ async fn lm_repo(State(a): State<App>, Query(q): Query<RepoQ>) -> Resp {
     .await;
     match res {
         Ok((files, qmode)) => {
-            let (total, avail) = sys::mem();
             let cfg = a.mgr.cfg();
-            let choices: Vec<Value> = hf::choices(&q.id, &files, &cfg.download.gguf_default_quant)
-                .into_iter()
-                .map(|c| {
-                    // GPU budget is the real limit on Asahi (about half of RAM).
-                    let fit = crate::compat::gpu_fit(c.size, cfg.llama.ctx_size as u64);
-                    let _ = (total, avail);
-                    let mut v = json!(c);
-                    v["fit"] = json!(fit);
-                    v
-                })
-                .collect();
+            let variants = hf::choices(&q.id, &files, &cfg.download.gguf_default_quant);
+            let advice: Vec<_> = variants.iter().map(|c| crate::compat::hardware_advice(&cfg, c.size, c.format)).collect();
+            let recommended = crate::compat::recommended_choice(&variants, &advice);
+            let recommended = recommended.filter(|&i| variants[i].format != "mlx" || crate::compat::assess_mlx(&cfg, &q.id, qmode.as_deref()).level != "unlikely");
+            let choices: Vec<Value> = variants.into_iter().zip(advice).enumerate().map(|(i, (c, hw))| {
+                let mut v = json!(c);
+                v["fit"] = json!(hw.fit);
+                v["hardware"] = json!(hw);
+                v["recommended"] = json!(recommended == Some(i));
+                v
+            }).collect();
             let has_mlx = choices.iter().any(|c| c["format"] == "mlx");
             let mut compat = has_mlx.then(|| crate::compat::assess_mlx(&cfg, &q.id, qmode.as_deref()));
             // Only recommend a repo that actually exists.

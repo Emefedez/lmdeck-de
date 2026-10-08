@@ -31,10 +31,10 @@ The Omarchy menu gets **Apps › lmdeck** and **Setup › Local LLM Server**. Th
 - **Server**: the endpoint and LAN IP (marked when exposed), plus Start/Restart, Stop, **Force stop** (SIGKILL of the service cgroup, backends included) and Open TUI.
 - **Loaded**: each model with RSS, its keep-alive countdown or "generating", Unload, and **Reload** when settings changed since it was loaded.
 - **Memory**: a unified-memory meter, the last request's tok/s, prefill and TTFT, and today's token totals.
-- **Downloads**: live progress, cancel and clear.
+- **Downloads**: live progress, a Cancel button for each active download, and clear. Cancelled downloads keep partial files; downloading the same variant resumes.
 - **Cache & memory**: keep-alive, max models, MLX prompt cache, GGUF context, GGUF KV cache type (f16/q8_0/q4_0), KV reuse, MLX fast path, memory check, and local/LAN listen.
 - **Models**: every local model; click one to load or unload it.
-- **Hugging Face**: search MLX or GGUF, expand a repo to see its variants with size and RAM fit, click one to download.
+- **Hugging Face**: search MLX or GGUF by name, multiple words, repo ID or Hugging Face URL; sort by relevance, popularity, likes or latest update. Expand a repo for variants, estimated memory, fit with current free RAM, and a recommended variant. Click one to download.
 
 Usage records are also written to `~/.local/state/omarchy/agents/usage/lmdeck.json`, so "tokens by day/model" works in the panel (and in the stock widget, if you keep it).
 
@@ -83,9 +83,9 @@ Everything lands in the standard Hugging Face hub cache (`~/.cache/huggingface/h
 | Loose GGUF in `models.extra_dirs` | `local/<file stem>` |
 | Short forms | `qwen3-4b-instruct-2507-4bit`, `hf.co/org/repo:Q4_K_M`, aliases from `/api/copy` |
 
-The downloader opens 6 parallel range connections per large file. It resumes after interruption (sidecar state file), checks every LFS file with SHA-256, and only then links it into the snapshot. Gated repos need a token in `~/.cache/huggingface/token` or `HF_TOKEN`.
+The downloader opens 6 parallel range connections per large file. It resumes after interruption (sidecar state file), checks every LFS file with SHA-256, and only then links it into the snapshot. `lmdeck cancel org/repo:Q4_K_M` cancels a daemon download; `lmdeck pull` with the same spec resumes. Gated repos need a token in `~/.cache/huggingface/token` or `HF_TOKEN`.
 
-The Discover tab has two sources. The first is the **omarchy-mlx curated catalog**, which shows which models the project has qualified on this GPU backend. The second is a live **Hugging Face search** (`g` switches between MLX and GGUF). Opening a repo lists its quants with sizes and whether each fits in RAM.
+The Discover tab has two sources. The first is the **omarchy-mlx curated catalog**, which shows which models the project has qualified on this GPU backend. The second is a live **Hugging Face search** (`g` switches between MLX and GGUF). The CLI also supports `lmdeck search "qwen 4b" --gguf --sort downloads` (omit the query to browse). Press `/` to search by name, multiple words (e.g. `qwen 4b`), `org/repo` or a pasted Hugging Face URL. Press `o` to cycle relevance, downloads, likes and recent updates. Opening a repo lists variants with disk size, estimated runtime memory, context and current hardware fit; a fitting variant is marked recommended. These are approximate estimates, not architecture-specific guarantees. Press `x` on Dashboard or Discover (including an open repo) to select which download to cancel. Partial files are kept so the same download can resume.
 
 ## Coding agents: `lmdeck launch`
 
@@ -199,6 +199,7 @@ Token usage is counted for both Ollama and OpenAI requests. It lives in memory a
   - `stock` never raises the heap. A number sets a fixed size in GiB.
   - A load that doesn't fit is refused with an explanation and a recommended model that does fit.
   - If a killed backend hasn't exited (for example a hung GPU), further loads are blocked so they can't stack another model's memory on top.
+  - MLX needs are planned exactly: weights from the safetensors headers, attention cache from the model's config.json for 32k tokens (only the full-attention layers count, so hybrid models such as Qwen3.5/3.6/3.8 need little), plus ~1.1 GiB for runtime and prompt-cache checkpoints and a 0.5 GiB margin. If that doesn't fit, the planner retries for 8k tokens before refusing. On a 32 GB Mac this admits ~19 GiB models such as Qwen3.6-35B-A3B-4bit (≈20.3 GiB at 8k, ≈20.8 GiB at 32k) when about 23 GiB is free; use the memory popup's **Make room** first. The prompt-cache budget is capped to what the heap leaves free, and the Discover fit marker counts a raised heap as "tight" rather than "too big".
   - MLX weights are sized from the safetensors headers. mlx-omarchy dev builds stamped after 2026-10-05 (allocator commit `b20211a0`) round every GPU buffer over 1 MiB up to a power of two; for those runtimes the planner rounds each tensor the same way (Qwen3.8-27B-4bit: 14.95 GiB plain, 21.40 GiB binned) and the refusal says how much the Omarchy package runtime would save.
   - GGUF models that don't fit whole are loaded with only as many layers on the GPU as fit (`llama.auto_offload`, layer count read from the GGUF). The rest run on the CPU from the memory-mapped file. A per-model `gpu_layers` override wins over both.
   - If an MLX backend's generator thread dies while loading (for example Vulkan out of memory) the load fails right away with that error instead of waiting for the timeout.

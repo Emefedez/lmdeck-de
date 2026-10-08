@@ -20,6 +20,8 @@ Item {
   property var config: []
   property var vscode: null
   property var searchResults: []
+  property int searchGeneration: 0
+  property bool searchDone: false
   property bool searching: false
   property string searchError: ""
   property string repoId: ""
@@ -173,22 +175,36 @@ Item {
       if (code !== 200) say(errorText(data, "pull failed"))
     })
   }
-  function cancel(spec) { request("POST", "/lmdeck/cancel", { model: spec }, null) }
+  function cancel(spec) {
+    request("POST", "/lmdeck/cancel", { model: spec }, function(code, data) {
+      if (code !== 200) say(errorText(data, "cancel failed"))
+      else say(data && data.ok ? "Cancelled " + spec + "; download again to resume" : "Download already finished")
+      request("GET", "/lmdeck/status", null, lm.applyStatus, 3000)
+    })
+  }
   function clearDownloads() { request("DELETE", "/lmdeck/downloads", null, null) }
 
-  function search(query, kind) {
+  function search(query, kind, sort) {
+    var generation = ++lm.searchGeneration
+    lm.searchDone = false
+    lm.searchResults = []
     lm.searching = true
     lm.searchError = ""
     lm.repoId = ""
     lm.repoChoices = []
-    request("GET", "/lmdeck/search?limit=25&kind=" + kind + "&q=" + encodeURIComponent(query), null, function(code, data) {
+    request("GET", "/lmdeck/search?limit=60&sort=" + encodeURIComponent(sort || "relevance") + "&kind=" + kind + "&q=" + encodeURIComponent(query), null, function(code, data) {
+      if (generation !== lm.searchGeneration) return
       lm.searching = false
+      lm.searchDone = true
       if (code === 200 && Array.isArray(data)) lm.searchResults = data
       else { lm.searchResults = []; lm.searchError = lm.errorText(data, "search failed") }
     }, 20000)
   }
   function openRepo(id) {
     if (repoId === id) { lm.repoId = ""; lm.repoChoices = []; lm.repoCompat = null; return }
+    if (!lm.searchResults.some(function(hit) { return hit.id === id })) {
+      lm.searchResults = [{ id: id, downloads: 0, likes: 0 }].concat(lm.searchResults)
+    }
     lm.repoId = id
     lm.repoChoices = []
     lm.repoCompat = null

@@ -38,6 +38,8 @@ enum Cmd {
     Ps,
     /// Download a model: org/repo (MLX) or org/repo:Q4_K_M (GGUF)
     Pull { model: String },
+    /// Cancel a daemon download, keeping partial files for resume
+    Cancel { model: String },
     /// Delete a local model
     Rm { model: String },
     /// Load a model and keep it resident
@@ -49,9 +51,12 @@ enum Cmd {
     Run { model: String, prompt: Option<String> },
     /// Search Hugging Face for MLX (default) or GGUF models
     Search {
+        #[arg(default_value = "")]
         query: String,
         #[arg(long)]
         gguf: bool,
+        #[arg(long, default_value = "relevance", value_parser = ["relevance", "downloads", "likes", "lastModified"])]
+        sort: String,
     },
     /// Show runtime/daemon status and versions
     Status,
@@ -155,6 +160,12 @@ async fn async_main(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Pull { model }) => pull_cli(&cfg, &d, &model).await,
+        Some(Cmd::Cancel { model }) => {
+            let result = d.cancel(&model).await?;
+            if result["ok"] != true { bail!("no active download for {model}"); }
+            println!("Cancelled {model}; pull the same model again to resume.");
+            Ok(())
+        },
         Some(Cmd::Rm { model }) => {
             if d.up().await {
                 d.delete(&model).await?;
@@ -195,8 +206,11 @@ async fn async_main(cli: Cli) -> Result<()> {
             ensure_daemon(&d).await?;
             run_chat(&d, &model, prompt).await
         }
-        Some(Cmd::Search { query, gguf }) => {
-            let hits = hf::search(&hf::client(), &query, if gguf { "gguf" } else { "mlx" }, 30).await?;
+        Some(Cmd::Search { query, gguf, sort }) => {
+            let c = hf::client();
+            let kind = if gguf { "gguf" } else { "mlx" };
+            let hits = if sort == "relevance" { hf::search(&c, &query, kind, 30).await? }
+                else { hf::search_sorted(&c, &query, kind, 30, &sort).await? };
             for h in hits {
                 println!("{:<64} ⬇{:>9} ♥{:>6}", h.id, h.downloads, h.likes);
             }

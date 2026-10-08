@@ -355,19 +355,27 @@ impl Manager {
 
     /// Estimated GPU bytes for `m` (weights + runtime + KV at its context).
     pub fn gpu_need(&self, m: &LocalModel) -> u64 {
+        self.gpu_need_ctx(m, MLX_PLAN_CTX)
+    }
+
+    /// MLX: exact weights + attention cache for `mlx_ctx` tokens (from config.json) + runtime and
+    /// prompt-cache allowance. Falls back to the generic estimate when the config is unknown.
+    fn gpu_need_ctx(&self, m: &LocalModel, mlx_ctx: u64) -> u64 {
         let cfg = self.cfg();
-        let ctx = match m.format {
-            Format::Gguf => cfg.overrides.get(&m.name).and_then(|o| o.ctx_size).unwrap_or(cfg.llama.ctx_size) as u64,
-            Format::Mlx => 8192,
-        };
-        let weights = match m.format {
+        match m.format {
+            Format::Gguf => {
+                let ctx = cfg.overrides.get(&m.name).and_then(|o| o.ctx_size).unwrap_or(cfg.llama.ctx_size) as u64;
+                crate::compat::gpu_need(m.size, ctx)
+            }
             Format::Mlx => {
                 let bins = cfg.mlx.command.first().is_some_and(|c| crate::compat::runtime_bins_buffers(c));
-                crate::compat::mlx_weight_bytes(&m.path, bins).unwrap_or(m.size)
+                let weights = crate::compat::mlx_weight_bytes(&m.path, bins).unwrap_or(m.size);
+                match crate::compat::mlx_kv_per_token(&m.path) {
+                    Some(per_tok) => weights + per_tok * mlx_ctx + MLX_RUNTIME + MLX_CACHE_ALLOWANCE,
+                    None => crate::compat::gpu_need(weights, 8192),
+                }
             }
-            Format::Gguf => m.size,
-        };
-        crate::compat::gpu_need(weights, ctx)
+        }
     }
 
     /// Decide the GPU heap (HK_SYSMEM) for loading `m`. Ok(None) = stock heap.
@@ -394,7 +402,19 @@ impl Manager {
                 // Room the model can really take: what is free now (already net of
                 // muvm/FEX/desktop) minus the reserve, never above MemTotal - reserve.
                 let cap = avail.saturating_sub(reserve).min(total.saturating_sub(reserve));
-                let want = need + need / 12 + (512 << 20);
+                // MLX needs are exact (weights from the files, KV from the config): a fixed margin.
+                // GGUF keeps the proportional one.
+                let margin = |n: u64| if m.format == Format::Mlx { 512 << 20 } else { n / 12 + (512 << 20) };
+                let mut need = need;
+                let mut want = need + margin(need);
+                if want > cap && m.format == Format::Mlx {
+                    let short = self.gpu_need_ctx(m, MLX_MIN_CTX);
+                    if short + margin(short) <= cap {
+                        sys::log(&format!("{}: planning for {}k context (not {}k) to fit free memory", m.name, MLX_MIN_CTX / 1024, MLX_PLAN_CTX / 1024));
+                        need = short;
+                        want = short + margin(short);
+                    }
+                }
                 if want > cap && m.format == Format::Gguf && cfg.llama.auto_offload {
                     // Put only as many layers on the GPU as fit; the rest run on the CPU from
                     // the memory-mapped file (reclaimable pages, so a tight machine slows down
@@ -526,7 +546,12 @@ impl Manager {
         let cfg = self.cfg();
         let ctx = cfg.overrides.get(&m.name).and_then(|o| o.ctx_size).unwrap_or(cfg.llama.ctx_size) as u64;
         // weights + ~10% runtime overhead + rough KV/compute workspace scaled by context.
-        let need = m.size + m.size / 10 + (ctx * 128 * 1024).min(8 << 30) + (512 << 20);
+        let need = if m.format == Format::Mlx && self.on_gpu(m) {
+            // Unified memory: the GPU estimate is the RAM it takes (at the shortest planned context).
+            self.gpu_need_ctx(m, MLX_MIN_CTX)
+        } else {
+            m.size + m.size / 10 + (ctx * 128 * 1024).min(8 << 30) + (512 << 20)
+        };
         let avail = sys::mem().1.saturating_sub((cfg.server.mem_reserve_gib * (1u64 << 30) as f64) as u64);
         (need, avail)
     }
@@ -558,7 +583,11 @@ impl Manager {
                 let cache_bytes = if cfg.mlx.prompt_cache_gib > 0.0 {
                     (cfg.mlx.prompt_cache_gib * (1u64 << 30) as f64) as u64
                 } else {
-                    heap.unwrap_or_else(crate::compat::gpu_budget) / 4
+                    // A quarter of the heap, but never more than what the weights and the planned
+                    // attention cache leave free in it (a 19 GiB model in a 21 GiB heap).
+                    let h = heap.unwrap_or_else(crate::compat::gpu_budget);
+                    let used = self.gpu_need_ctx(m, MLX_PLAN_CTX).saturating_sub(MLX_CACHE_ALLOWANCE);
+                    (h / 4).min(h.saturating_sub(used)).max(MLX_CACHE_ALLOWANCE)
                 };
                 a.extend(["--prompt-cache-bytes".into(), cache_bytes.to_string()]);
                 a.extend(["--prefill-step-size".into(), cfg.mlx.prefill_step_size.max(64).to_string()]);
@@ -1008,6 +1037,15 @@ mod work_tests {
         let _ = std::fs::remove_file(p);
     }
 }
+
+/// Context the MLX planner sizes the attention cache for (agents send long prompts); a tight
+/// machine falls back to MLX_MIN_CTX before refusing.
+const MLX_PLAN_CTX: u64 = 32768;
+const MLX_MIN_CTX: u64 = 8192;
+/// Activations at prefill_step_size 512 plus Vulkan pipelines and scratch.
+const MLX_RUNTIME: u64 = 640 << 20;
+/// Prompt-cache checkpoints kept on the GPU when the heap is tight.
+const MLX_CACHE_ALLOWANCE: u64 = 512 << 20;
 
 pub fn backend_sig(cfg: &Config, m: &LocalModel) -> String {
     let ov = cfg.overrides.get(&m.name).map(|o| serde_json::to_string(o).unwrap_or_default()).unwrap_or_default();
