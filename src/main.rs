@@ -60,8 +60,16 @@ enum Cmd {
         #[arg(long)]
         ane: bool,
     },
-    /// Update the omarchy-mlx packages
+    /// Update MLX: choose Omarchy packages or the official release installer
     Update,
+    /// Select an installed MLX runtime; optionally remove the other runtime
+    Runtime {
+        #[arg(value_parser = ["omarchy", "custom"])]
+        source: String,
+        /// Keep only this runtime (models, chat data, and GPU driver are kept)
+        #[arg(long)]
+        only: bool,
+    },
     /// llama.cpp management
     Llama {
         #[command(subcommand)]
@@ -204,7 +212,37 @@ async fn async_main(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Migrate { ane }) => run_script(&sys::script_migrate(ane)),
-        Some(Cmd::Update) => run_script(&sys::script_update_mlx()),
+        Some(Cmd::Update) => run_script(&sys::script_update_menu()),
+        Some(Cmd::Runtime { source, only }) => {
+            let path = sys::mlx_runtime_path(&source);
+            if !path.is_file() {
+                bail!("{} runtime is not installed; run lmdeck update first", source);
+            }
+            let smoke = std::process::Command::new(&path)
+                .args(["-c", "import mlx.core as mx; a=mx.ones((2,2)); mx.eval(a@a); print(mx.__version__, mx.default_device())"])
+                .status()?;
+            if !smoke.success() {
+                bail!("selected runtime failed its GPU smoke test; settings unchanged");
+            }
+            if only {
+                if let Some(s) = d.status().await {
+                    if s["running"].as_array().is_some_and(|rs| rs.iter().any(|r| r["format"] == "mlx")) {
+                        bail!("unload MLX models before removing a runtime (lmdeck unload)");
+                    }
+                }
+            }
+            let mut cfg = cfg;
+            sys::set_mlx_executable(&mut cfg, &path);
+            cfg.save()?;
+            if d.up().await {
+                d.reload().await?;
+            }
+            println!("Selected MLX runtime: {source} ({})", path.display());
+            if only {
+                run_script(&sys::script_remove_other_mlx(&source))?;
+            }
+            Ok(())
+        }
         Some(Cmd::Llama { cmd: LlamaCmd::Build }) => run_script(&sys::script_build_llama(&cfg)),
         Some(Cmd::Service { cmd }) => {
             match cmd {

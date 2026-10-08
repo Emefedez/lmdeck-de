@@ -35,6 +35,8 @@ pub struct ServerCfg {
     pub load_timeout_secs: u64,
     /// Refuse to load when estimated need exceeds MemAvailable minus this reserve.
     pub mem_reserve_gib: f64,
+    /// Extra RAM kept free while the muvm VM is running (GiB).
+    pub vm_reserve_gib: f64,
     /// Skip the memory admission check entirely.
     pub mem_check: bool,
     /// Refuse GPU loads that exceed the GPU memory budget (Asahi gives the GPU
@@ -110,6 +112,8 @@ pub struct LlamaCfg {
     /// Path to llama-server. Empty = lmdeck's own build, then $PATH.
     pub server_path: String,
     pub gpu_layers: i32,
+    /// When a GGUF model does not fit whole, offload only as many layers as fit instead of refusing.
+    pub auto_offload: bool,
     pub ctx_size: u32,
     /// "on" | "off" | "auto"
     pub flash_attn: String,
@@ -174,6 +178,8 @@ pub struct ModelOverride {
     /// have no Apple GPU kernel yet). Unset/"gpu" = Apple GPU.
     pub device: Option<String>,
     pub keep_alive: Option<String>,
+    /// GGUF: layers on the GPU for this model (overrides llama.gpu_layers and the auto plan).
+    pub gpu_layers: Option<i32>,
     pub extra_args: Vec<String>,
     pub env: BTreeMap<String, String>,
 }
@@ -204,6 +210,7 @@ impl Default for ServerCfg {
             max_loaded: 1,
             load_timeout_secs: 900,
             mem_reserve_gib: 3.0,
+            vm_reserve_gib: 2.0,
             mem_check: true,
             gpu_mem_check: true,
             gpu_heap: "auto".into(),
@@ -254,6 +261,7 @@ impl Default for LlamaCfg {
         Self {
             server_path: String::new(),
             gpu_layers: 999,
+            auto_offload: true,
             ctx_size: 8192,
             flash_attn: "auto".into(),
             threads: 0,
@@ -400,6 +408,7 @@ pub const SETTINGS: &[(&str, &str, &str)] = &[
     ("Memory & residency", "server.max_loaded", "Models resident at once"),
     ("Memory & residency", "server.mem_check", "Refuse loads that would not fit in RAM (true/false)"),
     ("Memory & residency", "server.mem_reserve_gib", "RAM kept free for the desktop (GiB)"),
+    ("Memory & residency", "server.vm_reserve_gib", "Extra RAM kept free while the muvm VM runs (GiB)"),
     ("Memory & residency", "server.gpu_heap", "GPU heap per model: auto (raise only when needed, per process) / stock (50% of RAM) / N GiB"),
     ("Memory & residency", "server.gpu_mem_check", "Refuse GPU loads over the GPU memory budget (turning this off can freeze the machine)"),
     ("KV cache · MLX", "mlx.kv_bits", "MLX KV quantization: 0 = f16, 8 or 4 bits (probed; falls back to f16)"),
@@ -421,6 +430,7 @@ pub const SETTINGS: &[(&str, &str, &str)] = &[
     ("MLX backend", "mlx.env", "Env for the MLX backend, K=V,K=V (e.g. MLX_OMARCHY_GDN_RAW_REPEAT=0)"),
     ("llama.cpp backend", "llama.server_path", "llama-server binary (empty = lmdeck build, then PATH)"),
     ("llama.cpp backend", "llama.gpu_layers", "Layers offloaded to the GPU (999 = all)"),
+    ("llama.cpp backend", "llama.auto_offload", "GGUF too big for free memory: put only the layers that fit on the GPU (true/false)"),
     ("llama.cpp backend", "llama.flash_attn", "Flash attention: on / off / auto"),
     ("llama.cpp backend", "llama.threads", "CPU threads (0 = auto)"),
     ("llama.cpp backend", "llama.parallel", "Parallel request slots"),
@@ -461,6 +471,7 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "server.gpu_mem_check" => c.server.gpu_mem_check.to_string(),
         "server.gpu_heap" => c.server.gpu_heap.clone(),
         "server.mem_reserve_gib" => c.server.mem_reserve_gib.to_string(),
+        "server.vm_reserve_gib" => c.server.vm_reserve_gib.to_string(),
         "server.uclamp_boost" => c.server.uclamp_boost.to_string(),
         "models.hf_cache" => c.models.hf_cache.clone(),
         "models.extra_dirs" => c.models.extra_dirs.join(","),
@@ -482,6 +493,7 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "mlx.env" => kv_join(&c.mlx.env),
         "llama.server_path" => c.llama.server_path.clone(),
         "llama.gpu_layers" => c.llama.gpu_layers.to_string(),
+        "llama.auto_offload" => c.llama.auto_offload.to_string(),
         "llama.ctx_size" => c.llama.ctx_size.to_string(),
         "llama.flash_attn" => c.llama.flash_attn.clone(),
         "llama.threads" => c.llama.threads.to_string(),
@@ -525,6 +537,7 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
             c.server.gpu_heap = v.into()
         }
         "server.mem_reserve_gib" => c.server.mem_reserve_gib = v.parse().map_err(|_| "not a number".to_string())?,
+        "server.vm_reserve_gib" => c.server.vm_reserve_gib = v.parse().map_err(|_| "not a number".to_string())?,
         "server.uclamp_boost" => c.server.uclamp_boost = boolean(v)?,
         "models.hf_cache" => c.models.hf_cache = v.into(),
         "models.extra_dirs" => c.models.extra_dirs = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
@@ -558,6 +571,7 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "mlx.env" => c.mlx.env = kv_parse(v),
         "llama.server_path" => c.llama.server_path = v.into(),
         "llama.gpu_layers" => c.llama.gpu_layers = v.parse().map_err(|_| "not a number".to_string())?,
+        "llama.auto_offload" => c.llama.auto_offload = v.parse().map_err(|_| "true or false".to_string())?,
         "llama.ctx_size" => c.llama.ctx_size = num(v)? as u32,
         "llama.flash_attn" => {
             if !["on", "off", "auto"].contains(&v) {

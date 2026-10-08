@@ -226,6 +226,68 @@ pub fn gpu_budget() -> u64 {
 }
 
 /// Estimated GPU bytes a model needs: weights + ~8% runtime + KV/workspace.
+/// Bytes the MLX weights occupy on the GPU, from the safetensors headers. With `binned`,
+/// each tensor over 1 MiB is rounded up to a power of two the way mlx-omarchy builds after
+/// 2026-10-05 (allocator commit b20211a0) allocate it, which can add ~30% to a model.
+pub fn mlx_weight_bytes(dir: &std::path::Path, binned: bool) -> Option<u64> {
+    use std::io::Read;
+    let mut total = 0u64;
+    let mut files = 0;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("safetensors") {
+            continue;
+        }
+        let mut f = std::fs::File::open(&p).ok()?;
+        let mut len = [0u8; 8];
+        f.read_exact(&mut len).ok()?;
+        let n = u64::from_le_bytes(len);
+        if n > 64 << 20 {
+            return None;
+        }
+        let mut hdr = vec![0u8; n as usize];
+        f.read_exact(&mut hdr).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&hdr).ok()?;
+        for (k, t) in v.as_object()? {
+            if k == "__metadata__" {
+                continue;
+            }
+            let off = t["data_offsets"].as_array()?;
+            let size = off.get(1)?.as_u64()?.saturating_sub(off.first()?.as_u64()?);
+            total += if binned && size > 1 << 20 { size.next_power_of_two() } else { size };
+        }
+        files += 1;
+    }
+    (files > 0).then_some(total)
+}
+
+/// Whether the MLX runtime behind `python` rounds GPU buffers up to powers of two
+/// (mlx-omarchy dev builds stamped after 2026-10-05 18:40 UTC).
+pub fn runtime_bins_buffers(python_or_wrapper: &str) -> bool {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(v) = cache.lock().unwrap().get(python_or_wrapper) {
+        return *v;
+    }
+    // Wrappers are `exec "<venv>/bin/python" "$@"`; follow them to the venv.
+    let mut py = std::path::PathBuf::from(python_or_wrapper);
+    if let Ok(text) = std::fs::read_to_string(&py) {
+        if let Some(target) = text.lines().find_map(|l| l.trim().strip_prefix("exec ")).and_then(|r| r.split('"').nth(1)) {
+            py = target.into();
+        }
+    }
+    let venv = py.parent().and_then(|b| b.parent()).map(|v| v.join("lib")).unwrap_or_default();
+    let stamp = std::fs::read_dir(&venv).ok().into_iter().flatten().flatten()
+        .filter_map(|pyd| std::fs::read_dir(pyd.path().join("site-packages")).ok())
+        .flatten().flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .find_map(|n| n.strip_prefix("mlx_omarchy-").and_then(|r| r.split(".dev").nth(1)).map(|d| d.chars().take(12).collect::<String>()))
+        .and_then(|d| d.parse::<u64>().ok());
+    let bins = stamp.is_some_and(|s| s > 202610051840);
+    cache.lock().unwrap().insert(python_or_wrapper.to_string(), bins);
+    bins
+}
+
 pub fn gpu_need(weights: u64, ctx_tokens: u64) -> u64 {
     weights + weights / 12 + (ctx_tokens * 96 * 1024).min(4 << 30) + (768 << 20)
 }
@@ -255,4 +317,19 @@ pub fn recommend_fitting(kind: &str) -> Option<String> {
         .filter(|(w, _)| (gpu_need(*w, 8192) as f64) <= budget)
         .max_by_key(|(w, _)| *w)
         .map(|(_, r)| r)
+}
+
+#[cfg(test)]
+mod sizing_tests {
+    #[test]
+    fn binned_weights_on_local_27b() {
+        let home = std::env::var("HOME").unwrap();
+        let Some(dir) = std::fs::read_dir(format!("{home}/.cache/huggingface/hub/models--mlx-community--Qwen3.8-27B-4bit/snapshots")).ok().and_then(|mut d| d.next()).and_then(|e| e.ok()).map(|e| e.path()) else { return };
+        let plain = super::mlx_weight_bytes(&dir, false).unwrap();
+        let binned = super::mlx_weight_bytes(&dir, true).unwrap();
+        eprintln!("plain {:.2} GiB binned {:.2} GiB", plain as f64 / (1u64 << 30) as f64, binned as f64 / (1u64 << 30) as f64);
+        assert!(binned >= plain);
+        assert!(super::runtime_bins_buffers(&format!("{home}/.local/bin/mlx-omarchy")));
+        assert!(!super::runtime_bins_buffers("/usr/bin/mlx-omarchy"));
+    }
 }

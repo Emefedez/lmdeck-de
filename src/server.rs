@@ -847,6 +847,11 @@ async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         Ok(x) => x,
         Err(e) => {
             let s = format!("{e:#}");
+            // A memory refusal is not a transient server fault: a 4xx keeps Claude Code from
+            // retrying and from wrapping it in "server-side issue, try again".
+            if s.contains("can be given to it right now") || s.contains("too big for the GPU heap") {
+                return anth_err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("Not enough free memory to load the model. {s} In lmdeck, press f / retry the load after freeing memory."));
+            }
             let code = if s.contains("not found") { StatusCode::NOT_FOUND } else { StatusCode::INTERNAL_SERVER_ERROR };
             return anth_err(code, if code == StatusCode::NOT_FOUND { "not_found_error" } else { "api_error" }, s);
         }
@@ -986,6 +991,7 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
     if let Some(acc) = headers.get("accept") {
         rb = rb.header("accept", acc);
     }
+    let t_req = Instant::now();
     let resp = match rb.send().await {
         Ok(r) => r,
         Err(e) => return err(StatusCode::BAD_GATEWAY, format!("backend dropped the request: {e}\n{}", sys::tail(&guard.0.log, 4))),
@@ -996,10 +1002,13 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let ok = status.is_success();
+    let ctype_s = ctype.clone();
     tokio::spawn(async move {
         let _g = guard;
         let model_name = _g.0.name.clone();
-        let t0 = Instant::now();
+        // Non-streaming bodies arrive in one piece at the end, so timing starts at the request.
+        let streaming = ctype_s.as_ref().and_then(|c| c.to_str().ok()).is_some_and(|c| c.contains("event-stream") || c.contains("ndjson"));
+        let t0 = t_req;
         let mut t_first: Option<Instant> = None;
         let mut deltas = 0u64;
         let mut tail: Vec<u8> = Vec::with_capacity(16 << 10);
@@ -1051,9 +1060,14 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
         }
         if ok {
             let (p, c) = extract_usage(&tail).unwrap_or((0, deltas));
-            let first = t_first.unwrap_or(t0);
-            let ttft = first.duration_since(t0).as_secs_f64();
-            USAGE.record(&model_name, p, c, ttft, Instant::now().duration_since(first).as_secs_f64(), ttft);
+            if streaming {
+                let first = t_first.unwrap_or(t0);
+                let ttft = first.duration_since(t0).as_secs_f64();
+                USAGE.record(&model_name, p, c, ttft, Instant::now().duration_since(first).as_secs_f64(), ttft);
+            } else {
+                // Prefill and decode can't be told apart here: report end-to-end throughput.
+                USAGE.record(&model_name, p, c, 0.0, t0.elapsed().as_secs_f64(), 0.0);
+            }
         }
     });
     let mut r = Response::new(Body::from_stream(ReceiverStream::new(rx)));

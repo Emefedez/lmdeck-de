@@ -270,6 +270,21 @@ impl Manager {
         Ok(secs)
     }
 
+    /// " The Custom MLX runtime rounds buffers up: +X GiB ..." when that applies to `m`.
+    fn binning_note(&self, m: &LocalModel) -> String {
+        let cfg = self.cfg();
+        if m.format != Format::Mlx || !cfg.mlx.command.first().is_some_and(|c| crate::compat::runtime_bins_buffers(c)) {
+            return String::new();
+        }
+        match (crate::compat::mlx_weight_bytes(&m.path, true), crate::compat::mlx_weight_bytes(&m.path, false)) {
+            (Some(b), Some(p)) if b > p => format!(
+                " The selected Custom MLX build rounds GPU buffers up to powers of two (+{:.1} GiB for this model); the Omarchy package runtime does not (TUI: i → 1).",
+                gib(b - p)
+            ),
+            _ => String::new(),
+        }
+    }
+
     fn on_gpu(&self, m: &LocalModel) -> bool {
         self.cfg().overrides.get(&m.name).and_then(|o| o.device.as_deref()) != Some("cpu")
     }
@@ -281,7 +296,14 @@ impl Manager {
             Format::Gguf => cfg.overrides.get(&m.name).and_then(|o| o.ctx_size).unwrap_or(cfg.llama.ctx_size) as u64,
             Format::Mlx => 8192,
         };
-        crate::compat::gpu_need(m.size, ctx)
+        let weights = match m.format {
+            Format::Mlx => {
+                let bins = cfg.mlx.command.first().is_some_and(|c| crate::compat::runtime_bins_buffers(c));
+                crate::compat::mlx_weight_bytes(&m.path, bins).unwrap_or(m.size)
+            }
+            Format::Gguf => m.size,
+        };
+        crate::compat::gpu_need(weights, ctx)
     }
 
     /// Decide the GPU heap (HK_SYSMEM) for loading `m`. Ok(None) = stock heap.
@@ -291,11 +313,12 @@ impl Manager {
         if !self.on_gpu(m) {
             return Ok(None);
         }
+        partial_layers().lock().unwrap().remove(&m.name);
         let need = self.gpu_need(m);
         let stock = crate::compat::gpu_budget();
         let gi = |b: u64| gib(b);
         let reserve = (cfg.server.mem_reserve_gib * (1u64 << 30) as f64) as u64
-            + if crate::sys::muvm_rss().is_some() { 2 << 30 } else { 0 };
+            + if crate::sys::muvm_rss().is_some() { (cfg.server.vm_reserve_gib.max(0.0) * (1u64 << 30) as f64) as u64 } else { 0 };
         let (total, avail) = sys::mem();
         let policy = cfg.server.gpu_heap.trim().to_lowercase();
         let heap = match policy.as_str() {
@@ -308,16 +331,31 @@ impl Manager {
                 // muvm/FEX/desktop) minus the reserve, never above MemTotal - reserve.
                 let cap = avail.saturating_sub(reserve).min(total.saturating_sub(reserve));
                 let want = need + need / 12 + (512 << 20);
+                if want > cap && m.format == Format::Gguf && cfg.llama.auto_offload {
+                    // Put only as many layers on the GPU as fit; the rest run on the CPU from
+                    // the memory-mapped file (reclaimable pages, so a tight machine slows down
+                    // instead of freezing).
+                    if let Some(blocks) = gguf_block_count(&m.path).filter(|b| *b > 0) {
+                        let usable = cap.saturating_sub(512 << 20) as f64;
+                        let ngl = ((blocks as f64 * usable / need as f64).floor() as i32).clamp(0, blocks as i32);
+                        if ngl >= 1 {
+                            partial_layers().lock().unwrap().insert(m.name.clone(), ngl);
+                            sys::log(&format!("{}: {ngl}/{blocks} layers on the GPU (needs ~{:.1} GiB, {:.1} GiB available)", m.name, gi(need), gi(cap)));
+                            return Ok(Some((cap & !((1u64 << 20) - 1)).max(stock)).filter(|h| *h != stock));
+                        }
+                    }
+                }
                 if want > cap {
                     bail!(
                         "{} needs ~{:.1} GiB of GPU memory, but only {:.1} GiB can be given to it right now \
-                         ({:.1} GiB free, {:.1} GiB kept for the desktop{}). Close apps or pick a smaller model{}",
+                         ({:.1} GiB free, {:.1} GiB kept for the desktop{}).{} Close apps or pick a smaller model{}",
                         m.name,
                         gi(need),
                         gi(cap),
                         gi(avail),
                         gi(reserve),
                         if crate::sys::muvm_rss().is_some() { " and a running muvm VM" } else { "" },
+                        self.binning_note(m),
                         crate::compat::recommend_fitting("chat").map(|r| format!(" (e.g. {r})")).unwrap_or_default()
                     );
                 }
@@ -482,7 +520,13 @@ impl Manager {
                     "--port".into(),
                     port.to_string(),
                     "-ngl".into(),
-                    if ov.device.as_deref() == Some("cpu") { "0".into() } else { cfg.llama.gpu_layers.to_string() },
+                    if ov.device.as_deref() == Some("cpu") {
+                        "0".into()
+                    } else if let Some(n) = ov.gpu_layers.or_else(|| partial_layers().lock().unwrap().get(&m.name).copied()) {
+                        n.to_string()
+                    } else {
+                        cfg.llama.gpu_layers.to_string()
+                    },
                     "-c".into(),
                     ctx.to_string(),
                     "-fa".into(),
@@ -533,7 +577,13 @@ impl Manager {
         let lf = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
         use std::io::Write;
         let _ = writeln!(&lf, "\n===== {} lmdeck: {}", sys::now_rfc3339(), argv.join(" "));
-        sys::log(&format!("loading {} ({}) on :{port}", m.name, m.format.as_str()));
+        {
+            let (total, avail) = sys::mem();
+            sys::log(&format!(
+                "loading {} ({}) on :{port} [free {:.1}/{:.1} GiB, shmem {:.1} GiB]",
+                m.name, m.format.as_str(), gib(avail), gib(total), gib(sys::shmem())
+            ));
+        }
 
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..])
@@ -601,6 +651,16 @@ impl Manager {
         Ok(r)
     }
 
+    /// The exception line if the backend's log (since this load began) shows a thread crash.
+    fn backend_thread_died(&self, r: &Running) -> Option<String> {
+        let offset = self.load_info.lock().unwrap().as_ref().map(|li| li.log_offset).unwrap_or(0);
+        let text = sys::read_since(&r.log, offset, 64 * 1024);
+        if !text.contains("Exception in thread") {
+            return None;
+        }
+        Some(sys::error_summary(&r.log))
+    }
+
     async fn wait_ready(&self, r: &Running, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let health = format!("{}/health", r.base());
@@ -643,6 +703,11 @@ impl Manager {
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {
                         if let Some(st) = r.child.lock().await.try_wait()? {
                             bail!("backend exited with {st} while loading");
+                        }
+                        // mlx_lm.server keeps serving HTTP when its generator thread dies
+                        // (e.g. Vulkan out of memory), so the request above would hang.
+                        if let Some(dead) = self.backend_thread_died(r) {
+                            bail!("backend's generator thread crashed while loading: {dead}");
                         }
                         if Instant::now() > deadline {
                             bail!("timed out loading weights after {}s", timeout.as_secs());
@@ -807,6 +872,58 @@ fn launcher_notes(log: &std::path::Path) -> String {
 }
 
 /// Fingerprint of everything that shapes a backend process for `m`.
+/// GPU layer counts chosen by the admission planner for GGUF loads that do not fit whole.
+fn partial_layers() -> &'static Mutex<std::collections::HashMap<String, i32>> {
+    static M: std::sync::OnceLock<Mutex<std::collections::HashMap<String, i32>>> = std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// `<arch>.block_count` from a GGUF file's metadata (transformer layers).
+pub fn gguf_block_count(path: &std::path::Path) -> Option<u32> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let mut b8 = [0u8; 8];
+    let mut b4 = [0u8; 4];
+    f.read_exact(&mut b4).ok()?;
+    if &b4 != b"GGUF" { return None; }
+    f.read_exact(&mut b4).ok()?; // version
+    f.read_exact(&mut b8).ok()?; // tensor count
+    f.read_exact(&mut b8).ok()?;
+    let kvs = u64::from_le_bytes(b8);
+    fn skip(f: &mut std::io::BufReader<std::fs::File>, ty: u32) -> Option<()> {
+        let fixed = |n: i64, f: &mut std::io::BufReader<std::fs::File>| f.seek(SeekFrom::Current(n)).ok().map(|_| ());
+        let mut b8 = [0u8; 8];
+        match ty {
+            0 | 1 | 7 => fixed(1, f),
+            2 | 3 => fixed(2, f),
+            4 | 5 | 6 => fixed(4, f),
+            10 | 11 | 12 => fixed(8, f),
+            8 => { f.read_exact(&mut b8).ok()?; fixed(u64::from_le_bytes(b8) as i64, f) }
+            9 => {
+                let mut t = [0u8; 4];
+                f.read_exact(&mut t).ok()?;
+                f.read_exact(&mut b8).ok()?;
+                for _ in 0..u64::from_le_bytes(b8) { skip(f, u32::from_le_bytes(t))?; }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+    for _ in 0..kvs.min(4096) {
+        f.read_exact(&mut b8).ok()?;
+        let mut key = vec![0u8; (u64::from_le_bytes(b8) as usize).min(1 << 16)];
+        f.read_exact(&mut key).ok()?;
+        f.read_exact(&mut b4).ok()?;
+        let ty = u32::from_le_bytes(b4);
+        if key.ends_with(b".block_count") && (ty == 4 || ty == 5) {
+            f.read_exact(&mut b4).ok()?;
+            return Some(u32::from_le_bytes(b4));
+        }
+        skip(&mut f, ty)?;
+    }
+    None
+}
+
 pub fn backend_sig(cfg: &Config, m: &LocalModel) -> String {
     let ov = cfg.overrides.get(&m.name).map(|o| serde_json::to_string(o).unwrap_or_default()).unwrap_or_default();
     let section = match m.format {

@@ -54,6 +54,191 @@ pub fn tree_rss(pid: u32) -> u64 {
     total
 }
 
+/// Processes of the current user that share a command name, biggest first.
+#[derive(Clone, Debug)]
+pub struct ProcGroup {
+    pub name: String,
+    pub pids: Vec<u32>,
+    pub rss: u64,
+    /// Why killing this would be a bad idea (lmdeck itself, the desktop, ...).
+    pub protected: Option<&'static str>,
+    /// Opt-in action instead of a plain kill: (id, what it does).
+    pub tweak: Option<(&'static str, &'static str)>,
+}
+
+/// Name shown for a process: VS Code extensions and node/bun scripts get their own
+/// lines so the hungry one is visible instead of one big "code" row.
+fn display_name(name: &str, pid: u32) -> String {
+    let Ok(cmd) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) else { return name.to_string() };
+    let args: Vec<&str> = cmd.split('\0').filter(|a| !a.is_empty()).collect();
+    if name == "libkrun VM" || args.first().is_some_and(|a| a.ends_with("/muvm")) {
+        return "muvm VM".to_string();
+    }
+    if let Some(ext) = args.iter().find_map(|a| a.split("/extensions/").nth(1)).and_then(|r| r.split('/').next()) {
+        let base = ext.rsplit_once('-').map(|(n, _)| n).unwrap_or(ext);
+        return format!("{name}: ext {base}");
+    }
+    if matches!(name, "node" | "bun" | "node-MainThread") {
+        let script = args.iter().skip(1).filter(|a| !a.starts_with('-') && **a != "run").take(2)
+            .map(|a| a.rsplit('/').next().unwrap_or(a)).collect::<Vec<_>>().join(" ");
+        if !script.is_empty() {
+            return format!("{name}: {script}");
+        }
+    }
+    name.to_string()
+}
+
+/// Opt-in actions shown above the process list. Nothing here runs by itself.
+pub fn tweaks(groups: &[ProcGroup]) -> Vec<ProcGroup> {
+    let mut out = vec![ProcGroup {
+        name: "[PRESET] Make room for this model automatically".into(),
+        pids: vec![], rss: 0, protected: None,
+        tweak: Some(("preset", "Least disruptive first, re-checking after each step and stopping once it fits: lower the reserves, drop Hyprland effects, disable optional shell plugins, then close the muvm VM. Then loads the model. It never kills your other apps.")),
+    }];
+    let vm: Vec<&ProcGroup> = groups.iter().filter(|g| g.name == "muvm VM" || g.name == "muvm" || g.name == "muvm-run").collect();
+    if !vm.is_empty() {
+        out.push(ProcGroup {
+            name: "[action] Close the muvm VM".into(),
+            pids: vm.iter().flat_map(|g| g.pids.clone()).collect(),
+            rss: vm.iter().map(|g| g.rss).sum(),
+            protected: None,
+            tweak: Some(("kill", "Stops muvm and everything running inside it (Windows/x86 apps). The VM can hold up to its --mem cap, not just its RSS.")),
+        });
+    }
+    out.push(ProcGroup {
+        name: "[action] Hyprland: no blur/shadows/animations/transparency".into(),
+        pids: vec![], rss: 0, protected: None,
+        tweak: Some(("hypr-lite", "Runtime only via hyprctl keyword (undo: hyprctl reload). Frees GPU/shmem buffers, not much RAM.")),
+    });
+    let on = optional_plugins_enabled();
+    if !on.is_empty() {
+        out.push(ProcGroup {
+            name: format!("[action] Disable {} optional Omarchy shell plugins", on.len()),
+            pids: vec![], rss: 0, protected: None,
+            tweak: Some(("plugins-lite", "Turns off: expose.switch, macnook, vantage, hw-monitor, dev gallery, disk speed test (whichever are on). Small RAM win (Quickshell stays); restorable from this list.")),
+        });
+    }
+    if !plugins_disabled_by_us().is_empty() {
+        out.push(ProcGroup {
+            name: "[action] Restore the shell plugins lmdeck disabled".into(),
+            pids: vec![], rss: 0, protected: None,
+            tweak: Some(("plugins-restore", "Re-enables exactly the plugins this tool turned off earlier.")),
+        });
+    }
+    out.push(ProcGroup {
+        name: "[action] Stop the tmux server".into(),
+        pids: vec![], rss: groups.iter().filter(|g| g.name.starts_with("tmux")).map(|g| g.rss).sum(), protected: None,
+        tweak: Some(("tmux", "Ends every tmux session and what runs in them. Small RAM win; shells inside are lost.")),
+    });
+    out
+}
+
+/// Non-essential Omarchy shell plugins that are safe to switch off under memory pressure.
+const OPTIONAL_PLUGINS: &[&str] = &[
+    "expose.switch", "david.macnook", "jmthomas00.vantage", "meviusisback.hw-monitor", "omarchy.dev-gallery", "omarchy.disk-speedtest",
+];
+
+fn optional_plugins_enabled() -> Vec<String> {
+    let Ok(o) = std::process::Command::new("omarchy-plugin-list").output() else { return Vec::new() };
+    String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| {
+        let mut it = l.split_whitespace();
+        let (id, state) = (it.next()?, it.next()?);
+        (state == "enabled" && OPTIONAL_PLUGINS.contains(&id)).then(|| id.to_string())
+    }).collect()
+}
+
+fn plugins_state_path() -> PathBuf {
+    crate::config::log_dir().parent().map(|p| p.join("disabled-plugins.json")).unwrap_or_else(|| PathBuf::from("/tmp/lmdeck-disabled-plugins.json"))
+}
+
+fn plugins_disabled_by_us() -> Vec<String> {
+    std::fs::read_to_string(plugins_state_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Run a tweak by id; returns a message for the toast.
+pub fn run_tweak(id: &str) -> String {
+    match id {
+        "hypr-lite" => {
+            let mut failed = 0;
+            for kv in ["decoration:blur:enabled false", "decoration:shadow:enabled false", "animations:enabled false", "decoration:active_opacity 1.0", "decoration:inactive_opacity 1.0"] {
+                let ok = std::process::Command::new("hyprctl").args(["keyword"]).args(kv.split(' ')).output().map(|o| o.status.success()).unwrap_or(false);
+                failed += (!ok) as u32;
+            }
+            if failed == 0 { "Hyprland effects off (hyprctl reload to restore)".into() } else { format!("{failed} hyprctl settings failed") }
+        }
+        "plugins-lite" => {
+            let on = optional_plugins_enabled();
+            let mut done = plugins_disabled_by_us();
+            for id in &on {
+                if std::process::Command::new("omarchy-plugin-disable").arg(id).output().map(|o| o.status.success()).unwrap_or(false) && !done.contains(id) {
+                    done.push(id.clone());
+                }
+            }
+            let _ = std::fs::write(plugins_state_path(), serde_json::to_string(&done).unwrap_or_default());
+            format!("disabled {} shell plugins (restore from this list)", on.len())
+        }
+        "plugins-restore" => {
+            let ids = plugins_disabled_by_us();
+            for id in &ids {
+                let _ = std::process::Command::new("omarchy-plugin-enable").arg(id).output();
+            }
+            let _ = std::fs::remove_file(plugins_state_path());
+            format!("re-enabled {} shell plugins", ids.len())
+        }
+        "tmux" => match std::process::Command::new("tmux").arg("kill-server").output() {
+            Ok(o) if o.status.success() => "tmux server stopped".into(),
+            _ => "tmux was not running".into(),
+        },
+        _ => String::new(),
+    }
+}
+
+fn protected_reason(name: &str, pid: u32) -> Option<&'static str> {
+    let me = std::process::id();
+    if pid == me || name == "lmdeck" {
+        return Some("lmdeck");
+    }
+    if std::fs::read_to_string(format!("/proc/{pid}/cmdline")).map(|c| c.contains("mlx_fast_server") || c.contains("llama-server")).unwrap_or(false) {
+        return Some("model backend: unload from Models");
+    }
+    match name {
+        "systemd" | "(sd-pam)" | "dbus-daemon" | "dbus-broker" | "Hyprland" | "hyprland" | "start-hyprland" | "uwsm" | "pipewire"
+        | "wireplumber" | "login" | "sshd" | "bash" | "fish" | "zsh" => Some("session / desktop"),
+        _ => None,
+    }
+}
+
+/// Group `uid`'s processes by name for the memory freer.
+pub fn proc_groups(uid: u32, with_tweaks: bool) -> Vec<ProcGroup> {
+    let mut map: std::collections::HashMap<String, ProcGroup> = std::collections::HashMap::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
+    for e in dir.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+        let Ok(st) = std::fs::read_to_string(format!("/proc/{pid}/status")) else { continue };
+        let field = |k: &str| st.lines().find_map(|l| l.strip_prefix(k)).map(str::trim);
+        let comm = field("Name:").unwrap_or("").to_string();
+        let name = display_name(&comm, pid);
+        let owner = field("Uid:").and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<u32>().ok());
+        let rss_kb = field("VmRSS:").and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<u64>().ok());
+        let (Some(owner), Some(rss_kb)) = (owner, rss_kb) else { continue }; // kernel threads have no VmRSS
+        if owner != uid || name.is_empty() {
+            continue;
+        }
+        let g = map.entry(name.clone()).or_insert_with(|| ProcGroup { name: name.clone(), pids: vec![], rss: 0, protected: None, tweak: None });
+        g.pids.push(pid);
+        g.rss += rss_kb * 1024;
+        if g.protected.is_none() {
+            g.protected = protected_reason(&comm, pid);
+        }
+    }
+    let all: Vec<ProcGroup> = map.into_values().collect();
+    let mut v: Vec<ProcGroup> = all.iter().filter(|g| g.rss >= 80 << 20).cloned().collect();
+    v.sort_by(|a, b| b.rss.cmp(&a.rss));
+    let mut out = if with_tweaks { tweaks(&all) } else { Vec::new() };
+    out.extend(v);
+    out
+}
+
 pub fn self_rss() -> u64 {
     rss(std::process::id())
 }
@@ -161,6 +346,8 @@ pub struct Versions {
     pub mlx_legacy: Option<String>,
     pub mlx_upstream: Option<String>,
     pub mlx_bin: Option<String>,
+    #[serde(default)]
+    pub mlx_selected: String,
     pub llama: Option<String>,
     pub llama_path: Option<String>,
     pub ane: bool,
@@ -191,6 +378,18 @@ pub fn legacy_version() -> Option<String> {
     None
 }
 
+pub fn mlx_runtime_path(source: &str) -> PathBuf {
+    if source == "custom" { home().join(".local/bin/mlx-omarchy") } else { PathBuf::from("/usr/bin/mlx-omarchy") }
+}
+
+pub fn set_mlx_executable(cfg: &mut Config, path: &Path) {
+    if cfg.mlx.command.is_empty() {
+        cfg.mlx.command = vec![path.display().to_string(), "-m".into(), "mlx_lm.server".into()];
+    } else {
+        cfg.mlx.command[0] = path.display().to_string();
+    }
+}
+
 /// Local-only probe (fast, no network).
 pub fn versions_local(cfg: &Config) -> Versions {
     let pkg = cmd_out("pacman", &["-Q", "omarchy-mlx"]).and_then(|s| s.split_whitespace().nth(1).map(str::to_string));
@@ -210,13 +409,22 @@ pub fn versions_local(cfg: &Config) -> Versions {
         let s = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         s.lines().find(|l| l.starts_with("version:")).map(|l| l.trim_start_matches("version:").trim().to_string())
     });
+    let mlx_bin = which(cfg.mlx.command.first().map(String::as_str).unwrap_or("mlx-omarchy"))
+        .and_then(|p| p.canonicalize().ok());
+    let mlx_selected = match &mlx_bin {
+        Some(bin) if mlx_runtime_path("custom").canonicalize().ok().as_ref() == Some(bin) => "Custom Installer",
+        Some(bin) if mlx_runtime_path("omarchy").canonicalize().ok().as_ref() == Some(bin) => "Omarchy package",
+        Some(_) => "Other executable",
+        None => "not found",
+    };
     Versions {
         mlx_install: install.into(),
         mlx_pkg: pkg,
         mlx_pkg_repo: repo,
         mlx_legacy: legacy,
         mlx_upstream: None,
-        mlx_bin: which(cfg.mlx.command.first().map(String::as_str).unwrap_or("mlx-omarchy")).map(|p| p.display().to_string()),
+        mlx_bin: mlx_bin.map(|p| p.display().to_string()),
+        mlx_selected: mlx_selected.into(),
         llama,
         llama_path: llama_path.map(|p| p.display().to_string()),
         ane: Path::new("/dev/accel/accel0").exists(),
@@ -301,6 +509,7 @@ install_mlx_pkgs {pkgs} || die "could not install {pkgs} (try 'omarchy-update' t
 say "2/4 Verifying the packaged runtime on the Apple GPU"
 /usr/bin/mlx-omarchy -c 'import mlx.core as mx; a=mx.random.normal((256,256)); mx.eval((a@a).sum()); print("  ", mx.__version__, mx.default_device())' \
   || die "packaged runtime failed its smoke test; legacy install left untouched"
+lmdeck runtime omarchy || die "could not select the Omarchy runtime"
 
 say "3/4 Retiring the legacy install (venv, launchers, desktop entry, shims; models and chat data are kept)"
 if command -v mlx-omarchy-retire-legacy >/dev/null; then
@@ -329,22 +538,102 @@ pub fn script_update_mlx() -> String {
     format!(
         r#"{HEADER}
 say "Updating omarchy-mlx packages"
-pacman -Q omarchy-mlx >/dev/null 2>&1 || die "omarchy-mlx is not installed as a package; use Migrate first."
-say "Full system upgrade first (Arch does not support partial upgrades)"
-sudo pacman -Syu || die "pacman -Syu failed"
-have="$(pacman -Q omarchy-mlx | awk '{{print $2}}')"
+say "Full system upgrade through Omarchy first (Arch does not support partial upgrades)"
+omarchy update || die "omarchy update failed"
+have="$(pacman -Q omarchy-mlx 2>/dev/null | awk '{{print $2}}')" || have=""
 want="$(omarchy_repo_version omarchy-mlx)"
-if [[ -n $want && $(vercmp "$want" "$have") -le 0 ]]; then
+if [[ -n $have && -n $want && $(vercmp "$want" "$have") -le 0 ]]; then
   say "omarchy-mlx $have is current"
 else
   say "omarchy-mlx $have -> $want"
-  # [omarchy] is sync-only here, so -Syu never upgrades these; install directly.
+  # [omarchy] is sync-only here, so the system upgrade skips these; install directly.
   install_mlx_pkgs {pkgs} || die "update failed"
 fi
-mlx-omarchy -c 'import mlx.core as mx; print("  ", mx.__version__, mx.default_device())' || warn "smoke test failed"
-say "Done. Reload models in lmdeck to pick up the new runtime."
+lmdeck runtime omarchy || die "could not select the Omarchy runtime"
+{retention}
+say "Done. Reload models in lmdeck to pick up the selected runtime."
 "#,
-        pkgs = PKGS.join(" ")
+        pkgs = PKGS.join(" "),
+        retention = script_mlx_retention("omarchy"),
+    )
+}
+
+/// Official release installer: a user runtime alongside the Omarchy packages.
+pub fn script_update_mlx_custom() -> String {
+    format!(
+        r#"{HEADER}
+say "Resolving the latest omarchy-mlx GitHub release"
+release="$(curl -fsSL https://api.github.com/repos/{MLX_REPO}/releases/latest | python3 -c 'import json, re, sys; tag=json.load(sys.stdin)["tag_name"]; assert re.fullmatch(r"v[0-9]+(?:\.[0-9]+)+(?:[-+][A-Za-z0-9.-]+)?", tag), "invalid release tag"; print(tag)')" || die "could not resolve the latest release"
+say "Installing $release with the official Custom Installer"
+warn "Installs into ~/.local/share/mlx-omarchy; ~/.local/bin/mlx-omarchy takes precedence over the packaged runtime."
+installer="$(mktemp)" || die "could not create installer file"
+trap 'rm -f "$installer"' EXIT
+curl -fsSL "https://raw.githubusercontent.com/{MLX_REPO}/$release/install.sh" -o "$installer" || die "could not download the release installer"
+# The official installer recreates this venv with --clear and deletes its
+# temporary wheel on exit. Disable pip caching too, so updates don't retain
+# downloaded copies of old dependencies outside that replaced runtime.
+PIP_NO_CACHE_DIR=1 MLX_OMARCHY_VERSION="$release" MLX_OMARCHY_HOME="$HOME/{LEGACY_PREFIX}" bash "$installer" || die "Custom Installer failed"
+"$HOME/.local/bin/mlx-omarchy" -c 'import mlx.core as mx; print("  ", mx.__version__, mx.default_device())' || die "installed runtime failed its smoke test"
+lmdeck runtime custom || die "could not select the custom runtime"
+{retention}
+say "Done. Reload models in lmdeck to use the selected runtime."
+"#,
+        retention = script_mlx_retention("custom")
+    )
+}
+
+fn script_mlx_retention(source: &str) -> String {
+    format!(r#"
+printf '\nInstalled runtimes\n1. Keep both\n2. Keep only selected ({source})\n\n'
+while true; do
+  read -rp 'Choose [1/2, default 1]: ' keep || keep=1
+  case "$keep" in
+    1|"") break ;;
+    2) lmdeck runtime {source} --only || die "could not remove the other runtime"; break ;;
+    *) printf 'Choose 1 or 2.\n' ;;
+  esac
+done
+"#)
+}
+
+/// Remove only the unselected runtime, keeping model data and the GPU driver.
+pub fn script_remove_other_mlx(source: &str) -> String {
+    if source == "custom" {
+        format!(r#"{HEADER}
+if pacman -Q omarchy-mlx >/dev/null 2>&1; then
+  say "Removing the packaged MLX runtime; keeping the Vulkan driver"
+  sudo pacman -D --asexplicit omarchy-mlx-vulkan || die "could not preserve the Vulkan driver"
+  sudo pacman -R omarchy-mlx || die "package removal failed"
+fi
+"#)
+    } else {
+        format!(r#"{HEADER}
+if [[ -d "$HOME/{LEGACY_PREFIX}/venv" || -e "$HOME/.local/bin/mlx-omarchy" ]]; then
+  say "Removing the custom runtime; keeping models and chat data"
+  /usr/bin/mlx-omarchy-retire-legacy --yes || die "custom runtime removal failed"
+fi
+"#)
+    }
+}
+
+pub fn script_update_menu() -> String {
+    format!(
+        r#"printf 'Update MLX\n\n1. Omarchy\n2. Custom Installer\nq. Cancel\n\n'
+while read -rp 'Choose [1/2/q]: ' choice; do
+  case "$choice" in
+    1)
+{omarchy}
+      break ;;
+    2)
+{custom}
+      break ;;
+    q|Q) exit 0 ;;
+    *) printf 'Choose 1, 2, or q.\n' ;;
+  esac
+done
+"#,
+        omarchy = script_update_mlx(),
+        custom = script_update_mlx_custom(),
     )
 }
 
@@ -513,7 +802,146 @@ mod tests {
         bash_n(&super::script_migrate(false));
         bash_n(&super::script_migrate(true));
         bash_n(&super::script_update_mlx());
+        bash_n(&super::script_update_mlx_custom());
+        bash_n(&super::script_update_menu());
+        bash_n(&super::script_remove_other_mlx("custom"));
+        bash_n(&super::script_remove_other_mlx("omarchy"));
         bash_n(&super::script_build_llama(&crate::config::Config::default()));
+    }
+
+    #[test]
+    fn mlx_update_uses_omarchy_and_stops_on_failure() {
+        for fail in [false, true] {
+            let mocks = format!(
+                r#"
+omarchy() {{
+  [[ "$*" == update ]] || return 99
+  echo UPDATE >&2
+  return {status}
+}}
+pacman() {{
+  [[ "$*" == '-Q omarchy-mlx' ]] || return 99
+  echo 'omarchy-mlx 1.0-1'
+}}
+tar() {{ printf '%%VERSION%%\n1.0-1\n'; }}
+vercmp() {{ echo 0; }}
+sudo() {{ echo 'unexpected sudo invocation' >&2; return 99; }}
+mlx-omarchy() {{ echo SMOKE >&2; }}
+lmdeck() {{ [[ "$*" == 'runtime omarchy' ]] || return 99; echo SMOKE >&2; }}
+"#,
+                status = if fail { 23 } else { 0 }
+            );
+            let output = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("{mocks}\n{}", super::script_update_mlx()))
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), !fail, "{stderr}");
+            if fail {
+                assert!(stderr.contains("omarchy update failed"), "{stderr}");
+                assert!(!stderr.contains("SMOKE"), "{stderr}");
+                assert!(!String::from_utf8_lossy(&output.stdout).contains("is current"));
+            } else {
+                assert_eq!(stderr, "UPDATE\nSMOKE\n");
+                assert!(String::from_utf8_lossy(&output.stdout).contains("omarchy-mlx 1.0-1 is current"));
+            }
+        }
+    }
+
+    #[test]
+    fn update_menu_cancel_runs_no_updater() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg(format!("omarchy() {{ exit 99; }}\ncurl() {{ exit 99; }}\n{}", super::script_update_menu()))
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"invalid\nq\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for choice in ["1. Omarchy", "2. Custom Installer", "q. Cancel", "Choose 1, 2, or q."] {
+            assert!(stdout.contains(choice), "{stdout}");
+        }
+    }
+
+    #[test]
+    fn custom_update_pins_release_and_stops_on_installer_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("lmdeck-installer-test-{}", std::process::id()));
+        let bin = root.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let launcher = bin.join("mlx-omarchy");
+        std::fs::write(&launcher, "#!/bin/bash\necho SMOKE >&2\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for fail in [false, true] {
+            let mocks = format!(r#"
+curl() {{
+  if [[ "$2" == https://api.github.com/repos/joshuaswarren/omarchy-mlx/releases/latest ]]; then
+    echo '{{"tag_name":"v0.7.31"}}'
+  elif [[ "$2" == https://raw.githubusercontent.com/joshuaswarren/omarchy-mlx/v0.7.31/install.sh && "$3" == -o ]]; then
+    printf '%s\n' '[[ "$MLX_OMARCHY_VERSION" == v0.7.31 ]] || exit 99' '[[ "$MLX_OMARCHY_HOME" == "$HOME/.local/share/mlx-omarchy" ]] || exit 99' '[[ "$PIP_NO_CACHE_DIR" == 1 ]] || exit 99' 'echo INSTALL >&2' 'exit {status}' > "$4"
+  else
+    return 99
+  fi
+}}
+lmdeck() {{ [[ "$*" == 'runtime custom' ]] || return 99; echo SELECT >&2; }}
+"#, status = if fail { 23 } else { 0 });
+            let output = std::process::Command::new("bash")
+                .arg("-c").arg(format!("{mocks}\n{}", super::script_update_mlx_custom()))
+                .env("HOME", &root).output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), !fail, "{stderr}");
+            if fail {
+                assert!(stderr.contains("Custom Installer failed"), "{stderr}");
+                assert!(!stderr.contains("SMOKE"), "{stderr}");
+            } else {
+                assert_eq!(stderr, "INSTALL\nSMOKE\nSELECT\n");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selecting_mlx_preserves_server_arguments() {
+        let mut cfg = crate::config::Config::default();
+        cfg.mlx.command = vec!["mlx-omarchy".into(), "-m".into(), "mlx_lm.server".into(), "--custom-flag".into()];
+        super::set_mlx_executable(&mut cfg, std::path::Path::new("/custom/mlx-omarchy"));
+        assert_eq!(cfg.mlx.command, ["/custom/mlx-omarchy", "-m", "mlx_lm.server", "--custom-flag"]);
+        cfg.mlx.command.clear();
+        super::set_mlx_executable(&mut cfg, std::path::Path::new("/usr/bin/mlx-omarchy"));
+        assert_eq!(cfg.mlx.command, ["/usr/bin/mlx-omarchy", "-m", "mlx_lm.server"]);
+    }
+
+    #[test]
+    fn removing_packaged_runtime_preserves_gpu_driver() {
+        let output = std::process::Command::new("bash").arg("-c")
+            .arg(format!("pacman() {{ return 0; }}\nsudo() {{ echo \"$*\"; }}\n{}", super::script_remove_other_mlx("custom")))
+            .output().unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("pacman -D --asexplicit omarchy-mlx-vulkan\npacman -R omarchy-mlx\n"), "{stdout}");
+        assert!(!stdout.contains("-Rns"));
+    }
+
+    #[test]
+    fn retention_choice_removes_only_selected_other_runtime() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        for source in ["custom", "omarchy"] {
+            for choice in ["1", "2"] {
+                let mut child = Command::new("bash").arg("-c")
+                    .arg(format!("die() {{ exit 1; }}\nlmdeck() {{ echo \"COMMAND $*\"; }}\n{}", super::script_mlx_retention(source)))
+                    .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+                child.stdin.take().unwrap().write_all(format!("{choice}\n").as_bytes()).unwrap();
+                let output = child.wait_with_output().unwrap();
+                assert!(output.status.success());
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert_eq!(stdout.contains(&format!("COMMAND runtime {source} --only")), choice == "2", "{stdout}");
+            }
+        }
     }
 
     #[test]
