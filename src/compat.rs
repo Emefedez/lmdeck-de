@@ -431,6 +431,10 @@ mod sizing_tests {
         assert!(binned >= plain);
         assert!(super::runtime_bins_buffers(&format!("{home}/.local/bin/mlx-omarchy")));
         assert!(!super::runtime_bins_buffers("/usr/bin/mlx-omarchy"));
+        let fixed = format!("{home}/.local/bin/mlx-omarchy-fixed");
+        if std::path::Path::new(&fixed).exists() {
+            assert!(!super::runtime_bins_buffers(&fixed), "the Fixed runtime must not be planned as binning");
+        }
     }
 }
 
