@@ -388,6 +388,25 @@ Column {
     }
   }
 
+  // ======================= Coding agents =======================
+  Card {
+    visible: lm.up
+    title: "CODING AGENTS"
+
+    SettingRow {
+      label: "Tools sent"
+      key: "server.local_tools"
+      info: "What Claude Code (t1code, T3, lmdeck launch) sends to a local model. lean: essential tools with short descriptions, no MCP tools (~6.6k tokens instead of ~148k). groups: lean plus your MCP tools on demand; the model looks up a group (e.g. rea/inspect) and lmdeck answers from ~/.config/lmdeck/tool-groups, so it only pays for what it uses (answers arrive whole, not streamed). core: every Claude Code tool but no MCP (~17k). all: everything as sent (can be 100k+ tokens: very slow and may run out of memory)."
+      options: [{ value: "lean", label: "lean" }, { value: "groups", label: "groups" }, { value: "core", label: "core" }, { value: "all", label: "all" }]
+    }
+    SettingRow {
+      label: "Reuse between turns"
+      key: "mlx.prefix_checkpoints"
+      info: "Saves the conversation's cache at the start of each answer so the next turn only reads what is new. Needed for hybrid models such as Qwen3.5/3.8, whose cache can't be rewound: an agent follow-up drops from ~99 s to ~13 s. Costs some RAM per saved conversation (bounded by the prompt cache size). Takes effect after a model reload."
+      options: [{ value: "true", label: "on" }, { value: "false", label: "off" }]
+    }
+  }
+
   // ======================= Memory & residency =======================
   Card {
     visible: lm.up

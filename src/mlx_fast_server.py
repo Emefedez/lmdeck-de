@@ -230,8 +230,9 @@ def main():
             src = src.replace(old, new)
             applied += 1
     checkpoint = False
+    want_checkpoints = os.environ.get("LMDECK_MLX_CHECKPOINTS", "1") != "0"
     for old, new in OPTIONAL_PATCHES:
-        if applied == len(PATCHES) and src.count(old) == 1:
+        if want_checkpoints and applied == len(PATCHES) and src.count(old) == 1:
             src = src.replace(old, new)
             checkpoint = True
     if applied != len(PATCHES):

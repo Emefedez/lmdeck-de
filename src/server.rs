@@ -1191,6 +1191,8 @@ fn status_value(a: &App) -> Value {
         "mlx.kv_bits",
         "mlx.max_kv_size",
         "mlx.fast_path",
+        "mlx.prefix_checkpoints",
+        "server.local_tools",
         "server.mem_check",
         "server.gpu_heap",
         "vscode.fallback",

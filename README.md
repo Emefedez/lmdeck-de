@@ -113,6 +113,8 @@ Claude Code sends every tool it knows, MCP tools included. With a few MCP server
 | `lean` (default) | No MCP tools; essential Claude Code tools only, descriptions cut to their first paragraph, parameter docs to one line. Schemas are untouched, so tool calls work as before. | ~148k → ~6.6k tokens, first answer in ~100 s on Qwen3.8-27B |
 | `groups` | `lean` plus two meta tools. `tool_group` lists your MCP servers (split into subgroups like `rea/inspect` when a server has many tools); lmdeck answers it itself with that section of `~/.config/lmdeck/tool-groups/<server>.md`. `call_tool(name, arguments)` is rewritten into the real MCP tool call for Claude Code. The group files are generated from the tool list and can be edited; delete the `lmdeck:auto` line to keep your edits. | MCP tools available at ~6.6k tokens; a hypruse call end to end in ~2 min |
 | `core` | Everything except MCP tools. | ~17k tokens |
+
+Both `server.local_tools` and `mlx.prefix_checkpoints` (on by default) have toggles, with ⓘ explanations, in the bar panel under **Coding agents**.
 | `all` | Everything. | as sent |
 
 Every `/v1/messages` request logs the breakdown (system, messages, tools before and after) in `lmdeck.log`. In `groups` mode responses are delivered when complete rather than streamed token by token.
