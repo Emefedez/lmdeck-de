@@ -100,6 +100,19 @@ lmdeck launch t3 --no-open               # only (re)write the T3 provider; T3 se
 - **T3 Code**: the provider instance uses T3's stock Claude driver plus those environment overrides, and lists your local models as custom models. `settings.json` is backed up first.
 - Agent system prompts are large (Claude Code's is about 21k tokens), so the first turn spends most of its time in prefill. That took about 2.5 minutes for a 4B model on an M1 Max. MLX prompt caching makes later turns with the same prefix much faster.
 
+## VS Code / Copilot fallback
+
+lmdeck registers itself as an **Ollama** model provider in VS Code (`chatLanguageModels.json`), so local models show up in Copilot's model picker. It reports each model under its full name, which keeps quants of one repo apart. It also advertises a capped context window (`mlx.max_context`, default 64k) instead of the native 262k, which would exhaust GPU memory.
+
+With `vscode.fallback = auto` (the default), the daemon reads VS Code's own `chat.quotaResumeState` every 5 minutes. That's a single read-only sqlite query.
+
+- While Copilot reports the quota **blocked**, lmdeck sets `inlineChat.defaultModel` and `chat.defaultModel` to a local tool-calling model, so inline **Fix** and chat keep working.
+- Both lines are marked `// set by lmdeck` and are removed when quota returns. Values you set yourself are never touched.
+- `always` forces the local model; `off` disables the feature.
+- `vscode.model` picks the model. Left empty, lmdeck uses the loaded model if it can call tools, otherwise the smallest local model that can.
+- `lmdeck vscode` shows the status and applies it immediately.
+- The originals are kept once as `*.bak.lmdeck`.
+
 ## Using it from other programs
 
 ```bash
@@ -163,6 +176,7 @@ Token usage is counted for both Ollama and OpenAI requests. It lives in memory a
 - **Compatibility**: lmdeck probes which MLX quantization modes the installed omarchy-mlx can run on the GPU. On 0.7.28 that's affine only; nvfp4, mxfp4 and mxfp8 fail. Combined with the omarchy-mlx catalog, every model gets a marker: ✓ qualified, ? untested, ✗ won't run. Each ✗ comes with a recommended alternative, and the per-model **Run on CPU (discouraged)** option is there as a last resort.
 - **One model resident by default** (`server.max_loaded = 1`). Unified memory makes a second big model a swap risk. The least-recently-used idle model is evicted when another is requested.
 - **Memory admission**: a load is refused with a clear error when weights plus overhead plus KV estimate exceed `MemAvailable − server.mem_reserve_gib`.
+- **Load progress**: `/lmdeck/status` → `load` reports the phase (starting, loading weights, warming up), a percentage, bytes uploaded and an ETA. Weights are measured as GPU shmem growth against the model's size; warm-up uses the backend's prefill counter. The TUI, the bar panel and `lmdeck load` all show it.
 - **Warm-up on load**: MLX models get a 1-token request before they are marked ready. That loads the weights and compiles the Vulkan pipelines, so the first real request doesn't pay for it.
 - `server.uclamp_boost` runs backends under `uclampset -m 1024`. It keeps schedutil from parking the CPU thread that feeds the GPU, which matters on power-saver profiles. There's no difference on `asahi-performance`.
 - `hooks.on_load` and `hooks.on_idle` can switch tuned profiles, e.g. `tuned-adm profile asahi-performance` and `tuned-adm profile asahi-balanced`.

@@ -18,6 +18,7 @@ Item {
   property var status: null
   property var models: []
   property var config: []
+  property var vscode: null
   property var searchResults: []
   property bool searching: false
   property string searchError: ""
@@ -100,6 +101,7 @@ Item {
   onPanelOpenChanged: if (panelOpen) {
     request("GET", "/lmdeck/status", null, applyStatus, 3000)
     refreshModels()
+    refreshVscode()
     if (config.length === 0) refreshConfig()
   }
 
@@ -107,6 +109,9 @@ Item {
 
   function refreshModels() {
     request("GET", "/lmdeck/models", null, function(code, data) { if (code === 200 && Array.isArray(data)) lm.models = data })
+  }
+  function refreshVscode() {
+    request("GET", "/lmdeck/vscode", null, function(code, data) { if (code === 200) lm.vscode = data })
   }
   function refreshConfig() {
     request("GET", "/lmdeck/config", null, function(code, data) { if (code === 200 && Array.isArray(data)) lm.config = data })
@@ -151,6 +156,7 @@ Item {
   function setSetting(key, value) {
     request("POST", "/lmdeck/config", { key: key, value: String(value) }, function(code, data) {
       if (code !== 200) { say(errorText(data, "could not save")); return }
+      if (key.indexOf("vscode.") === 0) Qt.callLater(lm.refreshVscode)
       if (data.restart_server) say("Saved — restart the server to apply")
       else if (data.reload) say("Saved — reload the model to apply")
       request("GET", "/lmdeck/status", null, lm.applyStatus, 3000)

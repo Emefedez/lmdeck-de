@@ -10,6 +10,7 @@ mod server;
 mod sys;
 mod tui;
 mod usage;
+mod vscode;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -73,6 +74,8 @@ enum Cmd {
     },
     /// Install the launcher (.desktop) and Omarchy menu entries
     Desktop,
+    /// VS Code / Copilot: show fallback status and apply it now
+    Vscode,
     /// Run a coding agent on a local model (like `ollama launch`):
     /// claude | codex | opencode | t3 (registers a T3 Code provider, opens t1code)
     Launch {
@@ -156,7 +159,22 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Some(Cmd::Load { model }) => {
             ensure_daemon(&d).await?;
-            let v = d.load(&model).await?;
+            // Show progress while the (blocking) load request runs.
+            let watcher = {
+                let d = d.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                        if let Some(l) = d.status().await.and_then(|s| s.get("load").cloned()).filter(|l| !l.is_null()) {
+                            eprint!("\r\x1b[2K{} [{:>3.0}%]", tui::load_label(&l), l["progress"].as_f64().unwrap_or(0.0) * 100.0);
+                        }
+                    }
+                })
+            };
+            let v = d.load(&model).await;
+            watcher.abort();
+            eprint!("\r\x1b[2K");
+            let v = v?;
             println!("{} loaded in {:.1}s", v["model"].as_str().unwrap_or(&model), v["load_secs"].as_f64().unwrap_or(0.0));
             Ok(())
         }
@@ -223,6 +241,13 @@ async fn async_main(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Launch { app, model, args }) => launch::run(&cfg, &d, &app, model, args).await,
+        Some(Cmd::Vscode) => {
+            let ms = models::scan(&cfg);
+            let loaded = d.status().await.and_then(|s| s["running"].as_array().and_then(|r| r.first()).and_then(|r| r["name"].as_str().map(str::to_string)));
+            vscode::sync(&cfg, &ms, loaded.as_deref());
+            println!("{}", serde_json::to_string_pretty(&vscode::status(&cfg))?);
+            Ok(())
+        }
         Some(Cmd::Desktop) => {
             println!("wrote {}", sys::desktop_entry()?.display());
             println!("updated {}", sys::install_menu()?.display());

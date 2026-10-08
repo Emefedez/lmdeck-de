@@ -111,6 +111,8 @@ struct Ui {
     toast: Option<(String, Instant)>,
     quit: bool,
     tx: mpsc::UnboundedSender<Msg>,
+    /// (quota_blocked, active fallback model) when VS Code is installed.
+    vscode: Option<(Option<bool>, Option<String>)>,
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
@@ -153,6 +155,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         toast: None,
         quit: false,
         tx: tx.clone(),
+        vscode: crate::vscode::installed().then(|| (crate::vscode::quota_blocked(), crate::vscode::active_model())),
     };
     ui.refresh_versions();
     ui.poll_status();
@@ -313,6 +316,7 @@ impl Ui {
     }
 
     fn after_action(&mut self) {
+        self.vscode = crate::vscode::installed().then(|| (crate::vscode::quota_blocked(), crate::vscode::active_model()));
         self.cfg = Config::load().unwrap_or_else(|_| self.cfg.clone());
         self.refresh_versions();
         self.rescan();
@@ -1121,10 +1125,33 @@ impl Ui {
             })
             .collect();
         let empty = rows.is_empty();
+        let block = panel("Loaded");
+        let inner_loaded = block.inner(loaded);
+        f.render_widget(block, loaded);
+        let progress = self.status.as_ref().and_then(|s| s.get("load")).filter(|l| !l.is_null()).cloned();
+        let (prog_area, table_area) = if progress.is_some() {
+            let [a, b] = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(inner_loaded);
+            (Some(a), b)
+        } else {
+            (None, inner_loaded)
+        };
+        if let (Some(area), Some(l)) = (prog_area, progress.as_ref()) {
+            let [label_area, gauge_area] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+            let label = load_label(l);
+            f.render_widget(Line::from(Span::styled(label, Style::new().fg(Color::Cyan))), label_area);
+            f.render_widget(
+                Gauge::default()
+                    .ratio(l["progress"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0))
+                    .gauge_style(Style::new().fg(Color::Cyan).bg(Color::Reset))
+                    .use_unicode(true)
+                    .label(format!("{:.0}%", l["progress"].as_f64().unwrap_or(0.0) * 100.0)),
+                gauge_area,
+            );
+        }
         let t = Table::new(rows, [Constraint::Min(20), Constraint::Length(5), Constraint::Length(7), Constraint::Length(8), Constraint::Length(7)])
-            .header(Row::new(["Model", "Fmt", "RSS", "Unload", "Load"]).style(Style::new().fg(Color::DarkGray)))
-            .block(panel("Loaded"));
-        f.render_widget(t, loaded);
+            .header(Row::new(["Model", "Fmt", "RSS", "Unload", "Load"]).style(Style::new().fg(Color::DarkGray)));
+        f.render_widget(t, table_area);
+        let empty = empty && progress.is_none();
         if empty {
             let inner = loaded.inner(ratatui::layout::Margin { horizontal: 2, vertical: 2 });
             f.render_widget(Paragraph::new("nothing loaded — models load on first request").fg(Color::DarkGray), inner);
@@ -1177,6 +1204,17 @@ impl Ui {
         }
         rl.push(kv("  offload", &format!("ngl {} · ctx {} · fa {}", self.cfg.llama.gpu_layers, self.cfg.llama.ctx_size, self.cfg.llama.flash_attn)));
         rl.push(Line::raw(""));
+        if let Some(vs) = self.vscode.as_ref() {
+            rl.push(Line::from(vec![
+                Span::styled("VS Code      ", Style::new().fg(Color::Cyan).bold()),
+                match vs.1.as_deref() {
+                    Some(m) => Span::styled(format!("Fix/chat → {}", m.rsplit('/').next().unwrap_or(m)), Style::new().fg(Color::Yellow)),
+                    None => Span::raw("Copilot"),
+                },
+                Span::styled(format!("  ({}{})", self.cfg.vscode.fallback, if vs.0 == Some(true) { ", quota exhausted" } else { "" }), Style::new().fg(Color::DarkGray)),
+            ]));
+            rl.push(Line::raw(""));
+        }
         rl.push(Line::from(vec![Span::styled("Cache        ", Style::new().fg(Color::Cyan).bold()), Span::raw(format!("keep {} · max {} loaded", self.cfg.server.keep_alive, self.cfg.server.max_loaded))]));
         rl.push(kv("  MLX", &format!("prompt cache {} entries{}", self.cfg.mlx.prompt_cache_size, if self.cfg.mlx.prompt_cache_gib > 0.0 { format!(" · ≤{} GiB", self.cfg.mlx.prompt_cache_gib) } else { String::new() })));
         rl.push(kv("  GGUF", &format!("KV {}/{} · reuse {} · ctx {}", self.cfg.llama.cache_type_k, self.cfg.llama.cache_type_v, self.cfg.llama.cache_reuse, self.cfg.llama.ctx_size)));
@@ -1560,6 +1598,27 @@ fn active_downloads(s: &Option<Value>) -> Vec<(String, u64)> {
 
 fn count_active(s: &Option<Value>) -> usize {
     active_downloads(s).len()
+}
+
+/// "Loading X — weights 6.7/15.0G · 32s · ETA 40s" for a /lmdeck/status load object.
+pub fn load_label(l: &Value) -> String {
+    let name = l["model"].as_str().unwrap_or("").rsplit('/').next().unwrap_or("").to_string();
+    let el = l["elapsed_secs"].as_f64().unwrap_or(0.0);
+    let detail = match l["phase"].as_str().unwrap_or("") {
+        "loading" => format!(
+            "weights {}/{}{}",
+            human(l["loaded_bytes"].as_u64().unwrap_or(0)),
+            human(l["total_bytes"].as_u64().unwrap_or(0)),
+            l["eta_secs"].as_f64().map(|e| format!(" · ETA {:.0}s", e)).unwrap_or_default()
+        ),
+        "warming up" => match l["warmup"].as_array() {
+            Some(w) if w.len() == 2 => format!("warming up {}/{} tokens", w[0], w[1]),
+            _ => "warming up (compiling GPU kernels)".into(),
+        },
+        "starting" => "starting backend".into(),
+        p => p.to_string(),
+    };
+    format!("Loading {name} — {detail} · {el:.0}s")
 }
 
 fn panel(title: &str) -> Block<'static> {

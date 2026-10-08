@@ -143,16 +143,32 @@ Column {
     // --- loaded models ---
     Caption { text: "Loaded"; color: sec.dim }
     Caption {
-      visible: lm.running.length === 0 && !(lm.status && lm.status.loading)
+      visible: lm.running.length === 0 && !(lm.status && lm.status.load)
       text: "Nothing loaded — models load on first request"
       color: sec.dim
     }
-    Caption {
-      visible: !!(lm.status && lm.status.loading)
+    Column {
+      readonly property var l: lm.status ? lm.status.load : null
+      visible: !!l
       width: parent.width
-      text: lm.status && lm.status.loading ? "Loading " + lm.status.loading + "…" : ""
-      color: Color.accent
-      elide: Text.ElideMiddle
+      spacing: Style.space(4)
+      Caption {
+        width: parent.width
+        text: {
+          var l = parent.l
+          if (!l) return ""
+          var name = String(l.model).split("/").pop()
+          var detail = l.phase === "loading"
+            ? "weights " + lm.bytes(l.loaded_bytes) + " / " + lm.bytes(l.total_bytes) + (l.eta_secs ? " · ETA " + Math.round(l.eta_secs) + " s" : "")
+            : l.phase === "warming up"
+              ? (l.warmup ? "warming up " + l.warmup[0] + " / " + l.warmup[1] + " tokens" : "warming up (compiling GPU kernels)")
+              : l.phase === "starting" ? "starting backend" : l.phase
+          return "Loading " + name + " — " + detail + " · " + Math.round(l.elapsed_secs) + " s"
+        }
+        color: Color.accent
+        elide: Text.ElideMiddle
+      }
+      Bar { width: parent.width; value: parent.l ? parent.l.progress : 0 }
     }
     Repeater {
       model: lm.running
@@ -413,6 +429,22 @@ Column {
       handler: function(v) { lm.setSetting("server.host", v); restartLater.restart() }
     }
     Timer { id: restartLater; interval: 400; onTriggered: lm.service("restart") }
+
+    Divider {}
+    SettingRow {
+      label: "VS Code Copilot fallback"
+      key: "vscode.fallback"
+      options: [{ value: "auto", label: "auto", tooltip: "Use a local model for chat and inline Fix while Copilot's quota is exhausted" },
+                { value: "always", label: "always" }, { value: "off", label: "off" }]
+    }
+    Caption {
+      width: parent.width
+      visible: !!lm.vscode && lm.vscode.installed
+      text: !lm.vscode ? "" : (lm.vscode.quota_blocked ? "Copilot quota exhausted · " : "Copilot quota available · ")
+        + (lm.vscode.active_model ? "Fix/chat use " + lm.vscode.active_model.split("/").pop() : "VS Code uses Copilot")
+      color: lm.vscode && lm.vscode.active_model ? Color.accent : sec.dim
+      wrapMode: Text.WordWrap
+    }
   }
 
   // ======================= Models =======================

@@ -6,6 +6,16 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Shmem from /proc/meminfo in bytes. On Asahi, GPU buffers (GEM shmem)
+/// show up here, which makes it a usable "weights uploaded" gauge.
+pub fn shmem() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Shmem:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()))
+        .unwrap_or(0)
+        * 1024
+}
+
 /// (MemTotal, MemAvailable) in bytes.
 pub fn mem() -> (u64, u64) {
     let s = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
@@ -77,6 +87,20 @@ pub fn error_summary(p: &Path) -> String {
             || l.contains("error loading model")
     };
     lines.iter().rev().find(|l| is_err(l)).or(lines.last()).map(|l| l.chars().take(400).collect()).unwrap_or_default()
+}
+
+/// Text appended to `p` after byte `offset` (at most the last `max` bytes).
+pub fn read_since(p: &Path, offset: u64, max: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(p) else { return String::new() };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len <= offset {
+        return String::new();
+    }
+    let _ = f.seek(SeekFrom::Start(offset.max(len.saturating_sub(max))));
+    let mut b = Vec::new();
+    let _ = f.read_to_end(&mut b);
+    String::from_utf8_lossy(&b).into_owned()
 }
 
 pub fn read_tail(p: &Path, max: u64) -> String {

@@ -16,6 +16,19 @@ use tokio::process::{Child, Command};
 
 const MLX_SHIM: &str = include_str!("mlx_fast_server.py");
 
+/// Book-keeping for the load in progress (for progress bars).
+#[derive(Clone)]
+struct LoadInfo {
+    model: String,
+    size: u64,
+    shmem0: u64,
+    started: Instant,
+    phase: &'static str,
+    log: Option<std::path::PathBuf>,
+    /// Log length when this load began; warm-up progress is parsed after it.
+    log_offset: u64,
+}
+
 pub struct Running {
     pub name: String,
     pub model: LocalModel,
@@ -94,6 +107,7 @@ pub struct Manager {
     pub cfg: RwLock<Config>,
     running: Mutex<Vec<Arc<Running>>>,
     loading: Mutex<Option<String>>,
+    load_info: Mutex<Option<LoadInfo>>,
     /// PIDs of backends we killed that had not exited yet.
     exiting: Mutex<Vec<u32>>,
     load_lock: tokio::sync::Mutex<()>,
@@ -107,6 +121,7 @@ impl Manager {
             cfg: RwLock::new(cfg),
             running: Mutex::new(Vec::new()),
             loading: Mutex::new(None),
+            load_info: Mutex::new(None),
             exiting: Mutex::new(Vec::new()),
             load_lock: tokio::sync::Mutex::new(()),
             cache: Mutex::new(None),
@@ -207,9 +222,19 @@ impl Manager {
         }
         let t0 = Instant::now();
         self.loading.lock().unwrap().replace(m.name.clone());
+        *self.load_info.lock().unwrap() = Some(LoadInfo {
+            model: m.name.clone(),
+            size: m.size,
+            shmem0: sys::shmem(),
+            started: Instant::now(),
+            phase: "preparing",
+            log: None,
+            log_offset: 0,
+        });
         EVENTS.bump();
         let res = self.load_locked(&m, ka).await;
         self.loading.lock().unwrap().take();
+        self.load_info.lock().unwrap().take();
         EVENTS.bump();
         let r = res?;
         let guard = enter(&r);
@@ -519,6 +544,13 @@ impl Manager {
             .process_group(0)
             .kill_on_drop(true);
         let child = cmd.spawn().with_context(|| format!("starting {}", argv[0]))?;
+        if let Some(li) = self.load_info.lock().unwrap().as_mut() {
+            li.log = Some(log.clone());
+            li.log_offset = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+            li.phase = "starting";
+            // Baseline right before the backend allocates anything.
+            li.shmem0 = sys::shmem();
+        }
         let pid = child.id().unwrap_or(0);
         let t0 = Instant::now();
         let r = Arc::new(Running {
@@ -586,6 +618,7 @@ impl Manager {
             }
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
+        self.set_phase("loading");
         if r.model.format == Format::Mlx {
             // mlx_lm.server answers /health before its generator thread has loaded the
             // weights. A 1-token request blocks until the model is loaded and also
@@ -619,6 +652,61 @@ impl Manager {
             }
         }
         Ok(())
+    }
+
+    fn set_phase(&self, phase: &'static str) {
+        if let Some(li) = self.load_info.lock().unwrap().as_mut() {
+            li.phase = phase;
+        }
+    }
+
+    /// Progress of the load in flight, for the TUI / panel / CLI.
+    /// Weights: growth of GPU shmem since the load began vs the model size.
+    /// Warm-up: the backend's own "Prompt processing progress: a/b" lines.
+    pub fn load_progress(&self) -> Option<serde_json::Value> {
+        let li = self.load_info.lock().unwrap().clone()?;
+        let loaded = sys::shmem().saturating_sub(li.shmem0).min(li.size);
+        let frac = if li.size > 0 { loaded as f64 / li.size as f64 } else { 0.0 };
+        let elapsed = li.started.elapsed().as_secs_f64();
+        let mut phase = li.phase;
+        // llama.cpp uploads weights before /health turns OK.
+        if phase == "starting" && frac > 0.02 {
+            phase = "loading";
+        }
+        let mut warm: Option<(u64, u64)> = None;
+        if let Some(log) = &li.log {
+            let text = sys::read_since(log, li.log_offset, 16 * 1024);
+            {
+                if let Some(line) = text.lines().rev().find(|l| l.contains("Prompt processing progress:")) {
+                    if let Some((a, b)) = line.rsplit(':').next().and_then(|t| t.trim().split_once('/')) {
+                        if let (Ok(a), Ok(b)) = (a.trim().parse::<u64>(), b.trim().parse::<u64>()) {
+                            warm = Some((a, b));
+                        }
+                    }
+                }
+            }
+        }
+        if phase == "loading" && (frac >= 0.97 || warm.is_some()) {
+            phase = "warming up";
+        }
+        // Overall: weights are ~90% of the wait, the warm-up the rest.
+        let overall = match phase {
+            "preparing" | "starting" => 0.0,
+            "warming up" => 0.9 + 0.1 * warm.map(|(a, b)| a as f64 / b.max(1) as f64).unwrap_or(0.0),
+            _ => 0.9 * frac.min(1.0),
+        };
+        let rate = if elapsed > 1.0 { loaded as f64 / elapsed } else { 0.0 };
+        let eta = (phase == "loading" && rate > 1e6).then(|| (li.size.saturating_sub(loaded)) as f64 / rate);
+        Some(serde_json::json!({
+            "model": li.model,
+            "phase": phase,
+            "progress": overall.clamp(0.0, 0.99),
+            "loaded_bytes": loaded,
+            "total_bytes": li.size,
+            "elapsed_secs": elapsed,
+            "eta_secs": eta,
+            "warmup": warm.map(|(a, b)| serde_json::json!([a, b])),
+        }))
     }
 
     async fn kill(&self, r: &Running) {

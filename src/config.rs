@@ -15,6 +15,7 @@ pub struct Config {
     pub llama: LlamaCfg,
     pub hooks: HooksCfg,
     pub usage: UsageCfg,
+    pub vscode: VscodeCfg,
     /// Short names: `alias = "org/repo[:tag]"`.
     pub aliases: BTreeMap<String, String>,
     /// Per-model overrides keyed by full model name.
@@ -85,6 +86,9 @@ pub struct MlxCfg {
     pub prompt_cache_size: u32,
     /// Cap on prompt cache memory in GiB (0 = auto: a quarter of the GPU heap).
     pub prompt_cache_gib: f64,
+    /// Context window advertised to clients (Copilot, Claude Code) for MLX
+    /// models; their native windows (e.g. 262k) would exhaust GPU memory.
+    pub max_context: u32,
     /// Prompt tokens processed per step. Smaller = less peak memory on long
     /// prompts (agent system prompts are 20k+ tokens), slightly slower prefill.
     pub prefill_step_size: u32,
@@ -134,6 +138,23 @@ pub struct HooksCfg {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct VscodeCfg {
+    /// Copilot fallback: "auto" = use a local model for chat / inline Fix while
+    /// VS Code reports the Copilot quota exhausted; "always"; "off".
+    pub fallback: String,
+    /// Model for the fallback (empty = loaded model if it calls tools, else
+    /// the smallest local tool-calling model).
+    pub model: String,
+}
+
+impl Default for VscodeCfg {
+    fn default() -> Self {
+        Self { fallback: "auto".into(), model: String::new() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UsageCfg {
     /// Publish token usage to the Omarchy agents bar panel.
     pub omarchy_record: bool,
@@ -167,6 +188,7 @@ impl Default for Config {
             llama: LlamaCfg::default(),
             hooks: HooksCfg::default(),
             usage: UsageCfg::default(),
+            vscode: VscodeCfg::default(),
             aliases: BTreeMap::new(),
             overrides: BTreeMap::new(),
         }
@@ -216,6 +238,7 @@ impl Default for MlxCfg {
             prompt_cache_size: 10,
             prompt_cache_gib: 0.0,
             prefill_step_size: 512,
+            max_context: 65536,
             kv_bits: 0,
             kv_group_size: 64,
             quantized_kv_start: 512,
@@ -332,6 +355,10 @@ pub fn config_path() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| home().join(".config")).join("lmdeck/config.toml")
 }
 
+pub fn config_dir_or_home() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(|| home().join(".config"))
+}
+
 pub fn data_dir() -> PathBuf {
     dirs::data_dir().unwrap_or_else(|| home().join(".local/share")).join("lmdeck")
 }
@@ -381,6 +408,7 @@ pub const SETTINGS: &[(&str, &str, &str)] = &[
     ("KV cache · MLX", "mlx.max_kv_size", "MLX rotating KV window in tokens (0 = unbounded)"),
     ("KV cache · MLX", "mlx.prompt_cache_size", "MLX prompt caches kept between requests (0 = no reuse)"),
     ("KV cache · MLX", "mlx.prompt_cache_gib", "Cap on MLX prompt cache memory in GiB (0 = auto: ¼ of the GPU heap)"),
+    ("KV cache · MLX", "mlx.max_context", "Context window advertised to clients for MLX models (tokens)"),
     ("KV cache · MLX", "mlx.prefill_step_size", "Prompt tokens per prefill step (smaller = less peak memory on long prompts)"),
     ("KV cache · GGUF", "llama.ctx_size", "GGUF context window (KV is allocated for all of it)"),
     ("KV cache · GGUF", "llama.cache_type_k", "GGUF K cache type: f16 / q8_0 / q4_0 (q8_0 halves KV memory)"),
@@ -407,6 +435,8 @@ pub const SETTINGS: &[(&str, &str, &str)] = &[
     ("Downloads & storage", "download.gguf_mmproj", "Also fetch the vision projector (mmproj) for GGUF"),
     ("Integration", "hooks.on_load", "Shell cmd before the first model loads (e.g. tuned-adm profile asahi-performance)"),
     ("Integration", "hooks.on_idle", "Shell cmd after the last model unloads"),
+    ("Integration", "vscode.fallback", "VS Code Copilot fallback: auto (local model while Copilot quota is exhausted) / always / off"),
+    ("Integration", "vscode.model", "Model for the VS Code fallback (empty = automatic; must support tool calling)"),
     ("Integration", "usage.omarchy_record", "Show lmdeck token usage in the Omarchy agents bar panel"),
 ];
 
@@ -465,6 +495,9 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "hooks.on_load" => c.hooks.on_load.clone(),
         "hooks.on_idle" => c.hooks.on_idle.clone(),
         "usage.omarchy_record" => c.usage.omarchy_record.to_string(),
+        "vscode.fallback" => c.vscode.fallback.clone(),
+        "vscode.model" => c.vscode.model.clone(),
+        "mlx.max_context" => c.mlx.max_context.to_string(),
         _ => String::new(),
     }
 }
@@ -547,6 +580,14 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "hooks.on_load" => c.hooks.on_load = v.into(),
         "hooks.on_idle" => c.hooks.on_idle = v.into(),
         "usage.omarchy_record" => c.usage.omarchy_record = boolean(v)?,
+        "vscode.fallback" => {
+            if !["auto", "always", "off"].contains(&v) {
+                return Err("use auto, always or off".into());
+            }
+            c.vscode.fallback = v.into()
+        }
+        "vscode.model" => c.vscode.model = v.into(),
+        "mlx.max_context" => c.mlx.max_context = (num(v)? as u32).clamp(2048, 1 << 20),
         _ => return Err("unknown setting".into()),
     }
     Ok(())

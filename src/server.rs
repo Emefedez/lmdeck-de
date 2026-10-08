@@ -38,6 +38,18 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let probe_cfg = app.mgr.cfg();
     tokio::task::spawn_blocking(move || crate::compat::probe(&probe_cfg));
 
+    // VS Code Copilot fallback: reconcile now and every 5 minutes (one sqlite read).
+    let vs = app.mgr.clone();
+    tokio::spawn(async move {
+        loop {
+            let cfg = vs.cfg();
+            let models = vs.models();
+            let loaded = vs.running().first().map(|r| r.name.clone());
+            let _ = tokio::task::spawn_blocking(move || crate::vscode::sync(&cfg, &models, loaded.as_deref())).await;
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        }
+    });
+
     let flusher = app.mgr.clone();
     tokio::spawn(async move {
         loop {
@@ -90,6 +102,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/lmdeck/override", post(lm_override))
         .route("/lmdeck/compat", get(lm_compat))
         .route("/lmdeck/plan", get(lm_plan))
+        .route("/lmdeck/vscode", get(lm_vscode).post(lm_vscode_sync))
         .layer(axum::middleware::from_fn(log_requests))
         .with_state(app.clone());
 
@@ -241,10 +254,17 @@ async fn show(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let arch = m.family();
     let mut info = json!({
         "general.architecture": arch,
-        "general.basename": m.repo.clone().unwrap_or(m.name.clone()),
+        // Copilot's Ollama provider names models after general.basename;
+        // the full name keeps quants of one repo apart and matches lmdeck's id.
+        "general.basename": m.name.clone(),
         "general.size_label": m.params,
     });
-    if let Some(c) = m.ctx_len {
+    let cfg = a.mgr.cfg();
+    let ctx = match m.format {
+        Format::Mlx => m.ctx_len.map(|c| c.min(cfg.mlx.max_context as u64)).or(Some(cfg.mlx.max_context as u64)),
+        Format::Gguf => Some(cfg.overrides.get(&m.name).and_then(|o| o.ctx_size).unwrap_or(cfg.llama.ctx_size) as u64),
+    };
+    if let Some(c) = ctx {
         info[format!("{arch}.context_length")] = json!(c);
     }
     Json(json!({
@@ -1058,6 +1078,7 @@ fn status_value(a: &App) -> Value {
         "mlx.fast_path",
         "server.mem_check",
         "server.gpu_heap",
+        "vscode.fallback",
     ]
     .iter()
     .map(|k| (k.to_string(), json!(crate::config::get_setting(&cfg, k))))
@@ -1074,6 +1095,7 @@ fn status_value(a: &App) -> Value {
         "ips": sys::lan_ips().into_iter().map(|(i, ip)| json!({"iface": i, "ip": ip})).collect::<Vec<_>>(),
         "running": a.mgr.views(),
         "loading": a.mgr.loading(),
+        "load": a.mgr.load_progress(),
         "downloads": a.dl.list(),
         "mem": {"total": total, "available": avail, "gpu_budget": crate::compat::gpu_budget(), "muvm": sys::muvm_rss()},
         "usage": USAGE.summary(),
@@ -1126,6 +1148,12 @@ async fn lm_config_set(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     *a.mgr.cfg.write().unwrap() = cfg;
     a.mgr.invalidate();
     EVENTS.bump();
+    if key.starts_with("vscode.") {
+        let cfg = a.mgr.cfg();
+        let models = a.mgr.models();
+        let loaded = a.mgr.running().first().map(|r| r.name.clone());
+        tokio::task::spawn_blocking(move || crate::vscode::sync(&cfg, &models, loaded.as_deref()));
+    }
     let restart = key == "server.host" || key == "server.port";
     let reload = crate::config::needs_reload(key) && !a.mgr.running().is_empty();
     Json(json!({"ok": true, "reload": reload, "restart_server": restart})).into_response()
@@ -1323,6 +1351,24 @@ struct PlanQ {
 
 async fn lm_plan(State(a): State<App>, Query(q): Query<PlanQ>) -> Json<Value> {
     Json(a.mgr.plan_preview(&q.model))
+}
+
+async fn lm_vscode(State(a): State<App>) -> Json<Value> {
+    let cfg = a.mgr.cfg();
+    Json(json!(tokio::task::spawn_blocking(move || crate::vscode::status(&cfg)).await.unwrap_or_default()))
+}
+
+async fn lm_vscode_sync(State(a): State<App>) -> Json<Value> {
+    let cfg = a.mgr.cfg();
+    let models = a.mgr.models();
+    let loaded = a.mgr.running().first().map(|r| r.name.clone());
+    let st = tokio::task::spawn_blocking(move || {
+        crate::vscode::sync(&cfg, &models, loaded.as_deref());
+        crate::vscode::status(&cfg)
+    })
+    .await
+    .unwrap_or_default();
+    Json(json!(st))
 }
 
 async fn lm_compat(State(a): State<App>) -> Json<Value> {
