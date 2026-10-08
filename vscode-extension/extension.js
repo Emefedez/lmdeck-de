@@ -9,6 +9,7 @@
 // the Omarchy bar panel show and change the same setting.
 
 const vscode = require("vscode");
+const { execFile } = require("child_process");
 
 const KEYS = ["inlineChat.defaultModel", "chat.defaultModel"];
 const SAVED = "lmdeck.savedDefaults"; // { key: previousGlobalValue | null }
@@ -162,11 +163,40 @@ async function setMode(mode) {
   await check("mode");
 }
 
+async function serverUp() {
+  try {
+    await api("GET", "/api/version");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function systemctl(action) {
+  return new Promise((resolve) =>
+    execFile("systemctl", ["--user", action, "lmdeck"], (err) => resolve(!err))
+  );
+}
+
+async function toggleServer() {
+  const up = await serverUp();
+  const ok = await systemctl(up ? "stop" : "start");
+  vscode.window.setStatusBarMessage(
+    ok ? `lmdeck server ${up ? "stopped" : "starting…"}` : "lmdeck: systemctl failed (is the user service installed?)",
+    5000
+  );
+  log(`server ${up ? "stop" : "start"} -> ${ok ? "ok" : "failed"}`);
+  if (!up && ok) setTimeout(() => check("server-start"), 2500);
+  else render(up ? "lmdeck server stopped" : undefined);
+}
+
 async function menu() {
   const auto = cfg().get("autoCheck");
   const mode = last ? last.mode : "?";
+  const up = await serverUp();
   const pick = await vscode.window.showQuickPick(
     [
+      { label: up ? "$(debug-stop) Stop lmdeck server" : "$(debug-start) Start lmdeck server", description: up ? "running on " + base() : "stopped", id: "server" },
       { label: "$(refresh) Check Copilot quota now", id: "check" },
       { label: "$(output) Show log", id: "log" },
       { label: `${mode === "auto" ? "$(check)" : "$(blank)"} Auto`, description: "local model only while Copilot quota is exhausted", id: "auto" },
@@ -177,7 +207,8 @@ async function menu() {
     { title: "lmdeck: Copilot fallback" }
   );
   if (!pick) return;
-  if (pick.id === "check") await check("manual");
+  if (pick.id === "server") await toggleServer();
+  else if (pick.id === "check") await check("manual");
   else if (pick.id === "log") out.show();
   else if (pick.id === "toggle") await toggleAutoCheck();
   else await setMode(pick.id);
@@ -200,6 +231,7 @@ function activate(context) {
   context.subscriptions.push(
     item,
     vscode.commands.registerCommand("lmdeck.menu", menu),
+    vscode.commands.registerCommand("lmdeck.toggleServer", toggleServer),
     vscode.commands.registerCommand("lmdeck.checkNow", () => check("manual")),
     vscode.commands.registerCommand("lmdeck.toggleAutoCheck", toggleAutoCheck),
     vscode.commands.registerCommand("lmdeck.useLocal", () => setMode("always")),

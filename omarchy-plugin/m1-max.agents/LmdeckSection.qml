@@ -43,8 +43,12 @@ Column {
   // ======================= Server =======================
   Card {
     title: "SERVER"
-    badge: lm.up ? "● serving" : "○ stopped"
+    badge: lm.pending ? (lm.up ? "stopping…" : "starting…") : (lm.up ? "on" : "off")
     badgeColor: lm.up ? Color.accent : sec.dim
+    hasSwitch: true
+    switchOn: lm.up
+    switchBusy: lm.pending
+    onSwitchToggled: lm.service(lm.up ? "stop" : "start")
 
     Caption { text: "Endpoint"; color: sec.dim }
     Text {
@@ -73,8 +77,7 @@ Column {
 
     Row {
       spacing: Style.spacing.sm
-      SmallButton { text: lm.up ? "Restart" : "Start"; onClicked: lm.service(lm.up ? "restart" : "start") }
-      SmallButton { visible: lm.up; text: "Stop"; onClicked: lm.service("stop") }
+      SmallButton { visible: lm.up; text: "Restart"; onClicked: lm.service("restart") }
       SmallButton {
         text: "Force stop"
         foreground: sec.urgent
@@ -683,6 +686,11 @@ Column {
     property color badgeColor: sec.dim
     property string action: ""
     signal actionClicked()
+    // Optional on/off switch at the right of the header (replaces the badge).
+    property bool hasSwitch: false
+    property bool switchOn: false
+    property bool switchBusy: false
+    signal switchToggled()
     default property alias content: body.data
     readonly property real pad: Style.space(12)
 
@@ -698,11 +706,22 @@ Column {
       x: card.pad
       y: card.pad
       width: card.width - card.pad * 2
-      height: headTitle.implicitHeight
-      PanelSectionHeader { id: headTitle; text: card.title; foreground: sec.foreground; fontFamily: sec.fontFamily }
+      height: Math.max(headTitle.implicitHeight, card.hasSwitch ? headSwitch.implicitHeight : 0)
+      PanelSectionHeader { id: headTitle; anchors.verticalCenter: parent.verticalCenter; text: card.title; foreground: sec.foreground; fontFamily: sec.fontFamily }
+      ToggleSwitch {
+        id: headSwitch
+        visible: card.hasSwitch
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        checked: card.switchOn
+        busy: card.switchBusy
+        foreground: sec.foreground
+        onToggled: card.switchToggled()
+      }
       Caption {
         visible: card.badge !== "" || card.action !== ""
-        anchors.right: parent.right
+        anchors.right: card.hasSwitch ? headSwitch.left : parent.right
+        anchors.rightMargin: card.hasSwitch ? Style.space(10) : 0
         anchors.verticalCenter: parent.verticalCenter
         text: card.action !== "" ? card.action : card.badge
         color: card.action !== "" ? sec.dim : card.badgeColor

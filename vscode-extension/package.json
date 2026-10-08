@@ -3,7 +3,7 @@
   "displayName": "lmdeck",
   "description": "Use lmdeck's local models for Copilot chat and inline Fix when your Copilot quota runs out.",
   "publisher": "local-lmdeck",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "license": "MIT",
   "engines": {
     "vscode": "^1.90.0"
@@ -21,6 +21,11 @@
       {
         "command": "lmdeck.menu",
         "title": "Copilot fallback\u2026",
+        "category": "lmdeck"
+      },
+      {
+        "command": "lmdeck.toggleServer",
+        "title": "Start / stop the lmdeck server",
         "category": "lmdeck"
       },
       {

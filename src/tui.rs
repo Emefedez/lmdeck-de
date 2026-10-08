@@ -1034,7 +1034,7 @@ impl Ui {
         let narrow = area.width < 100;
         let (srv, loaded, usage_area, dls, right) = if narrow {
             let [a, b, c, d, e] = Layout::vertical([
-                Constraint::Length(10),
+                Constraint::Length(11),
                 Constraint::Length(5),
                 Constraint::Length(8),
                 Constraint::Length(5),
@@ -1045,12 +1045,24 @@ impl Ui {
         } else {
             let [left, right] = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
             let [a, b, c, d] =
-                Layout::vertical([Constraint::Length(10), Constraint::Min(4), Constraint::Length(9), Constraint::Length(7)]).areas(left);
+                Layout::vertical([Constraint::Length(11), Constraint::Min(4), Constraint::Length(9), Constraint::Length(7)]).areas(left);
             (a, b, c, d, right)
         };
 
         // Server
         let mut lines = vec![];
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<12}", "Server"), Style::new().fg(Color::DarkGray)),
+            if self.status.is_some() {
+                Span::styled(" ON ", Style::new().fg(Color::Black).bg(Color::Green).bold())
+            } else {
+                Span::styled(" OFF ", Style::new().fg(Color::Black).bg(Color::DarkGray).bold())
+            },
+            Span::styled(
+                if self.status.is_some() { "  s = turn off · X = force stop" } else { "  s = turn on" },
+                Style::new().fg(Color::DarkGray),
+            ),
+        ]));
         match &self.status {
             Some(s) => {
                 lines.push(Line::from(vec![
@@ -1063,7 +1075,7 @@ impl Ui {
                     )),
                 ]));
             }
-            None => lines.push(Line::from(Span::styled("○ stopped — press s to start", Style::new().fg(Color::DarkGray)))),
+            None => lines.push(Line::from(Span::styled("○ stopped", Style::new().fg(Color::DarkGray)))),
         }
         let base = self.cfg.base_url();
         lines.push(kv("Ollama API", &base));

@@ -29,6 +29,9 @@ Item {
   property var offer: null
   property bool repoLoading: false
   property string toast: ""
+  // A start/stop was requested and the server hasn't changed state yet.
+  property bool pending: false
+  property bool _pendingFrom: false
 
   property int _event: 0
   property var _watchXhr: null
@@ -64,6 +67,8 @@ Item {
   }
 
   function applyStatus(code, data) {
+    var nowUp = code === 200 && data && typeof data === "object"
+    if (lm.pending && nowUp !== lm._pendingFrom) lm.pending = false
     if (code === 200 && data && typeof data === "object") {
       var wasUp = up
       var changed = data.event !== _event
@@ -208,14 +213,20 @@ Item {
     }[action]
     if (!cmd) return
     Quickshell.execDetached(cmd)
+    if (action === "start" || action === "stop") {
+      lm.pending = true
+      lm._pendingFrom = lm.up
+      pendingTimeout.restart()
+    }
     say(action === "kill" ? "Force-stopped lmdeck and its backends" : "lmdeck: " + action)
-    if (action !== "start") { lm.up = false; lm.status = null }
+    if (action === "kill") { lm.up = false; lm.status = null }
     if (_watchXhr) { _watchXhr.abort(); lm._watchXhr = null }
     retryTimer.interval = 1500
     retryTimer.restart()
     retryReset.restart()
   }
   Timer { id: retryReset; interval: 8000; onTriggered: retryTimer.interval = 20000 }
+  Timer { id: pendingTimeout; interval: 15000; onTriggered: lm.pending = false }
 
   function openTui() {
     Quickshell.execDetached(["omarchy-launch-or-focus-tui", "lmdeck"])
