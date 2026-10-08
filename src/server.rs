@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub const OLLAMA_COMPAT_VERSION: &str = "0.12.6";
 
 #[derive(Clone)]
@@ -115,6 +117,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 _ = tokio::signal::ctrl_c() => {},
                 _ = term.recv() => {},
             }
+            // Release parked long-polls (/lmdeck/watch) so graceful shutdown
+            // doesn't wait up to their timeout.
+            SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+            EVENTS.bump();
             sys::log("shutting down, unloading models");
             mgr.unload_all().await;
             USAGE.flush(&mgr.cfg());
@@ -1117,7 +1123,9 @@ struct WatchQ {
 /// Lets the bar widget follow lmdeck with ~one idle request a minute.
 async fn lm_watch(State(a): State<App>, Query(q): Query<WatchQ>) -> Json<Value> {
     if let Some(since) = q.since {
-        EVENTS.wait(since, Duration::from_secs(q.timeout.unwrap_or(55).min(300))).await;
+        if !SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            EVENTS.wait(since, Duration::from_secs(q.timeout.unwrap_or(55).min(300))).await;
+        }
     }
     Json(status_value(&a))
 }
