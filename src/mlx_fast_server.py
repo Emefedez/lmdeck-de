@@ -173,10 +173,19 @@ def install_kv_options(mod):
     return ", ".join(notes)
 
 
-# Optional: checkpoint the conversation prefix before generating. The stock single-request
-# path only caches prompt+output, which a hybrid model (non-trimmable cache, e.g. Qwen3.5/3.8)
-# can never reuse, so every agent turn re-read the whole prompt.
+# Optional: prompt-cache checkpoints. The stock single-request path only caches
+# prompt+output, which a hybrid model (non-trimmable cache, e.g. Qwen3.5/3.8) can never
+# reuse, so every agent turn re-read the whole prompt. lmdeck checkpoints
+#   1. the system prompt (tools included), shared by every conversation of the same agent,
+#      also kept on disk so it survives restarts and model reloads;
+#   2. the conversation up to the answer being generated, for the next turn.
 OPTIONAL_PATCHES = [
+    (
+        "            cache, rest = self.prompt_cache.fetch_nearest_cache(\n"
+        "                self.model_provider.model_key, prompt\n"
+        "            )\n",
+        "            cache, rest = _lmdeck_fetch(self, prompt)\n",
+    ),
     (
         "            # Process the prompt and generate tokens\n            for gen in stream_generate(",
         "            if self.model_provider.draft_model is None:\n"
@@ -185,38 +194,137 @@ OPTIONAL_PATCHES = [
     ),
 ]
 
+MIN_CHECKPOINT = 256
+DISK_KEEP = 6
+
+
+def _disk_dir(server):
+    import hashlib
+
+    key = repr(server.model_provider.model_key) + "|" + os.environ.get("LMDECK_MLX_KV_BITS", "0")
+    try:
+        import importlib.metadata as md
+
+        key += "|" + md.version("mlx-omarchy")
+    except Exception:
+        pass
+    base = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "lmdeck", "prompt-cache")
+    return os.path.join(base, hashlib.sha256(key.encode()).hexdigest()[:16])
+
+
+def _tok_hash(tokens):
+    import hashlib
+
+    return hashlib.sha256(",".join(map(str, tokens)).encode()).hexdigest()
+
+
+def _im_start(tokenizer):
+    try:
+        im = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    except Exception:
+        return None
+    return im if isinstance(im, int) and im >= 0 else None
+
+
+def lmdeck_fetch(server, prompt):
+    """In-memory prompt cache lookup, falling back to a system-prompt checkpoint on disk."""
+    import copy
+    import json
+
+    key = server.model_provider.model_key
+    cache, rest = server.prompt_cache.fetch_nearest_cache(key, prompt)
+    covered = len(prompt) - len(rest)
+    d = _disk_dir(server)
+    try:
+        metas = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".json")]
+    except OSError:
+        return cache, rest
+    best = None
+    for path in metas:
+        try:
+            meta = json.load(open(path))
+        except Exception:
+            continue
+        n = int(meta.get("n", 0))
+        if covered < n <= len(prompt) and (best is None or n > best[0]) and meta.get("sha") == _tok_hash(prompt[:n]):
+            best = (n, path[:-5] + ".safetensors")
+    if best is None:
+        return cache, rest
+    try:
+        from mlx_lm.models.cache import load_prompt_cache
+
+        loaded = load_prompt_cache(best[1])
+        os.utime(best[1])
+    except Exception as e:
+        print(f"lmdeck: could not load prompt checkpoint {best[1]}: {e}", file=sys.stderr, flush=True)
+        return cache, rest
+    server.prompt_cache.insert_cache(key, prompt[: best[0]], loaded, cache_type="system")
+    print(f"lmdeck: system prompt restored from disk ({best[0]} tokens)", file=sys.stderr, flush=True)
+    return copy.deepcopy(loaded), prompt[best[0] :]
+
+
+def _save_disk(server, tokens, cache):
+    import json
+
+    from mlx_lm.models.cache import save_prompt_cache
+
+    d = _disk_dir(server)
+    sha = _tok_hash(tokens)
+    path = os.path.join(d, sha[:24])
+    if os.path.exists(path + ".json"):
+        return
+    os.makedirs(d, exist_ok=True)
+    save_prompt_cache(path + ".safetensors", cache)
+    with open(path + ".json", "w") as f:
+        json.dump({"n": len(tokens), "sha": sha}, f)
+    # Keep the most recently used few.
+    files = sorted(
+        (p for p in os.listdir(d) if p.endswith(".safetensors")),
+        key=lambda p: os.path.getmtime(os.path.join(d, p)),
+        reverse=True,
+    )
+    for old in files[DISK_KEEP:]:
+        for ext in (".safetensors", ".json"):
+            try:
+                os.remove(os.path.join(d, old[: -len(".safetensors")] + ext))
+            except OSError:
+                pass
+
 
 def lmdeck_checkpoint(server, model, tokenizer, prompt, rest, cache, progress):
-    """Prefill up to the last <|im_start|> (the start of the answer being generated), save
-    that cache as a prefix entry, and return the tokens still to process."""
+    """Prefill up to the checkpoint boundaries, saving the cache at each; return what is left."""
     import copy
 
     import mlx.core as mx
 
-    try:
-        im = tokenizer.convert_tokens_to_ids("<|im_start|>")
-    except Exception:
+    im = _im_start(tokenizer)
+    if im is None:
         return rest
-    if not isinstance(im, int) or im < 0:
+    starts = [i for i, t in enumerate(prompt) if t == im]
+    if len(starts) < 2:
         return rest
-    start = len(prompt) - len(rest)
-    try:
-        boundary = len(prompt) - 1 - prompt[::-1].index(im)
-    except ValueError:
-        return rest
-    if boundary - start < 256:
-        return rest
+    system_end, answer_start = starts[1], starts[-1]
+    pos = len(prompt) - len(rest)
     step = getattr(server.cli_args, "prefill_step_size", None) or 512
-    toks = prompt[start:boundary]
-    for i in range(0, len(toks), step):
-        chunk = toks[i : i + step]
-        model(mx.array(chunk)[None], cache=cache)
-        mx.eval([c.state for c in cache])
-        progress(start + i + len(chunk), len(prompt))
-    server.prompt_cache.insert_cache(
-        server.model_provider.model_key, prompt[:boundary], copy.deepcopy(cache), cache_type="user"
-    )
-    return prompt[boundary:]
+    key = server.model_provider.model_key
+    for boundary, kind in ((system_end, "system"), (answer_start, "user")):
+        if boundary - pos < MIN_CHECKPOINT:
+            continue
+        toks = prompt[pos:boundary]
+        for i in range(0, len(toks), step):
+            chunk = toks[i : i + step]
+            model(mx.array(chunk)[None], cache=cache)
+            mx.eval([c.state for c in cache])
+            progress(pos + i + len(chunk), len(prompt))
+        pos = boundary
+        snap = copy.deepcopy(cache)
+        server.prompt_cache.insert_cache(key, prompt[:boundary], snap, cache_type=kind)
+        if kind == "system":
+            try:
+                _save_disk(server, prompt[:boundary], snap)
+            except Exception as e:
+                print(f"lmdeck: could not save prompt checkpoint: {e}", file=sys.stderr, flush=True)
+    return prompt[pos:]
 
 
 def main():
@@ -247,6 +355,7 @@ def main():
     mod.__package__ = "mlx_lm"
     sys.modules["mlx_lm.server"] = mod
     mod.__dict__["_lmdeck_checkpoint"] = lmdeck_checkpoint
+    mod.__dict__["_lmdeck_fetch"] = lmdeck_fetch
     exec(compile(src, path, "exec"), mod.__dict__)
     # The BatchGenerator path is ~40% slower per stream than stream_generate on
     # this backend; a desktop rarely runs concurrent requests, so default to the

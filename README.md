@@ -119,7 +119,7 @@ Both `server.local_tools` and `mlx.prefix_checkpoints` (on by default) have togg
 
 Every `/v1/messages` request logs the breakdown (system, messages, tools before and after) in `lmdeck.log`. In `groups` mode text and thinking stream as usual; only tool calls wait until the end of the round, so lmdeck can answer `tool_group` itself.
 
-**Prefix checkpoints.** Hybrid models such as Qwen3.5/3.8 keep part of their state in a cache that can't be rewound, so mlx_lm's single-request path (which caches prompt + answer) never reused anything and every agent turn re-read the whole prompt. lmdeck's shim now saves a checkpoint at the start of each answer, so the next turn (or the next `tool_group` round) only processes what is new: a follow-up turn went from ~99 s to ~13 s.
+**Prefix checkpoints.** Hybrid models such as Qwen3.5/3.8 keep part of their state in a cache that can't be rewound, so mlx_lm's single-request path (which caches prompt + answer) never reused anything and every agent turn re-read the whole prompt. lmdeck's shim now saves a checkpoint at the start of each answer, so the next turn (or the next `tool_group` round) only processes what is new: a follow-up turn went from ~99 s to ~13 s. A second checkpoint right after the system prompt (Claude Code's instructions plus tools, the same in every conversation) is also saved to `~/.cache/lmdeck/prompt-cache/` (~0.4 GB each, the 6 most recent per model and runtime), so new conversations and the first prompt after a restart or reload skip it too: a new Claude Code conversation after a restart went from ~104 s to ~50 s on Qwen3.8-27B.
 
 ## VS Code / Copilot fallback
 
