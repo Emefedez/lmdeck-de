@@ -117,7 +117,7 @@ Claude Code sends every tool it knows, MCP tools included. With a few MCP server
 Both `server.local_tools` and `mlx.prefix_checkpoints` (on by default) have toggles, with ⓘ explanations, in the bar panel under **Coding agents**.
 | `all` | Everything. | as sent |
 
-Every `/v1/messages` request logs the breakdown (system, messages, tools before and after) in `lmdeck.log`. In `groups` mode responses are delivered when complete rather than streamed token by token.
+Every `/v1/messages` request logs the breakdown (system, messages, tools before and after) in `lmdeck.log`. In `groups` mode text and thinking stream as usual; only tool calls wait until the end of the round, so lmdeck can answer `tool_group` itself.
 
 **Prefix checkpoints.** Hybrid models such as Qwen3.5/3.8 keep part of their state in a cache that can't be rewound, so mlx_lm's single-request path (which caches prompt + answer) never reused anything and every agent turn re-read the whole prompt. lmdeck's shim now saves a checkpoint at the start of each answer, so the next turn (or the next `tool_group` round) only processes what is new: a follow-up turn went from ~99 s to ~13 s.
 

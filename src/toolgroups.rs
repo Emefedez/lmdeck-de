@@ -151,15 +151,6 @@ fn fxhash(s: &str) -> u64 {
     s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
 
-/// tool_group calls in an assistant message: (id, group).
-pub fn group_requests(msg: &Value) -> Vec<(String, String)> {
-    msg["content"].as_array().map(|c| {
-        c.iter().filter(|b| b["type"] == "tool_use" && b["name"] == "tool_group")
-            .map(|b| (b["id"].as_str().unwrap_or("").to_string(), b["input"]["group"].as_str().unwrap_or("").to_string()))
-            .collect()
-    }).unwrap_or_default()
-}
-
 /// call_tool(name, arguments) -> the real tool_use the client knows.
 pub fn rewrite_calls(msg: &mut Value) {
     if let Some(c) = msg["content"].as_array_mut() {
@@ -170,34 +161,6 @@ pub fn rewrite_calls(msg: &mut Value) {
             b["input"] = if args.is_object() { args } else { json!({}) };
         }
     }
-}
-
-/// A finished Anthropic message replayed as SSE events (thinking blocks are left out).
-pub fn message_to_sse(msg: &Value) -> String {
-    use crate::anthropic::sse;
-    let mut head = msg.clone();
-    head["content"] = json!([]);
-    head["stop_reason"] = Value::Null;
-    let mut out = sse("message_start", &json!({"type": "message_start", "message": head}));
-    let mut i = 0;
-    for b in msg["content"].as_array().into_iter().flatten() {
-        match b["type"].as_str() {
-            Some("text") => {
-                out += &sse("content_block_start", &json!({"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}));
-                out += &sse("content_block_delta", &json!({"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": b["text"]}}));
-            }
-            Some("tool_use") => {
-                out += &sse("content_block_start", &json!({"type": "content_block_start", "index": i, "content_block": {"type": "tool_use", "id": b["id"], "name": b["name"], "input": {}}}));
-                out += &sse("content_block_delta", &json!({"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": b["input"].to_string()}}));
-            }
-            _ => continue,
-        }
-        out += &sse("content_block_stop", &json!({"type": "content_block_stop", "index": i}));
-        i += 1;
-    }
-    out += &sse("message_delta", &json!({"type": "message_delta", "delta": {"stop_reason": msg["stop_reason"], "stop_sequence": null}, "usage": msg["usage"]}));
-    out += &sse("message_stop", &json!({"type": "message_stop"}));
-    out
 }
 
 #[cfg(test)]
@@ -227,7 +190,5 @@ mod tests {
         rewrite_calls(&mut m);
         assert_eq!(m["content"][0]["name"], "mcp__srv__trace_y");
         assert_eq!(m["content"][0]["input"]["path"], "/x");
-        let sse = message_to_sse(&json!({"id": "m", "content": m["content"], "stop_reason": "tool_use", "usage": {}}));
-        assert!(sse.contains("input_json_delta") && sse.contains("message_stop"));
     }
 }

@@ -246,6 +246,8 @@ pub struct Stream {
     pub text: String,
     pub thinking: String,
     pub tools_done: Vec<(String, String, String)>, // id, name, args (for non-stream)
+    /// Collect tool calls without emitting them (tool groups decides what reaches the client).
+    pub hold_tools: bool,
 }
 
 pub fn sse(event: &str, data: &Value) -> String {
@@ -269,7 +271,30 @@ impl Stream {
             text: String::new(),
             thinking: String::new(),
             tools_done: vec![],
+            hold_tools: false,
         }
+    }
+
+    /// Start another backend round inside the same client message (tool groups):
+    /// block indices keep counting, per-round tool state and finish reason reset.
+    pub fn next_round(&mut self) -> String {
+        let mut out = String::new();
+        self.close(&mut out);
+        self.tool_slots.clear();
+        self.tool_block.clear();
+        self.tools_done.clear();
+        self.stop_reason = None;
+        out
+    }
+
+    /// Emit one complete tool_use block (used for held tool calls).
+    pub fn emit_tool(&mut self, id: &str, name: &str, input: &Value) -> String {
+        let mut out = String::new();
+        let i = self.open("tool_use", json!({"type": "tool_use", "id": id, "name": name, "input": {}}), &mut out);
+        out.push_str(&sse("content_block_delta", &json!({"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": input.to_string()}})));
+        self.close(&mut out);
+        self.saw_tool = true;
+        out
     }
 
     pub fn start(&self) -> String {
@@ -347,11 +372,15 @@ impl Stream {
                     let id = if self.tool_slots[idx].0.is_empty() { format!("toolu_lmdeck_{idx}") } else { self.tool_slots[idx].0.clone() };
                     self.tool_slots[idx].0 = id.clone();
                     let name = self.tool_slots[idx].1.clone();
-                    let i = self.open("tool_use", json!({"type": "tool_use", "id": id, "name": name, "input": {}}), &mut out);
-                    self.tool_block[idx] = Some(i);
+                    if self.hold_tools {
+                        self.tool_block[idx] = Some(usize::MAX);
+                    } else {
+                        let i = self.open("tool_use", json!({"type": "tool_use", "id": id, "name": name, "input": {}}), &mut out);
+                        self.tool_block[idx] = Some(i);
+                        self.saw_tool = true;
+                    }
                     self.tools_done[idx].0 = id;
                     self.tools_done[idx].1 = name;
-                    self.saw_tool = true;
                 }
                 let args = match f.get("arguments") {
                     Some(Value::String(s)) => s.clone(),
@@ -361,7 +390,9 @@ impl Stream {
                 if !args.is_empty() {
                     if let Some(i) = self.tool_block[idx] {
                         self.tools_done[idx].2.push_str(&args);
-                        out.push_str(&sse("content_block_delta", &json!({"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": args}})));
+                        if i != usize::MAX {
+                            out.push_str(&sse("content_block_delta", &json!({"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": args}})));
+                        }
                     }
                 }
             }
@@ -375,7 +406,7 @@ impl Stream {
     /// True when the backend stream ended without a finish reason or any output
     /// (it crashed or was cut off).
     pub fn failed(&self) -> bool {
-        self.stop_reason.is_none() && self.text.is_empty() && self.thinking.is_empty() && !self.saw_tool
+        self.stop_reason.is_none() && self.text.is_empty() && self.thinking.is_empty() && !self.saw_tool && self.tools_done.is_empty()
     }
 
     pub fn anthropic_stop(&self) -> &'static str {
@@ -460,6 +491,28 @@ mod tests {
         assert!(out.contains("input_json_delta"));
         assert!(out.contains("\"stop_reason\":\"tool_use\""));
         assert_eq!(s.message()["content"][1]["input"]["a"], 1);
+    }
+}
+
+#[cfg(test)]
+mod held_tool_tests {
+    use serde_json::json;
+
+    #[test]
+    fn held_tools_stream_text_but_not_tool_calls() {
+        let mut st = super::Stream::new("m");
+        st.hold_tools = true;
+        let mut out = st.feed(&json!({"choices": [{"delta": {"content": "hi"}}]}));
+        out += &st.feed(&json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "tool_group", "arguments": "{\"group\":\"rea\"}"}}]}, "finish_reason": "tool_calls"}]}));
+        assert!(out.contains("text_delta"));
+        assert!(!out.contains("tool_use"));
+        assert_eq!(st.tools_done[0].1, "tool_group");
+        let next = st.next_round();
+        assert!(next.contains("content_block_stop"));
+        assert!(st.tools_done.is_empty());
+        let t = st.emit_tool("c2", "mcp__x__y", &json!({"a": 1}));
+        assert!(t.contains("\"index\":1") && t.contains("input_json_delta"));
+        assert_eq!(st.anthropic_stop(), "tool_use");
     }
 }
 

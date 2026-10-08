@@ -871,13 +871,14 @@ async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let groups = (mode == crate::anthropic::ToolMode::Groups)
         .then(|| crate::toolgroups::Groups::sync(b.get("tools").and_then(|t| t.as_array()).map(|t| t.as_slice()).unwrap_or(&[])))
         .filter(|g| !g.is_empty());
-    if let Some(g) = &groups {
+    if let Some(g) = groups.as_ref() {
         let meta: Vec<Value> = g.meta_tools().iter().map(|t| json!({"type": "function", "function": {
             "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}})).collect();
         match body["tools"].as_array_mut() {
             Some(ts) => ts.extend(meta),
             None => body["tools"] = json!(meta),
         }
+        let g = groups.expect("checked above");
         return anthropic_groups(a, guard, body, g, stream, t0).await;
     }
     let resp = match a.mgr.http.post(format!("{}/v1/chat/completions", guard.0.base())).json(&body).send().await {
@@ -967,77 +968,133 @@ async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     r
 }
 
-/// Tool-groups mode: run the backend until the model stops asking for tool_group (answered
-/// here from the group docs), then hand the client the final message with call_tool rewritten
-/// into the real MCP tool. Responses are replayed, not streamed live.
-async fn anthropic_groups(a: App, guard: crate::backend::InFlight, mut body: Value, groups: &crate::toolgroups::Groups, stream: bool, t0: Instant) -> Resp {
-    let model_name = guard.0.name.clone();
-    let mut msg = Value::Null;
-    let (mut tin, mut tout) = (0u64, 0u64);
-    for round in 0..5 {
-        let resp = match a.mgr.http.post(format!("{}/v1/chat/completions", guard.0.base())).json(&body).send().await {
-            Ok(r) => r,
-            Err(e) => return anth_err(StatusCode::BAD_GATEWAY, "api_error", format!("backend unreachable: {e}")),
+/// Tool-groups mode. Text and thinking stream to the client as they arrive; tool calls are
+/// held until the round ends. tool_group calls are answered here from the group docs and the
+/// backend continues in the same client message; call_tool is rewritten into the real tool.
+async fn anthropic_groups(a: App, guard: crate::backend::InFlight, body: Value, groups: crate::toolgroups::Groups, stream: bool, t0: Instant) -> Resp {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let run = groups_rounds(a, guard, body, groups, t0, stream.then(|| tx.clone()));
+    if !stream {
+        drop(tx);
+        return match run.await {
+            Ok(msg) => Json(msg).into_response(),
+            Err(m) => anth_err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", m),
         };
-        if !resp.status().is_success() {
-            let t = resp.text().await.unwrap_or_default();
-            return anth_err(StatusCode::BAD_GATEWAY, "api_error", format!("backend: {t}"));
+    }
+    tokio::spawn(async move {
+        if let Err(m) = run.await {
+            let ev = crate::anthropic::sse("error", &json!({"type": "error", "error": {"type": "api_error", "message": m}}));
+            let _ = tx.send(Ok(Bytes::from(ev))).await;
         }
-        let mut st = crate::anthropic::Stream::new(&model_name);
+    });
+    let mut r = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+    r.headers_mut().insert("content-type", HeaderValue::from_static("text/event-stream"));
+    r.headers_mut().insert("cache-control", HeaderValue::from_static("no-cache"));
+    r
+}
+
+async fn groups_rounds(
+    a: App,
+    guard: crate::backend::InFlight,
+    mut body: Value,
+    groups: crate::toolgroups::Groups,
+    t0: Instant,
+    tx: Option<mpsc::Sender<Result<Bytes, std::io::Error>>>,
+) -> Result<Value, String> {
+    let model_name = guard.0.name.clone();
+    let send = |s: String| {
+        let tx = tx.clone();
+        async move {
+            if let (Some(tx), false) = (tx, s.is_empty()) {
+                let _ = tx.send(Ok(Bytes::from(s))).await;
+            }
+        }
+    };
+    let mut st = crate::anthropic::Stream::new(&model_name);
+    st.hold_tools = true;
+    send(st.start()).await;
+    let (mut tin, mut tout) = (0u64, 0u64);
+    let mut first: Option<Instant> = None;
+    let mut final_tools: Vec<Value> = Vec::new();
+    for round in 0..5 {
+        let resp = a.mgr.http.post(format!("{}/v1/chat/completions", guard.0.base())).json(&body).send().await
+            .map_err(|e| format!("backend unreachable: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("backend: {}", resp.text().await.unwrap_or_default()));
+        }
+        let text_before = st.text.len();
+        st.output_tokens = 0;
         let mut s = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         while let Some(Ok(chunk)) = s.next().await {
             buf.extend_from_slice(&chunk);
+            let mut out = String::new();
             while let Some(pos) = buf.iter().position(|&c| c == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
                 let line = String::from_utf8_lossy(&line);
                 if let Some(v) = line.trim().strip_prefix("data:").map(str::trim).filter(|d| *d != "[DONE]").and_then(|d| serde_json::from_str::<Value>(d).ok()) {
-                    st.feed(&v);
+                    out.push_str(&st.feed(&v));
                 }
+            }
+            if !out.is_empty() {
+                first.get_or_insert_with(Instant::now);
+                send(out).await;
             }
         }
         if st.failed() {
             let m = format!("local model backend failed: {}", sys::error_summary(&guard.0.log));
             sys::log(&format!("/v1/messages {model_name}: {m}"));
-            return anth_err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", m);
+            return Err(m);
         }
         tin = tin.max(st.input_tokens);
         tout += st.output_tokens;
-        msg = st.message();
-        let asks = crate::toolgroups::group_requests(&msg);
-        if asks.is_empty() || round == 4 {
-            break;
+        let tools: Vec<(String, String, String)> = st.tools_done.iter().filter(|t| !t.1.is_empty()).cloned().collect();
+        let asks: Vec<(String, String)> = tools.iter().filter(|t| t.1 == "tool_group").map(|t| {
+            let g = serde_json::from_str::<Value>(&t.2).ok().and_then(|v| v["group"].as_str().map(String::from)).unwrap_or_default();
+            (t.0.clone(), g)
+        }).collect();
+        if !asks.is_empty() && round < 4 {
+            let calls: Vec<Value> = asks.iter().map(|(id, g)| json!({"id": id, "type": "function", "function": {"name": "tool_group", "arguments": json!({"group": g}).to_string()}})).collect();
+            let text = st.text[text_before..].to_string();
+            let msgs = body["messages"].as_array_mut().ok_or("no messages")?;
+            msgs.push(json!({"role": "assistant", "content": text, "tool_calls": calls}));
+            for (id, g) in &asks {
+                msgs.push(json!({"role": "tool", "tool_call_id": id, "content": groups.segment(g)}));
+            }
+            sys::log(&format!("/v1/messages {model_name}: tool_group {}", asks.iter().map(|a| a.1.as_str()).collect::<Vec<_>>().join(", ")));
+            let s = st.next_round();
+            send(s).await;
+            continue;
         }
-        // Answer tool_group here: append the call and its markdown segment, then continue.
-        let calls: Vec<Value> = asks.iter().map(|(id, g)| json!({"id": id, "type": "function", "function": {"name": "tool_group", "arguments": json!({"group": g}).to_string()}})).collect();
-        let text = msg["content"].as_array().and_then(|c| c.iter().find(|b| b["type"] == "text")).and_then(|b| b["text"].as_str()).unwrap_or("").to_string();
-        let msgs = body["messages"].as_array_mut().expect("messages");
-        msgs.push(json!({"role": "assistant", "content": text, "tool_calls": calls}));
-        for (id, g) in &asks {
-            msgs.push(json!({"role": "tool", "tool_call_id": id, "content": groups.segment(g)}));
+        // Final round: hand the real tool calls to the client.
+        for (id, name, args) in tools.into_iter().filter(|t| t.1 != "tool_group") {
+            let mut block = json!({"type": "tool_use", "id": id, "name": name, "input": serde_json::from_str::<Value>(&args).unwrap_or_else(|_| json!({}))});
+            let mut m = json!({"content": [block.clone()]});
+            crate::toolgroups::rewrite_calls(&mut m);
+            block = m["content"][0].clone();
+            let out = st.emit_tool(block["id"].as_str().unwrap_or(""), block["name"].as_str().unwrap_or(""), &block["input"]);
+            send(out).await;
+            final_tools.push(block);
         }
-        sys::log(&format!("/v1/messages {model_name}: tool_group {}", asks.iter().map(|a| a.1.as_str()).collect::<Vec<_>>().join(", ")));
+        break;
     }
-    // A tool_group left in the final message (round limit) would be unknown to the client.
-    if let Some(c) = msg["content"].as_array_mut() {
-        c.retain(|b| !(b["type"] == "tool_use" && b["name"] == "tool_group"));
-        if !c.iter().any(|b| b["type"] == "tool_use") && msg["stop_reason"] == "tool_use" {
-            msg["stop_reason"] = json!("end_turn");
-        }
-    }
-    crate::toolgroups::rewrite_calls(&mut msg);
-    msg["usage"] = json!({"input_tokens": tin, "output_tokens": tout});
+    st.input_tokens = tin;
+    st.output_tokens = tout;
+    let stop = st.anthropic_stop();
+    send(st.finish()).await;
     drop(guard);
     let secs = t0.elapsed().as_secs_f64();
-    sys::log(&format!("/v1/messages {model_name}: {tin} in / {tout} out, stop={}, {secs:.1}s [groups]", msg["stop_reason"].as_str().unwrap_or("")));
-    USAGE.record(&model_name, tin, tout, 0.0, secs, 0.0);
-    if !stream {
-        return Json(msg).into_response();
+    sys::log(&format!("/v1/messages {model_name}: {tin} in / {tout} out, stop={stop}, {secs:.1}s [groups]"));
+    let gen_secs = first.map(|f| f.elapsed().as_secs_f64()).unwrap_or(secs);
+    let ttft = first.map(|f| f.duration_since(t0).as_secs_f64()).unwrap_or(0.0);
+    USAGE.record(&model_name, tin, tout, ttft, gen_secs, ttft);
+    let mut msg = st.message();
+    if let Some(c) = msg["content"].as_array_mut() {
+        c.retain(|b| b["type"] != "tool_use");
+        c.extend(final_tools);
     }
-    let mut r = Response::new(Body::from(crate::toolgroups::message_to_sse(&msg)));
-    r.headers_mut().insert("content-type", HeaderValue::from_static("text/event-stream"));
-    r.headers_mut().insert("cache-control", HeaderValue::from_static("no-cache"));
-    r
+    msg["stop_reason"] = json!(stop);
+    Ok(msg)
 }
 
 // ---------- OpenAI ----------
