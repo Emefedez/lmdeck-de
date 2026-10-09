@@ -58,6 +58,19 @@ pub struct RepoHit {
     pub pipeline_tag: Option<String>,
     #[serde(default)]
     pub gated: serde_json::Value,
+    /// Smallest matching variant's estimated RAM, populated by TUI discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formats: Vec<String>,
+}
+
+fn search_query(query: &str) -> &str {
+    let query = query.trim().trim_end_matches('/');
+    let query = query.strip_prefix("https://huggingface.co/")
+        .or_else(|| query.strip_prefix("https://hf.co/"))
+        .or_else(|| query.strip_prefix("hf.co/")).unwrap_or(query);
+    query.split("/tree/").next().unwrap_or(query).split(':').next().unwrap_or(query)
 }
 
 /// kind: "mlx" | "gguf"
@@ -68,12 +81,7 @@ pub async fn search(c: &reqwest::Client, query: &str, kind: &str, limit: usize) 
 pub async fn search_sorted(c: &reqwest::Client, query: &str, kind: &str, limit: usize, sort: &str) -> Result<Vec<RepoHit>> {
     if !matches!(kind, "mlx" | "gguf") { bail!("kind must be mlx or gguf"); }
     if !matches!(sort, "relevance" | "downloads" | "likes" | "lastModified") { bail!("invalid search sort"); }
-    let query = query.trim().trim_end_matches('/');
-    let query = query.strip_prefix("https://huggingface.co/")
-        .or_else(|| query.strip_prefix("https://hf.co/"))
-        .or_else(|| query.strip_prefix("hf.co/")).unwrap_or(query);
-    let query = query.split("/tree/").next().unwrap_or(query);
-    let query = query.split(':').next().unwrap_or(query);
+    let query = search_query(query);
     let limit = limit.clamp(1, 100);
     // Search each word against the Hub's substring index, then require all words
     // locally. This finds "qwen 4b" in names such as "Qwen3-4B-4bit".
@@ -103,6 +111,46 @@ pub async fn search_sorted(c: &reqwest::Client, query: &str, kind: &str, limit: 
     rank_hits(&mut hits, query, sort);
     hits.truncate(limit);
     Ok(hits)
+}
+
+/// Search supported formats, then check actual variants rather than trusting repo tags.
+/// Unreadable repos are counted so discovery can report incomplete results.
+pub async fn search_discover(c: &reqwest::Client, cfg: &Config, query: &str, kind: &str, budget: Option<u64>, sort: &str) -> Result<(Vec<RepoHit>, usize)> {
+    let mut hits = if kind == "both" {
+        let (mut mlx, gguf) = tokio::try_join!(
+            search_sorted(c, query, "mlx", 100, sort),
+            search_sorted(c, query, "gguf", 100, sort)
+        )?;
+        mlx.extend(gguf);
+        mlx
+    } else {
+        search_sorted(c, query, kind, 100, sort).await?
+    };
+    // Each source is already ranked, including normalized repo URLs. Merge without
+    // applying the raw query again, which would discard pasted URLs.
+    rank_hits(&mut hits, search_query(query), sort);
+    let checked = futures_util::stream::iter(hits.into_iter().map(|mut hit| async move {
+        let files = repo_files(c, &hit.id, "main").await?;
+        let variants = discovery_choices(cfg, &hit.id, &files, kind, budget);
+        for variant in &variants {
+            if !hit.formats.iter().any(|format| format == variant.format) {
+                hit.formats.push(variant.format.into());
+            }
+        }
+        hit.estimated_bytes = variants.iter().map(|v| crate::compat::estimated_memory(cfg, v.size, v.format)).min();
+        Ok::<_, anyhow::Error>(hit.estimated_bytes.map(|_| hit))
+    })).buffered(8).collect::<Vec<_>>().await;
+    let mut unreadable = 0;
+    let mut hits = Vec::new();
+    for result in checked {
+        match result {
+            Ok(Some(hit)) => hits.push(hit),
+            Ok(None) => {},
+            Err(_) => unreadable += 1,
+        }
+    }
+    hits.truncate(60);
+    Ok((hits, unreadable))
 }
 
 fn matches_search_word(id: &str, word: &str) -> bool {
@@ -249,6 +297,14 @@ pub fn choices(repo: &str, files: &[RepoFile], default_quant: &str) -> Vec<Choic
         out.push(Choice { spec: format!("{repo}:{q}"), label: format!("GGUF {q}"), size, format: "gguf", default });
     }
     out
+}
+
+/// Apply discovery filters to individual downloadable variants.
+pub fn discovery_choices(cfg: &Config, repo: &str, files: &[RepoFile], kind: &str, budget: Option<u64>) -> Vec<Choice> {
+    choices(repo, files, &cfg.download.gguf_default_quant).into_iter()
+        .filter(|v| kind == "both" || v.format == kind)
+        .filter(|v| v.size > 0 && budget.is_none_or(|b| crate::compat::estimated_memory(cfg, v.size, v.format) <= b))
+        .collect()
 }
 
 // ---------- pull planning ----------
@@ -773,6 +829,39 @@ mod tests {
         assert_eq!(hits[0].id, "b/Qwen3-4B");
         rank_hits(&mut hits, "Qwen3-4B", "downloads");
         assert_eq!(hits[0].downloads, 100);
+    }
+
+    #[test]
+    fn discovery_filters_mixed_repo_by_format_and_variant_ram() {
+        let cfg = Config::default();
+        let file = |path: &str, size| RepoFile { path: path.into(), size, sha256: None, blob: String::new() };
+        let files = vec![file("config.json", 128), file("model.safetensors", 4 << 30),
+            file("model-Q4_K_M-00001-of-00002.gguf", 1 << 30),
+            file("model-Q4_K_M-00002-of-00002.gguf", 1 << 30),
+            file("model-Q8_0.gguf", 6 << 30), file("mmproj-f16.gguf", 512 << 20)];
+        let mlx = discovery_choices(&cfg, "org/mixed", &files, "mlx", None);
+        assert_eq!(mlx.len(), 1);
+        assert_eq!(mlx[0].format, "mlx");
+        let gguf = discovery_choices(&cfg, "org/mixed", &files, "gguf", None);
+        assert_eq!(gguf.len(), 2);
+        assert!(gguf.iter().all(|v| v.format == "gguf"));
+        assert_eq!(gguf[0].size, 2 << 30); // All weight shards, without the projector.
+        assert_eq!(discovery_choices(&cfg, "org/mixed", &files, "both", None).len(), 3);
+        let budget = crate::compat::estimated_memory(&cfg, 2 << 30, "gguf");
+        let fits = discovery_choices(&cfg, "org/mixed", &files, "both", Some(budget));
+        assert_eq!(fits.len(), 1);
+        assert!(fits[0].spec.ends_with(":Q4_K_M"));
+        assert!(discovery_choices(&cfg, "org/mixed", &files, "both", Some(budget - 1)).is_empty());
+        assert!(discovery_choices(&cfg, "org/no-weights", &[file("README.md", 100)], "both", None).is_empty());
+    }
+
+    #[test]
+    fn discovery_normalizes_repo_urls_before_merging_formats() {
+        for query in ["https://huggingface.co/org/model/tree/main", "https://hf.co/org/model/", "org/model:Q4_K_M"] {
+            let mut hits = vec![RepoHit { id: "org/model".into(), ..Default::default() }; 2];
+            rank_hits(&mut hits, search_query(query), "relevance");
+            assert_eq!(hits.len(), 1);
+        }
     }
 
     #[tokio::test]

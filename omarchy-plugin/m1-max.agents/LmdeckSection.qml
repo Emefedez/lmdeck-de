@@ -346,8 +346,14 @@ Column {
     SettingRow {
       label: "Quantization"
       key: "mlx.kv_bits"
-      info: "Precision of the attention cache (the model's memory of the conversation), not of the weights. f16: exact, biggest. 8-bit: about half the memory, practically no quality loss. 4-bit: about a quarter, faster on long chats but can drift on long or precise tasks (code, numbers). Weights keep their own quant (the 4bit in the model name)."
+      info: "Precision of the attention cache (the model's memory of the conversation), not of the weights. Measured on Qwen3.8-27B (hybrid, so the cache is small): f16 is the fastest. 8-bit saves ~40% of the cache (0.4 GiB at 12k tokens) and keeps the same answers, but generates 10-15% slower. 4-bit saves ~60% but answers drift within a few dozen tokens, and on the Omarchy package runtime (0.7.28) it computes wrong results, so lmdeck falls back to f16 there. Worth it only when memory, not speed, is the limit. Weights keep their own quant (the 4bit in the model name)."
       options: [{ value: "0", label: "f16" }, { value: "8", label: "8-bit" }, { value: "4", label: "4-bit" }]
+    }
+    SettingRow {
+      label: "Decode attention"
+      key: "mlx.decode_attention"
+      info: "How each new token attends to the conversation once it is longer than ~1k tokens. composed: two matrix multiplies and a softmax, much faster on omarchy-mlx's GPU backend (Qwen3.8-27B at 12k context: 4.8 -> 8.5 tok/s, 4k: 9.3 -> 11.3) with the same results up to rounding. fused: the backend's own attention kernel. Prompt reading always uses the fused kernel. Reload the model to apply."
+      options: [{ value: "composed", label: "composed" }, { value: "fused", label: "fused" }]
     }
     SettingRow {
       label: "Window"

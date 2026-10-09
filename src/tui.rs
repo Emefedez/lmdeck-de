@@ -49,7 +49,7 @@ enum Msg {
     Tick,
     Status(Option<Value>),
     Versions(Box<Versions>),
-    Search(u64, Result<Vec<RepoHit>, String>),
+    Search(u64, Result<(Vec<RepoHit>, usize), String>),
     Repo(String, Result<Vec<RepoFile>, String>),
     Toast(String),
     Models,
@@ -67,6 +67,17 @@ enum Action {
     Exec(String, Vec<String>),
 }
 
+fn parse_search_budget(text: &str) -> Result<Option<u64>, String> {
+    let text = text.trim();
+    if text.is_empty() { return Ok(None); }
+    let gib = text.parse::<f64>().map_err(|_| "Enter a positive RAM budget in GiB, or leave empty for unlimited".to_string())?;
+    let bytes = gib * (1u64 << 30) as f64;
+    if !gib.is_finite() || bytes < 1.0 || bytes >= u64::MAX as f64 {
+        return Err("RAM budget must be a finite positive number in GiB".into());
+    }
+    Ok(Some(bytes as u64))
+}
+
 fn fmt_gib(b: u64) -> String {
     format!("{:.1} GiB", crate::backend::gib(b))
 }
@@ -74,6 +85,7 @@ fn fmt_gib(b: u64) -> String {
 enum Input {
     None,
     Search,
+    SearchBudget,
     Downloads(Vec<String>, usize),
     Setting(usize),
     Confirm(String, Confirmed),
@@ -110,7 +122,8 @@ struct Ui {
     models: Vec<LocalModel>,
     models_sel: TableState,
     query: String,
-    kind_gguf: bool,
+    search_kind: usize,
+    search_budget: Option<u64>,
     catalog_mode: bool,
     catalog: Vec<Value>,
     hits: Vec<RepoHit>,
@@ -118,6 +131,7 @@ struct Ui {
     searching: bool,
     search_generation: u64,
     search_sort: usize,
+    search_task: Option<tokio::task::JoinHandle<()>>,
     repo: Option<RepoView>,
     settings_sel: TableState,
     input: Input,
@@ -259,13 +273,15 @@ impl Ui {
             versions: Versions::default(),
             models_sel: TableState::default().with_selected(Some(0)),
             query: String::new(),
-            kind_gguf: false,
+            search_kind: 0,
+            search_budget: None,
             catalog_mode: true,
             hits: vec![],
             hits_sel: TableState::default().with_selected(Some(0)),
             searching: false,
-        search_generation: 0,
-        search_sort: 0,
+            search_generation: 0,
+            search_sort: 0,
+            search_task: None,
             repo: None,
             settings_sel: TableState::default().with_selected(Some(0)),
             input: Input::None,
@@ -388,9 +404,10 @@ impl Ui {
                 if generation != self.search_generation { return None; }
                 self.searching = false;
                 match r {
-                    Ok(h) => {
+                    Ok((h, unreadable)) => {
                         self.hits = h;
                         self.hits_sel.select(Some(0));
+                        if unreadable > 0 { self.toast(format!("{unreadable} repos could not be checked and were excluded")); }
                     }
                     Err(e) => { self.hits.clear(); self.toast(format!("search failed: {e}")); },
                 }
@@ -660,6 +677,20 @@ impl Ui {
                         self.query = text;
                         self.catalog_mode = false;
                         self.search();
+                    }
+                    Input::SearchBudget => {
+                        match parse_search_budget(&text) {
+                            Ok(budget) => {
+                                self.search_budget = budget;
+                                self.catalog_mode = false;
+                                self.search();
+                            }
+                            Err(e) => {
+                                self.buf = text;
+                                self.input = Input::SearchBudget;
+                                self.toast(e);
+                            }
+                        }
                     }
                     Input::Setting(i) => {
                         let key = SETTINGS[i].1;
@@ -1098,19 +1129,28 @@ impl Ui {
         self.set_device(name, dev.into(), true);
     }
 
+    fn search_kind(&self) -> &'static str {
+        ["mlx", "gguf", "both"][self.search_kind]
+    }
+
     fn search(&mut self) {
+        if let Some(task) = self.search_task.take() { task.abort(); }
         let q = self.query.clone();
-        let kind = if self.kind_gguf { "gguf" } else { "mlx" };
+        let kind = self.search_kind();
+        let budget = self.search_budget;
+        let cfg = self.cfg.clone();
         let tx = self.tx.clone();
         self.searching = true;
         self.search_generation += 1;
         let generation = self.search_generation;
         let sort = ["relevance", "downloads", "likes", "lastModified"][self.search_sort];
         self.repo = None;
-        tokio::spawn(async move {
-            let r = hf::search_sorted(&hf::client(), &q, kind, 60, sort).await.map_err(|e| e.to_string());
+        self.hits.clear();
+        self.hits_sel.select(Some(0));
+        self.search_task = Some(tokio::spawn(async move {
+            let r = hf::search_discover(&hf::client(), &cfg, &q, kind, budget, sort).await.map_err(|e| e.to_string());
             let _ = tx.send(Msg::Search(generation, r));
-        });
+        }));
     }
 
     fn open_repo(&mut self, repo: String) {
@@ -1132,7 +1172,11 @@ impl Ui {
     fn repo_choices(&self) -> Vec<(String, String, u64)> {
         let Some(rv) = &self.repo else { return vec![] };
         let Some(files) = &rv.files else { return vec![] };
-        let choices = hf::choices(&rv.repo, files, &self.cfg.download.gguf_default_quant);
+        let choices = if self.catalog_mode {
+            hf::choices(&rv.repo, files, &self.cfg.download.gguf_default_quant)
+        } else {
+            hf::discovery_choices(&self.cfg, &rv.repo, files, self.search_kind(), self.search_budget)
+        };
         let advice: Vec<_> = choices.iter().map(|c| crate::compat::hardware_advice(&self.cfg, c.size, c.format)).collect();
         let recommended = crate::compat::recommended_choice(&choices, &advice);
         let recommended = recommended.filter(|&i| choices[i].format != "mlx" || crate::compat::assess_mlx(&self.cfg, &rv.repo, None).level != "unlikely");
@@ -1179,9 +1223,13 @@ impl Ui {
                 self.input = Input::Search;
             }
             KeyCode::Char('g') => {
-                self.kind_gguf = !self.kind_gguf;
+                self.search_kind = (self.search_kind + 1) % 3;
                 self.catalog_mode = false;
                 self.search();
+            }
+            KeyCode::Char('m') => {
+                self.buf = self.search_budget.map(|b| format!("{}", crate::backend::gib(b))).unwrap_or_default();
+                self.input = Input::SearchBudget;
             }
             KeyCode::Char('o') => {
                 self.search_sort = (self.search_sort + 1) % 4;
@@ -1338,7 +1386,7 @@ impl Ui {
                 if self.repo.is_some() {
                     "⏎ download · a recommended alternative · x cancel download · esc back"
                 } else {
-                    "/ search · g MLX⇄GGUF · o sort · c catalog⇄search · ⏎ open · x cancel download"
+                    "/ search · g MLX/GGUF/Both · m RAM budget · o sort · c catalog⇄search · ⏎ open · x cancel download"
                 }
             }
             Tab::Settings => "⏎ edit · o open config in $EDITOR",
@@ -1512,7 +1560,8 @@ impl Ui {
             Input::Update | Input::Runtime | Input::RuntimeKeep(_) | Input::Guide | Input::Free(..) => unreachable!(),
             Input::None => return,
             Input::Downloads(..) => unreachable!(),
-            Input::Search => (format!("Search Hugging Face ({})", if self.kind_gguf { "GGUF" } else { "MLX" }), format!("{}▏", self.buf)),
+            Input::Search => (format!("Search Hugging Face ({})", self.search_kind().to_uppercase()), format!("{}▏", self.buf)),
+            Input::SearchBudget => ("Maximum estimated RAM in GiB (empty = unlimited)".into(), format!("{}▏", self.buf)),
             Input::Setting(i) => (format!("{} — {}", SETTINGS[*i].1, SETTINGS[*i].2), format!("{}▏", self.buf)),
             Input::Override(n) => (format!("Context size for {n} (empty = default)"), format!("{}▏", self.buf)),
             Input::Confirm(q, _) => ("Confirm".into(), q.clone()),
@@ -1871,7 +1920,7 @@ impl Ui {
     }
 
     fn draw_discover(&mut self, f: &mut Frame, area: Rect) {
-        let buttons = [("Search [/]", KeyCode::Char('/')), ("MLX / GGUF [g]", KeyCode::Char('g')), ("Catalog / HF [c]", KeyCode::Char('c')), ("Open [Enter]", KeyCode::Enter), ("Sort [o]", KeyCode::Char('o')), ("Cancel download [x]", KeyCode::Char('x'))];
+        let buttons = [("Search [/]", KeyCode::Char('/')), ("MLX / GGUF / Both [g]", KeyCode::Char('g')), ("RAM budget [m]", KeyCode::Char('m')), ("Catalog / HF [c]", KeyCode::Char('c')), ("Open [Enter]", KeyCode::Enter), ("Sort [o]", KeyCode::Char('o')), ("Cancel download [x]", KeyCode::Char('x'))];
         let height = button_height(area.width.saturating_sub(2), &buttons);
         let [actions, area] = Layout::vertical([Constraint::Length(height + 1), Constraint::Min(0)]).areas(area);
         self.draw_buttons(f, actions.inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 }), &buttons);
@@ -1906,7 +1955,7 @@ impl Ui {
                 .hits
                 .iter()
                 .map(|h| {
-                    let v = (!self.kind_gguf).then(|| crate::compat::assess_mlx(&self.cfg, &h.id, None));
+                    let v = h.formats.iter().any(|format| format == "mlx").then(|| crate::compat::assess_mlx(&self.cfg, &h.id, None));
                     let (mk, color) = match v.as_ref().map(|v| v.level) {
                         Some("unlikely") => ("✗ ", Color::Red),
                         Some("untested") => ("? ", Color::Yellow),
@@ -1915,6 +1964,8 @@ impl Ui {
                     };
                     Row::new(vec![
                         Cell::from(Line::from(vec![Span::styled(mk, Style::new().fg(color)), Span::raw(h.id.clone())])),
+                        Cell::from(h.formats.join("/").to_uppercase()),
+                        Cell::from(h.estimated_bytes.map(fmt_gib).unwrap_or_else(|| "—".into())),
                         Cell::from(compact(h.downloads)),
                         Cell::from(compact(h.likes)),
                         Cell::from(h.last_modified.get(..10).unwrap_or("").to_string()).fg(Color::DarkGray),
@@ -1923,12 +1974,12 @@ impl Ui {
                 .collect();
             let title = format!(
                 "Hugging Face · {} · \"{}\"{}",
-                if self.kind_gguf { "GGUF" } else { "MLX" },
+                self.search_kind().to_uppercase(),
                 self.query,
-                format!(" · {}{}", ["relevance", "downloads", "likes", "updated"][self.search_sort], if self.searching { " · searching…" } else { "" })
+                format!(" · RAM {} · {}{}", self.search_budget.map(|b| format!("≤{}", fmt_gib(b))).unwrap_or_else(|| "unlimited".into()), ["relevance", "downloads", "likes", "updated"][self.search_sort], if self.searching { " · checking variants…" } else { "" })
             );
-            let t = Table::new(rows, [Constraint::Min(30), Constraint::Length(7), Constraint::Length(6), Constraint::Length(10)])
-                .header(Row::new(["Repo", "⬇", "♥", "Updated"]).style(Style::new().fg(Color::DarkGray)))
+            let t = Table::new(rows, [Constraint::Min(20), Constraint::Length(8), Constraint::Length(10), Constraint::Length(7), Constraint::Length(6), Constraint::Length(10)])
+                .header(Row::new(["Repo", "Format", "Est. RAM", "⬇", "♥", "Updated"]).style(Style::new().fg(Color::DarkGray)))
                 .row_highlight_style(Style::new().bg(Color::DarkGray).bold())
                 .block(panel(&title));
             f.render_stateful_widget(t, list, &mut self.hits_sel);
@@ -1951,7 +2002,8 @@ impl Ui {
         match &mut self.repo {
             None => {
                 let mut l = vec![
-                    Line::from("Press / to search, ⏎ to open a repo."),
+                    Line::from("/ search · g MLX/GGUF/Both · m RAM budget · ⏎ open"),
+                    Line::from("RAM is estimated for the configured context. Unreadable repos are excluded. Search checks up to 100 repos per format."),
                     Line::raw(""),
                     Line::from(vec![Span::styled("MLX ", Style::new().fg(Color::Magenta).bold()), Span::raw("runs on the Apple GPU via omarchy-mlx (mlx_lm.server).")]),
                     Line::from(vec![Span::styled("GGUF ", Style::new().fg(Color::Blue).bold()), Span::raw("runs via llama.cpp Vulkan on Honeykrisp.")]),
@@ -2285,14 +2337,77 @@ mod tests {
     }
 
     #[test]
+    fn search_budget_accepts_decimal_gib_and_rejects_invalid_values() {
+        assert_eq!(parse_search_budget(" 8.5 ").unwrap(), Some((8 << 30) + (1 << 29)));
+        assert_eq!(parse_search_budget(" ").unwrap(), None);
+        for value in ["0", "-2", "NaN", "inf", "1e50", "nonsense"] {
+            assert!(parse_search_budget(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_controls_cycle_all_formats_and_apply_budget() {
+        let mut ui = ui();
+        ui.tab = Tab::Discover;
+        for kind in ["gguf", "both", "mlx"] {
+            ui.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+            assert_eq!(ui.search_kind(), kind);
+            assert!(!ui.catalog_mode);
+        }
+        ui.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(matches!(ui.input, Input::SearchBudget));
+        ui.buf = "bad".into();
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(ui.input, Input::SearchBudget));
+        ui.buf = "8.5".into();
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(ui.search_budget, Some((8 << 30) + (1 << 29)));
+        assert!(matches!(ui.input, Input::None));
+        for (w, h) in [(60, 20), (80, 24), (120, 36)] { draw(&mut ui, w, h); }
+        ui.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        ui.buf.clear();
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(ui.search_budget, None);
+        ui.search_task.take().unwrap().abort();
+    }
+
+    #[test]
+    fn opened_repo_obeys_format_and_budget_filters() {
+        let mut ui = ui();
+        ui.tab = Tab::Discover;
+        ui.catalog_mode = false;
+        let file = |path: &str, size| RepoFile { path: path.into(), size, sha256: None, blob: String::new() };
+        ui.repo = Some(RepoView {
+            repo: "org/mixed".into(),
+            files: Some(vec![file("config.json", 128), file("model.safetensors", 4 << 30),
+                file("model-Q4_K_M.gguf", 2 << 30), file("model-Q8_0.gguf", 6 << 30)]),
+            err: None, sel: TableState::default().with_selected(Some(0)),
+        });
+        let mlx = ui.repo_choices();
+        assert_eq!(mlx.len(), 1);
+        assert_eq!(mlx[0].0, "org/mixed");
+        ui.search_kind = 1;
+        assert!(ui.repo_choices().iter().all(|v| v.0.contains(':')));
+        ui.search_kind = 2;
+        assert_eq!(ui.repo_choices().len(), 3);
+        ui.search_budget = Some(crate::compat::estimated_memory(&ui.cfg, 2 << 30, "gguf"));
+        let fits = ui.repo_choices();
+        assert_eq!(fits.len(), 1);
+        assert!(fits[0].0.ends_with(":Q4_K_M"));
+        let text = draw(&mut ui, 120, 36);
+        assert!(text.contains("Q4_K_M"));
+        assert!(!text.contains("Q8_0"));
+    }
+
+    #[test]
     fn stale_search_cannot_replace_newer_results() {
         let mut ui = ui();
         ui.search_generation = 2;
         ui.searching = true;
-        ui.handle(Msg::Search(1, Ok(vec![RepoHit { id: "org/old".into(), ..Default::default() }])));
+        ui.handle(Msg::Search(1, Ok((vec![RepoHit { id: "org/old".into(), ..Default::default() }], 0))));
         assert!(ui.hits.is_empty());
         assert!(ui.searching);
-        ui.handle(Msg::Search(2, Ok(vec![RepoHit { id: "org/new".into(), ..Default::default() }])));
+        ui.handle(Msg::Search(2, Ok((vec![RepoHit { id: "org/new".into(), ..Default::default() }], 0))));
         assert_eq!(ui.hits[0].id, "org/new");
         assert!(!ui.searching);
     }

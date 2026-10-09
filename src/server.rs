@@ -1257,6 +1257,7 @@ fn status_value(a: &App) -> Value {
         "mlx.max_kv_size",
         "mlx.fast_path",
         "mlx.prefix_checkpoints",
+        "mlx.decode_attention",
         "server.local_tools",
         "server.local_prompt",
         "server.mem_check",

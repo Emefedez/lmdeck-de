@@ -94,6 +94,9 @@ pub struct MlxCfg {
     /// Save a prompt-cache checkpoint at the start of each answer so the next turn reuses the
     /// conversation even on hybrid models whose cache can't be rewound (fast path only).
     pub prefix_checkpoints: bool,
+    /// Single-token decode over >= 1k tokens of context: "composed" (two matmuls + softmax,
+    /// 1.2-1.8x faster on omarchy-mlx) or "fused" (the backend's SDPA kernel).
+    pub decode_attention: String,
     /// mlx_lm prompt (KV) cache entries kept between requests; 0 disables reuse.
     pub prompt_cache_size: u32,
     /// Cap on prompt cache memory in GiB (0 = auto: a quarter of the GPU heap).
@@ -254,6 +257,7 @@ impl Default for MlxCfg {
             command: vec!["mlx-omarchy".into(), "-m".into(), "mlx_lm.server".into()],
             fast_path: true,
             prefix_checkpoints: true,
+            decode_attention: "composed".into(),
             batching: false,
             prompt_cache_size: 10,
             prompt_cache_gib: 0.0,
@@ -440,6 +444,7 @@ pub const SETTINGS: &[(&str, &str, &str)] = &[
     ("KV cache · GGUF", "llama.cache_reuse", "GGUF: reuse cached prompt chunks ≥ N tokens (0 = off)"),
     ("MLX backend", "mlx.command", "Command that starts the MLX server"),
     ("MLX backend", "mlx.fast_path", "Patch out mlx_lm.server's per-token GPU sync (~2x decode)"),
+    ("MLX backend", "mlx.decode_attention", "Decode attention over long contexts: composed (faster on omarchy-mlx: 4.8 -> 8.5 tok/s at 12k on a 27B) / fused"),
     ("MLX backend", "mlx.prefix_checkpoints", "Reuse the conversation between turns on hybrid models (agent follow-ups ~99 s -> ~13 s)"),
     ("MLX backend", "mlx.batching", "Batched generator: only for concurrent requests (slower per stream)"),
     ("MLX backend", "mlx.extra_args", "Extra mlx_lm.server args"),
@@ -500,6 +505,7 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "mlx.command" => c.mlx.command.join(" "),
         "mlx.fast_path" => c.mlx.fast_path.to_string(),
         "mlx.prefix_checkpoints" => c.mlx.prefix_checkpoints.to_string(),
+        "mlx.decode_attention" => c.mlx.decode_attention.clone(),
         "mlx.batching" => c.mlx.batching.to_string(),
         "mlx.prompt_cache_size" => c.mlx.prompt_cache_size.to_string(),
         "mlx.prompt_cache_gib" => c.mlx.prompt_cache_gib.to_string(),
@@ -575,6 +581,10 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "mlx.command" => c.mlx.command = words(v),
         "mlx.fast_path" => c.mlx.fast_path = boolean(v)?,
         "mlx.prefix_checkpoints" => c.mlx.prefix_checkpoints = boolean(v)?,
+        "mlx.decode_attention" => match v {
+            "composed" | "fused" => c.mlx.decode_attention = v.into(),
+            _ => return Err("composed or fused".into()),
+        },
         "mlx.batching" => c.mlx.batching = boolean(v)?,
         "mlx.prompt_cache_size" => c.mlx.prompt_cache_size = num(v)? as u32,
         "mlx.prompt_cache_gib" => c.mlx.prompt_cache_gib = v.parse().map_err(|_| "not a number".to_string())?,

@@ -115,20 +115,117 @@ def enable_cpu_mode():
     print("lmdeck: running on the CPU (discouraged: much slower than the Apple GPU)", file=sys.stderr, flush=True)
 
 
+def folded_quantized_sdpa(queries, q_keys, q_values, scale, mask, group_size=64, bits=8):
+    """Quantized SDPA with the GQA repeat folded into the query rows.
+
+    mlx_lm expands keys/values to 5-D and lets quantized_matmul broadcast them over
+    the repeat axis; omarchy-mlx's kernel only takes 2-D/3-D weights (and a
+    materialized broadcast would copy the cache once per repeat). Every group of
+    n_repeats*L query rows uses the same keys, so fold them into the row count.
+    """
+    import mlx.core as mx
+
+    B, n_q_heads, L, D = queries.shape
+    n_kv_heads = q_keys[0].shape[-3]
+    S = q_keys[0].shape[-2]
+    R = n_q_heads // n_kv_heads
+    q = (queries * scale).reshape(B * n_kv_heads, R * L, D)
+    k = tuple(t.reshape(B * n_kv_heads, S, t.shape[-1]) for t in q_keys)
+    v = tuple(t.reshape(B * n_kv_heads, S, t.shape[-1]) for t in q_values)
+    scores = mx.quantized_matmul(q, *k, transpose=True, group_size=group_size, bits=bits)
+    scores = scores.reshape(B, n_kv_heads, R, L, S)
+    if mask is not None:
+        if isinstance(mask, str):
+            mask = mx.arange(S - L, S)[:, None] >= mx.arange(S)[None]
+        if mask.ndim == 4:  # [B|1, H|1, L, S]: broadcast over the repeat axis
+            mask = mx.expand_dims(mask, 2) if mask.shape[1] == 1 else mask.reshape(mask.shape[0], n_kv_heads, R, L, S)
+        if mask.dtype == mx.bool_:
+            scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+        else:
+            scores = scores + mask
+    scores = mx.softmax(scores, axis=-1, precise=True)
+    out = mx.quantized_matmul(
+        scores.reshape(B * n_kv_heads, R * L, S), *v, transpose=False, group_size=group_size, bits=bits
+    )
+    return out.reshape(B, n_q_heads, L, D)
+
+
+# Decode attention: omarchy-mlx's fused SDPA kernel streams only ~5 GB/s of KV when one query
+# token attends a long context (measured on M1 Max: 8.4 ms at 12k tokens for 24 query / 4 KV
+# heads of 256), so generation slowed from 12 to 4.8 tok/s between 1k and 12k of context on
+# Qwen3.8-27B. Two matmuls + softmax with the GQA repeat folded into the rows take 2.3 ms for
+# the same work. Prompt chunks (L > 1) keep the fused kernel, which is as fast there.
+DECODE_COMPOSED_MIN_KV = 1024
+
+
+def composed_decode_sdpa(queries, keys, values, scale):
+    import mlx.core as mx
+
+    B, n_q_heads, L, D = queries.shape
+    n_kv_heads, S = keys.shape[1], keys.shape[2]
+    R = n_q_heads // n_kv_heads
+    q = (queries * scale).reshape(B * n_kv_heads, R * L, D)
+    scores = q @ keys.reshape(B * n_kv_heads, S, D).swapaxes(-1, -2)
+    probs = mx.softmax(scores.astype(mx.float32), axis=-1).astype(queries.dtype)
+    return (probs @ values.reshape(B * n_kv_heads, S, values.shape[-1])).reshape(B, n_q_heads, L, values.shape[-1])
+
+
+def install_decode_attention():
+    """Route single-token decode over a long context through composed_decode_sdpa."""
+    if os.environ.get("LMDECK_MLX_DECODE_ATTN", "composed") != "composed":
+        return False
+    try:
+        import mlx_lm.models.base as base
+    except Exception:
+        return False
+    stock = base.scaled_dot_product_attention
+
+    def scaled_dot_product_attention(queries, keys, values, cache, scale, mask, sinks=None):
+        if (
+            sinks is None
+            and not hasattr(cache, "bits")
+            and queries.ndim == 4
+            and queries.shape[2] == 1
+            and keys.shape[2] >= DECODE_COMPOSED_MIN_KV
+            and (mask is None or isinstance(mask, str))
+            and queries.shape[1] % keys.shape[1] == 0
+        ):
+            return composed_decode_sdpa(queries, keys, values, scale)
+        return stock(queries, keys, values, cache, scale=scale, mask=mask, sinks=sinks)
+
+    base.scaled_dot_product_attention = scaled_dot_product_attention
+    # Model modules import the function by name; repoint the ones already loaded.
+    for name, module in list(sys.modules.items()):
+        if name.startswith("mlx_lm.models.") and getattr(module, "scaled_dot_product_attention", None) is stock:
+            module.scaled_dot_product_attention = scaled_dot_product_attention
+    return True
+
+
 def kv_quant_probe(bits, group):
-    """True if quantized KV attention runs on this runtime, else the error text."""
+    """True if quantized KV attention runs on this runtime and matches the f16
+    reference, else the reason. Checks numbers, not just "it ran": 4-bit on
+    omarchy-mlx 0.7.28 runs but returns wrong results."""
     try:
         import mlx.core as mx
-        from mlx_lm.models.base import quantized_scaled_dot_product_attention
         from mlx_lm.models.cache import QuantizedKVCache
 
+        mx.random.seed(0)
         cache = QuantizedKVCache(group_size=group, bits=bits)
-        k = mx.random.normal((1, 2, 4, 64)).astype(mx.bfloat16)
-        qk, qv = cache.update_and_fetch(k, k)
-        q = mx.random.normal((1, 8, 1, 64)).astype(mx.bfloat16)
-        out = quantized_scaled_dot_product_attention(q, qk, qv, scale=0.125, mask=None, group_size=group, bits=bits)
-        mx.eval(out)
-        return True
+        k = mx.random.normal((1, 2, 300, 128)).astype(mx.bfloat16)
+        v = mx.random.normal((1, 2, 300, 128)).astype(mx.bfloat16)
+        qk, qv = cache.update_and_fetch(k, v)
+        q = mx.random.normal((1, 8, 5, 128)).astype(mx.bfloat16)
+        scale = 128**-0.5
+        got = folded_quantized_sdpa(q, qk, qv, scale, "causal", group, bits)
+        ref = mx.fast.scaled_dot_product_attention(
+            q,
+            mx.dequantize(*qk, group_size=group, bits=bits),
+            mx.dequantize(*qv, group_size=group, bits=bits),
+            scale=scale,
+            mask="causal",
+        )
+        err = float(mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max())
+        return True if err < 0.05 else f"wrong results on this runtime (max error {err:.3f})"
     except Exception as e:  # noqa: BLE001 - any failure means "not supported here"
         return str(e).splitlines()[0][:200]
 
@@ -142,6 +239,12 @@ def install_kv_options(mod):
     max_kv = int(os.environ.get("LMDECK_MLX_MAX_KV", "0") or 0)
     notes = []
     if bits:
+        try:
+            import mlx_lm.models.base as _base
+
+            _base.quantized_scaled_dot_product_attention = folded_quantized_sdpa
+        except Exception:
+            pass
         ok = kv_quant_probe(bits, group)
         if ok is True:
             notes.append(f"KV {bits}-bit (group {group}, from token {start})")
@@ -365,6 +468,8 @@ def main():
     if not batching and rg is not None and hasattr(rg, "_is_batchable"):
         rg._is_batchable = lambda self, args: False
     kv = install_kv_options(mod)
+    if install_decode_attention():
+        kv += ", composed decode attention"
     print(
         f"lmdeck: mlx_lm.server fast path active (no per-token logprob sync, batching {'on' if batching else 'off'}, {kv}"
         f"{', prefix checkpoints' if checkpoint else ''})",

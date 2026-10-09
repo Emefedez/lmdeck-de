@@ -345,6 +345,14 @@ pub struct HardwareAdvice {
     pub advice: String,
 }
 
+/// Download-time RAM estimate used by both discovery filters and hardware advice.
+pub fn estimated_memory(cfg: &Config, weights: u64, format: &str) -> u64 {
+    let context = if format == "mlx" {
+        if cfg.mlx.max_kv_size > 0 { cfg.mlx.max_context.min(cfg.mlx.max_kv_size) } else { cfg.mlx.max_context }
+    } else { cfg.llama.ctx_size } as u64;
+    gpu_need(weights, context)
+}
+
 pub fn hardware_advice(cfg: &Config, weights: u64, format: &str) -> HardwareAdvice {
     // Reuse one snapshot across all variants in a render/search response.
     // Scanning /proc once per row would make large result lists expensive.
@@ -368,7 +376,7 @@ fn hardware_advice_for(cfg: &Config, weights: u64, format: &str, total: u64, ava
     let context = if format == "mlx" {
         if cfg.mlx.max_kv_size > 0 { cfg.mlx.max_context.min(cfg.mlx.max_kv_size) } else { cfg.mlx.max_context }
     } else { cfg.llama.ctx_size } as u64;
-    let need = gpu_need(weights, context);
+    let need = estimated_memory(cfg, weights, format);
     let available = available.saturating_sub(reserve);
     let budget = match cfg.server.gpu_heap.trim().to_lowercase().as_str() {
         "stock" => stock,
