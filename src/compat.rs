@@ -249,7 +249,9 @@ pub fn mlx_weight_bytes(dir: &std::path::Path, binned: bool) -> Option<u64> {
         f.read_exact(&mut hdr).ok()?;
         let v: serde_json::Value = serde_json::from_slice(&hdr).ok()?;
         for (k, t) in v.as_object()? {
-            if k == "__metadata__" {
+            // mlx_lm drops vision towers when serving text (e.g. qwen3_5.sanitize), so they
+            // never reach the GPU: ~0.86 GiB on Qwen3.8-27B.
+            if k == "__metadata__" || k.starts_with("vision_tower") || k.starts_with("model.visual") || k.starts_with("visual.") {
                 continue;
             }
             let off = t["data_offsets"].as_array()?;
