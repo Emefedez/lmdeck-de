@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Usage records for agents Omarchy ships no collector for, plus the panel's
+provider picker state.
+
+  agents-extra collect [--force] [--limits-only] [--except <id>]... [id...]
+  agents-extra set-provider <id> on|off
+  agents-extra save-prefs '{"providers": {...}, "order": [...]}'
+
+`collect` writes one display-ready record per agent into the same directory
+omarchy-agent-usage-update fills, so the stock data layer picks them up like
+any other agent. `set-provider` edits ~/.config/omarchy/agents/providers.json,
+which the panel watches; `save-prefs` replaces the provider map and order
+whole, the way the panel saves, so two quick edits can't interleave.
+"""
+import datetime as dt
+import json
+import os
+import pathlib
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+HOME = pathlib.Path.home()
+STATE = pathlib.Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state")
+CONFIG = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache")
+USAGE_DIR = STATE / "omarchy/agents/usage"
+PREFS = CONFIG / "omarchy/agents/providers.json"
+CACHE_DIR = CACHE / "omarchy/agents"
+
+
+def write_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".")
+    with os.fdopen(fd, "w") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def local_date(ts):
+    return dt.datetime.fromtimestamp(ts).date().isoformat()
+
+
+def iso_ts(text):
+    try:
+        return dt.datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+class Tally:
+    """Accumulates the record contract: tokens by day and model, prompts, sessions."""
+
+    def __init__(self):
+        self.models = {}
+        self.day_tokens = {}
+        self.day_models = {}
+        self.prompt_days = {}
+        self.session_days = {}
+        self.sessions = 0
+
+    def tokens(self, day, model, inp=0, out=0, cache_read=0, cache_write=0):
+        m = self.models.setdefault(model, {"inputTokens": 0, "outputTokens": 0,
+                                           "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0})
+        m["inputTokens"] += inp
+        m["outputTokens"] += out
+        m["cacheReadInputTokens"] += cache_read
+        m["cacheCreationInputTokens"] += cache_write
+        total = inp + out + cache_read + cache_write
+        self.day_tokens[day] = self.day_tokens.get(day, 0) + total
+        per_model = self.day_models.setdefault(day, {})
+        per_model[model] = per_model.get(model, 0) + total
+
+    def prompt(self, day):
+        self.prompt_days[day] = self.prompt_days.get(day, 0) + 1
+
+    def session(self, day):
+        self.sessions += 1
+        if day:
+            self.session_days[day] = self.session_days.get(day, 0) + 1
+
+    def record(self, agent_id, name, **extra):
+        today = dt.date.today()
+        week = [(today - dt.timedelta(days=n)).isoformat() for n in range(6, -1, -1)]
+        t = today.isoformat()
+        active = sorted(set(self.day_tokens) | set(self.prompt_days) | set(self.session_days))
+        rec = {
+            "schemaVersion": 1,
+            "id": agent_id,
+            "name": name,
+            "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "ready": True,
+            "hasLocalStats": True,
+            "hasPromptStats": True,
+            "todayPrompts": self.prompt_days.get(t, 0),
+            "todaySessions": self.session_days.get(t, 0),
+            "todayTotalTokens": self.day_tokens.get(t, 0),
+            "todayTokensByModel": self.day_models.get(t, {}),
+            "recentDays": [{"date": d, "messageCount": self.day_tokens.get(d, 0)} for d in week],
+            "totalPrompts": sum(self.prompt_days.values()),
+            "totalSessions": self.sessions,
+            "activeDays": len(active),
+            "activeDates": active,
+            "modelUsage": self.models,
+            "limits": [],
+            "tierLabel": "",
+            "usageStatusText": "",
+            "authHelpText": "",
+        }
+        rec.update(extra)
+        return rec
+
+
+# ------------------------------------------------------------------ copilot
+
+def copilot_home():
+    return pathlib.Path(os.environ.get("COPILOT_HOME") or HOME / ".copilot")
+
+
+def copilot_quota():
+    """Premium-request allowance from GitHub, via the gh CLI's token."""
+    try:
+        out = subprocess.run(["gh", "api", "copilot_internal/user"], capture_output=True,
+                             text=True, timeout=15)
+        data = json.loads(out.stdout) if out.stdout.strip() else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        data = None
+    if not isinstance(data, dict) or "quota_snapshots" not in data:
+        return None
+    limits = []
+    snap = (data.get("quota_snapshots") or {}).get("premium_interactions") or {}
+    if snap and not snap.get("unlimited") and snap.get("entitlement", 0) > 0:
+        used = 1 - float(snap.get("percent_remaining", 100)) / 100
+        reset = data.get("quota_reset_date_utc") or data.get("quota_reset_date") or ""
+        if reset and "T" not in reset:
+            reset += "T00:00:00+00:00"
+        limits.append({"label": "Premium requests (monthly)", "title": "Premium requests",
+                       "percent": max(0.0, min(1.0, used)), "resetsAt": reset})
+    sku = str(data.get("access_type_sku") or "")
+    tiers = {"free_educational_quota": "Education", "free_limited_copilot": "Free",
+             "monthly_subscriber_quota": "Pro", "yearly_subscriber_quota": "Pro"}
+    tier = tiers.get(sku) or str(data.get("copilot_plan") or "").replace("_", " ")
+    return {"limits": limits, "tierLabel": tier}
+
+
+def collect_copilot(limits_only):
+    home = copilot_home()
+    sessions = home / "session-state"
+    if not sessions.is_dir():
+        return None
+    tally = Tally()
+    for events in sorted(sessions.glob("*/events.jsonl")):
+        # A resumed session logs one shutdown per run; runs are keyed by their
+        # start time so a rewritten summary of the same run is counted once.
+        runs = {}
+        started = None
+        try:
+            lines = events.open(errors="replace")
+        except OSError:
+            continue
+        with lines:
+            for line in lines:
+                if '"type":"session.' not in line and '"type":"user.message"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                ts = iso_ts(ev.get("timestamp"))
+                if ts is None:
+                    continue
+                kind = ev.get("type")
+                if kind == "session.start" and started is None:
+                    started = ts
+                elif kind == "user.message":
+                    tally.prompt(local_date(ts))
+                elif kind == "session.shutdown":
+                    data = ev.get("data") or {}
+                    runs[data.get("sessionStartTime", ts)] = (ts, data.get("modelMetrics") or {})
+        tally.session(local_date(started) if started else None)
+        for ts, metrics in runs.values():
+            day = local_date(ts)
+            for model, m in metrics.items():
+                u = m.get("usage") or {}
+                cr = int(u.get("cacheReadTokens") or 0)
+                cw = int(u.get("cacheWriteTokens") or 0)
+                # inputTokens already includes the cached part.
+                inp = max(0, int(u.get("inputTokens") or 0) - cr - cw)
+                tally.tokens(day, model, inp, int(u.get("outputTokens") or 0), cr, cw)
+    extra = {}
+    quota = copilot_quota()
+    if quota:
+        extra.update(quota)
+    else:
+        extra["authHelpText"] = "Run `gh auth login` to see the premium-request allowance."
+    return tally.record("copilot", "Copilot", **extra)
+
+
+# -------------------------------------------------------------- antigravity
+
+def varint(b, i):
+    r = s = 0
+    while True:
+        c = b[i]
+        i += 1
+        r |= (c & 0x7F) << s
+        s += 7
+        if c < 0x80:
+            return r, i
+
+
+def fields(b):
+    """Top-level protobuf fields as {number: [value, ...]}; bytes for length-delimited."""
+    out, i = {}, 0
+    while i < len(b):
+        key, i = varint(b, i)
+        num, wire = key >> 3, key & 7
+        if wire == 0:
+            v, i = varint(b, i)
+        elif wire == 1:
+            v, i = b[i:i + 8], i + 8
+        elif wire == 5:
+            v, i = b[i:i + 4], i + 4
+        elif wire == 2:
+            n, i = varint(b, i)
+            v, i = b[i:i + n], i + n
+        else:
+            raise ValueError("unsupported wire type")
+        out.setdefault(num, []).append(v)
+    return out
+
+
+def first(f, num, default=None):
+    v = f.get(num)
+    return v[0] if v else default
+
+
+def antigravity_conversation(path):
+    """Per-generation (step timestamp, model, input, output, cache read) for one conversation."""
+    db = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+    try:
+        stamps = []
+        for (meta,) in db.execute("select metadata from steps order by idx"):
+            try:
+                ts = first(fields(first(fields(meta or b""), 1, b"")), 1)
+            except (ValueError, IndexError):
+                ts = None
+            if isinstance(ts, int):
+                stamps.append(ts)
+        gens = []
+        for (data,) in db.execute("select data from gen_metadata order by idx"):
+            try:
+                g = fields(first(fields(data or b""), 1, b""))
+                u = fields(first(g, 4, b""))
+                model = first(g, 19, b"").decode(errors="replace") or "unknown"
+            except (ValueError, IndexError):
+                continue
+            usage = (first(u, 2, 0), first(u, 3, 0), first(u, 5, 0))
+            if any(usage):
+                gens.append((model,) + usage)
+    finally:
+        db.close()
+    # Generations carry no clock of their own; spread them over the step
+    # timeline in order, which lands each on the right day in practice.
+    out = []
+    for k, (model, inp, outp, cr) in enumerate(gens):
+        ts = stamps[round(k * (len(stamps) - 1) / max(1, len(gens) - 1))] if stamps else os.path.getmtime(path)
+        out.append((ts, model, inp, outp, cr))
+    return {"start": stamps[0] if stamps else os.path.getmtime(path), "gens": out}
+
+
+def collect_antigravity(limits_only):
+    root = pathlib.Path(os.environ.get("ANTIGRAVITY_CLI_HOME") or HOME / ".gemini/antigravity-cli")
+    convs = root / "conversations"
+    if not convs.is_dir():
+        return None
+    cache_path = CACHE_DIR / "antigravity-scan.json"
+    cache = read_json(cache_path, {})
+    fresh = {}
+    tally = Tally()
+    for db in sorted(convs.glob("*.db")):
+        st = db.stat()
+        key = "%d:%d" % (st.st_mtime_ns, st.st_size)
+        hit = cache.get(db.name)
+        if hit and hit.get("key") == key:
+            conv = hit["conv"]
+        else:
+            try:
+                conv = antigravity_conversation(db)
+            except sqlite3.Error:
+                continue
+        fresh[db.name] = {"key": key, "conv": conv}
+        tally.session(local_date(conv["start"]))
+        for ts, model, inp, outp, cr in conv["gens"]:
+            tally.tokens(local_date(ts), model, inp, outp, cr, 0)
+    write_atomic(cache_path, json.dumps(fresh))
+    try:
+        with (root / "history.jsonl").open(errors="replace") as f:
+            for line in f:
+                try:
+                    h = json.loads(line)
+                except ValueError:
+                    continue
+                if h.get("type") == "slash_command" or not h.get("timestamp"):
+                    continue
+                tally.prompt(local_date(h["timestamp"] / 1000))
+    except OSError:
+        pass
+    model = read_json(root / "settings.json", {}).get("model", "")
+    return tally.record("antigravity", "Antigravity", tierLabel=model or "Local stats")
+
+
+COLLECTORS = {"antigravity": collect_antigravity, "copilot": collect_copilot}
+
+
+def cmd_collect(args):
+    flags = {"--force", "--limits-only"}
+    excluded, only, i = set(), [], 0
+    while i < len(args):
+        if args[i] == "--except" and i + 1 < len(args):
+            excluded.add(args[i + 1])
+            i += 1
+        elif args[i] not in flags:
+            only.append(args[i])
+        i += 1
+    status = 0
+    for agent, fn in COLLECTORS.items():
+        if agent in excluded or (only and agent not in only):
+            continue
+        try:
+            rec = fn("--limits-only" in args)
+        except Exception as e:  # one broken agent must not take the others down
+            print("agents-extra: %s collector failed: %s" % (agent, e), file=sys.stderr)
+            status = 1
+            continue
+        if rec:
+            write_atomic(USAGE_DIR / (agent + ".json"), json.dumps(rec) + "\n")
+    return status
+
+
+def cmd_set_provider(args):
+    if len(args) != 2 or args[1] not in ("on", "off"):
+        print("usage: agents-extra set-provider <id> on|off", file=sys.stderr)
+        return 2
+    prefs = read_json(PREFS, {})
+    providers = prefs.setdefault("providers", {})
+    providers.setdefault(args[0], {})["enabled"] = args[1] == "on"
+    write_atomic(PREFS, json.dumps(prefs, indent=2) + "\n")
+    return 0
+
+
+def cmd_save_prefs(args):
+    try:
+        update = json.loads(args[0]) if len(args) == 1 else None
+    except ValueError:
+        update = None
+    if not isinstance(update, dict) or not set(update) <= {"providers", "order"}:
+        print("usage: agents-extra save-prefs '{\"providers\": {\"codex\": {\"enabled\": false}}, \"order\": [\"claude\"]}'",
+              file=sys.stderr)
+        return 2
+    prefs = read_json(PREFS, {})
+    prefs.update(update)
+    write_atomic(PREFS, json.dumps(prefs, indent=2) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    cmd, rest = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("", [])
+    if cmd == "collect":
+        sys.exit(cmd_collect(rest))
+    if cmd == "set-provider":
+        sys.exit(cmd_set_provider(rest))
+    if cmd == "save-prefs":
+        sys.exit(cmd_save_prefs(rest))
+    print(__doc__.strip(), file=sys.stderr)
+    sys.exit(2)
