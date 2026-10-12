@@ -591,7 +591,8 @@ Column {
       }
     }
 
-    Row {
+    Flow {
+      width: parent.width
       spacing: Style.spacing.sm
       SmallButton {
         text: "Search"
@@ -874,11 +875,17 @@ Column {
     width: parent ? parent.width : 0
     spacing: 2
     Item {
+      id: rowLine
+      // The panel is narrow; a long label with several options would run the
+      // buttons into it, so they drop under the label instead.
+      readonly property bool stacked: labelRow.implicitWidth + group.implicitWidth + Style.spacing.md > width
       width: parent.width
-      implicitHeight: Math.max(rowLabel.implicitHeight, group.implicitHeight)
+      implicitHeight: stacked ? labelRow.implicitHeight + 4 + group.implicitHeight
+                              : Math.max(labelRow.implicitHeight, group.implicitHeight)
       Row {
+        id: labelRow
         anchors.left: parent.left
-        anchors.verticalCenter: parent.verticalCenter
+        y: rowLine.stacked ? 0 : (rowLine.height - implicitHeight) / 2
         spacing: 4
         Caption {
           id: rowLabel
@@ -900,7 +907,7 @@ Column {
       ButtonGroup {
         id: group
         anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
+        y: rowLine.stacked ? labelRow.implicitHeight + 4 : (rowLine.height - implicitHeight) / 2
         options: row.options
         value: sec.setting(row.key)
         foreground: sec.foreground

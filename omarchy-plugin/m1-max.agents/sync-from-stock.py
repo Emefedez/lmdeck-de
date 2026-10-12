@@ -501,8 +501,6 @@ sub('''    text: "󱚣"
       anchors.topMargin: Math.round(parent.height * 0.18)
     }''')
 
-sub('contentWidth: panel.fittedContentWidth(Style.space(380))',
-    'contentWidth: panel.fittedContentWidth(Style.space(root.lmdeckSelected ? 440 : 380))')
 
 # The search box needs plain typing while focused.
 sub('''      id: keyCatcher
