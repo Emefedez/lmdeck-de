@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Regenerate Panel.qml from Omarchy's stock agents panel plus the lmdeck hooks.
+"""Regenerate Panel.qml and Usage.qml from Omarchy's stock agents plugin plus the lmdeck hooks.
 
-Run after an Omarchy update changes /usr/share/omarchy/shell/plugins/agents/Panel.qml.
-The data layer (Main.qml, Agent.qml, collectors) is imported from the stock
-directory at runtime, so only the panel is forked.
+Run after an Omarchy update changes /usr/share/omarchy/shell/plugins/agents/.
+Agent.qml and the collectors are used from the stock directory at runtime;
+Panel.qml and Main.qml (as Usage.qml, without its refresh timer) are forked.
 """
 import pathlib, sys
 
@@ -139,10 +139,7 @@ sub('readonly property var providers: usage.enabledProviders',
     next[id] = { enabled: shown }
     providerPrefs = next
     savePrefs()
-    if (shown) {
-      usage.refreshAll(false)
-      collectExtra("normal")
-    }
+    if (shown) updateAgents([id])
   }
 
   function moveProvider(id, delta) {
@@ -184,17 +181,19 @@ sub('readonly property var providers: usage.enabledProviders',
 
   // Agents Omarchy ships no collector for (Antigravity, Copilot) come from
   // collectors/agents-extra, which writes into the same usage directory.
-  property double _extraAt: 0
-  function collectExtra(kind) {
-    if (extraCollect.running) return
-    // Opening the panel asks for limits; one quota call a minute is plenty.
-    if (kind === "limits" && Date.now() - _extraAt < 60000) return
-    _extraAt = Date.now()
+  readonly property var extraAgents: ["antigravity", "copilot"]
+  property var _extraQueued: null
+  function collectExtra(kind, ids) {
+    if (extraCollect.running) {
+      _extraQueued = { kind: kind, ids: ids }
+      return
+    }
     var command = [root.extraTool, "collect"]
     if (kind === "force") command.push("--force")
     if (kind === "limits") command.push("--limits-only")
     for (var id in providerSettings)
       if (providerSettings[id] && providerSettings[id].enabled === false) command.push("--except", id)
+    if (ids) for (var i = 0; i < ids.length; i++) command.push(ids[i])
     extraCollect.command = command
     extraCollect.running = true
   }
@@ -202,7 +201,14 @@ sub('readonly property var providers: usage.enabledProviders',
   Process {
     id: extraCollect
     running: false
-    onExited: usage.rescanAgents()
+    onExited: {
+      usage.rescanAgents()
+      if (root._extraQueued) {
+        var queued = root._extraQueued
+        root._extraQueued = null
+        root.collectExtra(queued.kind, queued.ids)
+      }
+    }
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: if (text.trim() !== "") console.warn("agents-extra", text.trim())
@@ -229,12 +235,112 @@ sub('readonly property var providers: usage.enabledProviders',
     function onContentYChanged() { if (pickerScroll.running && root.opened) Qt.callLater(root.scrollToPicker) }
   }
 
+  // ---------------------------------------------------------------- triggers
+  //
+  // Nothing polls. Usage is collected when an agent is used (its history or
+  // session files change; inotifywait sleeps in the kernel until then), when
+  // the panel opens, and on a manual refresh.
+  readonly property string homeDir: Quickshell.env("HOME") || ""
+  readonly property var activityPaths: {
+    var claude = Quickshell.env("CLAUDE_CONFIG_DIR") || (homeDir + "/.claude")
+    var codex = Quickshell.env("CODEX_HOME") || (homeDir + "/.codex")
+    var copilot = Quickshell.env("COPILOT_HOME") || (homeDir + "/.copilot")
+    var antigravity = Quickshell.env("ANTIGRAVITY_CLI_HOME") || (homeDir + "/.gemini/antigravity-cli")
+    return [
+      { id: "claude", path: claude + "/history.jsonl" },
+      { id: "codex", path: codex + "/history.jsonl" },
+      { id: "copilot", path: copilot + "/session-state" },
+      { id: "antigravity", path: antigravity + "/history.jsonl" },
+      { id: "antigravity", path: antigravity + "/conversations" }
+    ]
+  }
+
+  property var _dirty: ({})
+  property double _dirtySince: 0
+  property var _lastActivity: ({})
+  property var _lastUpdate: ({})
+  property double _lastLimits: 0
+
+  function agentActive(path) {
+    for (var i = 0; i < activityPaths.length; i++) {
+      if (path.indexOf(activityPaths[i].path) !== 0) continue
+      var id = activityPaths[i].id
+      if (!providerShown(id)) return
+      var now = Date.now()
+      _lastActivity[id] = now
+      if (!_dirty[id]) console.log("agents: activity from " + id)
+      _dirty[id] = true
+      if (_dirtySince === 0) _dirtySince = now
+      // Settle once the agent goes quiet, but a long session still lands
+      // every ten minutes instead of waiting for the end.
+      if (!activityIdle.running || now - _dirtySince < 600000) activityIdle.restart()
+      return
+    }
+  }
+
   Timer {
-    interval: Math.max(30, Number(usage.refreshIntervalSec) || 900) * 1000
+    id: activityIdle
+    interval: 90000
+    onTriggered: root.flushActivity()
+  }
+
+  function flushActivity() {
+    var ids = Object.keys(_dirty)
+    console.log("agents: updating " + ids.join(", ") + " after activity")
+    _dirty = {}
+    _dirtySince = 0
+    activityIdle.stop()
+    updateAgents(ids)
+  }
+
+  function updateAgents(ids) {
+    var stock = []
+    var extra = []
+    for (var i = 0; i < ids.length; i++) {
+      if (!providerShown(ids[i])) continue
+      _lastUpdate[ids[i]] = Date.now()
+      if (extraAgents.indexOf(ids[i]) >= 0) extra.push(ids[i])
+      else stock.push(ids[i])
+    }
+    if (stock.length > 0) usage.runUpdate("normal", stock)
+    if (extra.length > 0) collectExtra("normal", extra)
+  }
+
+  function refreshOnOpen() {
+    var now = Date.now()
+    var ids = Object.keys(_dirty)
+    // An agent mid-turn wrote its prompt a while ago and has been quiet on
+    // disk since, so anything active in the last half hour gets a fresh look.
+    for (var id in _lastActivity)
+      if (now - _lastActivity[id] < 1800000 && now - (_lastUpdate[id] || 0) > 60000 && ids.indexOf(id) < 0)
+        ids.push(id)
+    _dirty = {}
+    _dirtySince = 0
+    activityIdle.stop()
+    if (ids.length > 0) updateAgents(ids)
+    // Limits move without local activity (another machine, the web UI), so an
+    // open re-reads them, at most every two minutes.
+    if (now - _lastLimits > 120000) {
+      _lastLimits = now
+      usage.refreshLimits()
+      collectExtra("limits")
+    }
+  }
+
+  Process {
+    id: activityWatch
     running: true
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: root.collectExtra("normal")
+    command: [root.extraTool, "watch"].concat(root.activityPaths.map(function(p) { return p.path }))
+    stdout: SplitParser {
+      onRead: function(line) { root.agentActive(String(line)) }
+    }
+    onExited: watchRestart.start()
+  }
+
+  Timer {
+    id: watchRestart
+    interval: 300000
+    onTriggered: activityWatch.running = true
   }''')
 
 # The data layer sees the picker's choices: hidden agents drop out of the list
@@ -246,11 +352,14 @@ sub('''    id: usage
 sub('''  function refreshNow() {
     usage.refreshAll(true)''', '''  function refreshNow() {
     usage.refreshAll(true)
-    collectExtra("force")''')
+    collectExtra("force")
+    _lastLimits = Date.now()
+    _dirty = {}
+    _dirtySince = 0
+    activityIdle.stop()''')
 
 sub('''    usage.refreshLimits()
-    Qt.callLater''', '''    usage.refreshLimits()
-    collectExtra("limits")
+    Qt.callLater''', '''    refreshOnOpen()
     Qt.callLater''')
 
 # Hiding every provider must not strand the picker: the icon stays while
@@ -433,6 +542,17 @@ sub('''    function next(): string { root.selectProvider(root.providerIndex + 1)
     function showProvider(id: string): string { root.setProviderShown(id, true); return "ok" }
     function hideProvider(id: string): string { root.setProviderShown(id, false); return "ok" }
     function moveProvider(id: string, delta: int): string { root.moveProvider(id, delta); return "ok" }
+    // What the usage triggers are doing, for debugging.
+    function usageStatus(): string {
+      return JSON.stringify({
+        watcher: activityWatch.running,
+        pending: Object.keys(root._dirty),
+        settlingMs: activityIdle.running ? activityIdle.interval : 0,
+        lastActivity: root._lastActivity,
+        lastUpdate: root._lastUpdate,
+        extraRunning: extraCollect.running
+      })
+    }
     function listProviders(): string {
       var out = []
       for (var i = 0; i < root.pickerRows.length; i++)
@@ -481,7 +601,7 @@ sub('''  Main {
     panelOpen: root.opened
   }
 
-  Stock.Main {
+  Usage {
     id: usage''')
 
 # Bar icon: a small dot while a model is loaded (accent while busy).
@@ -525,6 +645,30 @@ sub('''          // ---------- Status ----------''', '''          LmdeckSection 
 
           // ---------- Status ----------''')
 
+# Usage.qml: the stock data layer minus its start-up and every-15-minutes
+# rescan; the panel's triggers decide when collectors run.
+m = (STOCK / "Main.qml").read_text()
+
+def msub(old, new):
+    global m
+    if m.count(old) != 1:
+        sys.exit(f"stock Main.qml changed; cannot find:\n{old}")
+    m = m.replace(old, new)
+
+msub('import Quickshell.Io\n', 'import Quickshell.Io\nimport "file://' + str(STOCK) + '" as Stock\n')
+msub('    delegate: Agent {', '    delegate: Stock.Agent {')
+msub('''  Timer {
+    interval: root.refreshIntervalSec * 1000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.runUpdate("normal")
+  }
+''', '''  // No refresh timer: Panel.qml runs updates when an agent is used, when the
+  // panel opens, and on a manual refresh.
+''')
+(HERE / "Usage.qml").write_text("// GENERATED by sync-from-stock.py from " + str(STOCK / "Main.qml") + " — edit the script, not this file.\n" + m)
+
 header = "// GENERATED by sync-from-stock.py from " + str(STOCK / "Panel.qml") + " — edit the script, not this file.\n"
 (HERE / "Panel.qml").write_text(header + s)
-print("Panel.qml regenerated")
+print("Panel.qml and Usage.qml regenerated")

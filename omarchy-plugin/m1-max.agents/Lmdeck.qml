@@ -95,7 +95,10 @@ Item {
     }, 70000)
   }
 
-  Timer { id: retryTimer; interval: 20000; onTriggered: lm.watch() }
+  // While the server is down: quick after a start/stop, every 20 s with the
+  // panel open, every 2 min behind a closed panel (opening reconnects at once).
+  property bool _retryFast: false
+  Timer { id: retryTimer; interval: lm._retryFast ? 1500 : (lm.panelOpen ? 20000 : 120000); onTriggered: lm.watch() }
 
   // ---- live poll only while the panel is visible ----
   Timer {
@@ -107,6 +110,7 @@ Item {
 
   onPanelOpenChanged: if (panelOpen) {
     request("GET", "/lmdeck/status", null, applyStatus, 3000)
+    if (!_watchXhr) watch()
     refreshModels()
     refreshVscode()
     if (config.length === 0) refreshConfig()
@@ -237,11 +241,11 @@ Item {
     say(action === "kill" ? "Force-stopped lmdeck and its backends" : "lmdeck: " + action)
     if (action === "kill") { lm.up = false; lm.status = null }
     if (_watchXhr) { _watchXhr.abort(); lm._watchXhr = null }
-    retryTimer.interval = 1500
+    lm._retryFast = true
     retryTimer.restart()
     retryReset.restart()
   }
-  Timer { id: retryReset; interval: 8000; onTriggered: retryTimer.interval = 20000 }
+  Timer { id: retryReset; interval: 8000; onTriggered: lm._retryFast = false }
   Timer { id: pendingTimeout; interval: 15000; onTriggered: lm.pending = false }
 
   function openTui() {

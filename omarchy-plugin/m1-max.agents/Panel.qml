@@ -135,10 +135,7 @@ Panel {
     next[id] = { enabled: shown }
     providerPrefs = next
     savePrefs()
-    if (shown) {
-      usage.refreshAll(false)
-      collectExtra("normal")
-    }
+    if (shown) updateAgents([id])
   }
 
   function moveProvider(id, delta) {
@@ -180,17 +177,19 @@ Panel {
 
   // Agents Omarchy ships no collector for (Antigravity, Copilot) come from
   // collectors/agents-extra, which writes into the same usage directory.
-  property double _extraAt: 0
-  function collectExtra(kind) {
-    if (extraCollect.running) return
-    // Opening the panel asks for limits; one quota call a minute is plenty.
-    if (kind === "limits" && Date.now() - _extraAt < 60000) return
-    _extraAt = Date.now()
+  readonly property var extraAgents: ["antigravity", "copilot"]
+  property var _extraQueued: null
+  function collectExtra(kind, ids) {
+    if (extraCollect.running) {
+      _extraQueued = { kind: kind, ids: ids }
+      return
+    }
     var command = [root.extraTool, "collect"]
     if (kind === "force") command.push("--force")
     if (kind === "limits") command.push("--limits-only")
     for (var id in providerSettings)
       if (providerSettings[id] && providerSettings[id].enabled === false) command.push("--except", id)
+    if (ids) for (var i = 0; i < ids.length; i++) command.push(ids[i])
     extraCollect.command = command
     extraCollect.running = true
   }
@@ -198,7 +197,14 @@ Panel {
   Process {
     id: extraCollect
     running: false
-    onExited: usage.rescanAgents()
+    onExited: {
+      usage.rescanAgents()
+      if (root._extraQueued) {
+        var queued = root._extraQueued
+        root._extraQueued = null
+        root.collectExtra(queued.kind, queued.ids)
+      }
+    }
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: if (text.trim() !== "") console.warn("agents-extra", text.trim())
@@ -225,12 +231,112 @@ Panel {
     function onContentYChanged() { if (pickerScroll.running && root.opened) Qt.callLater(root.scrollToPicker) }
   }
 
+  // ---------------------------------------------------------------- triggers
+  //
+  // Nothing polls. Usage is collected when an agent is used (its history or
+  // session files change; inotifywait sleeps in the kernel until then), when
+  // the panel opens, and on a manual refresh.
+  readonly property string homeDir: Quickshell.env("HOME") || ""
+  readonly property var activityPaths: {
+    var claude = Quickshell.env("CLAUDE_CONFIG_DIR") || (homeDir + "/.claude")
+    var codex = Quickshell.env("CODEX_HOME") || (homeDir + "/.codex")
+    var copilot = Quickshell.env("COPILOT_HOME") || (homeDir + "/.copilot")
+    var antigravity = Quickshell.env("ANTIGRAVITY_CLI_HOME") || (homeDir + "/.gemini/antigravity-cli")
+    return [
+      { id: "claude", path: claude + "/history.jsonl" },
+      { id: "codex", path: codex + "/history.jsonl" },
+      { id: "copilot", path: copilot + "/session-state" },
+      { id: "antigravity", path: antigravity + "/history.jsonl" },
+      { id: "antigravity", path: antigravity + "/conversations" }
+    ]
+  }
+
+  property var _dirty: ({})
+  property double _dirtySince: 0
+  property var _lastActivity: ({})
+  property var _lastUpdate: ({})
+  property double _lastLimits: 0
+
+  function agentActive(path) {
+    for (var i = 0; i < activityPaths.length; i++) {
+      if (path.indexOf(activityPaths[i].path) !== 0) continue
+      var id = activityPaths[i].id
+      if (!providerShown(id)) return
+      var now = Date.now()
+      _lastActivity[id] = now
+      if (!_dirty[id]) console.log("agents: activity from " + id)
+      _dirty[id] = true
+      if (_dirtySince === 0) _dirtySince = now
+      // Settle once the agent goes quiet, but a long session still lands
+      // every ten minutes instead of waiting for the end.
+      if (!activityIdle.running || now - _dirtySince < 600000) activityIdle.restart()
+      return
+    }
+  }
+
   Timer {
-    interval: Math.max(30, Number(usage.refreshIntervalSec) || 900) * 1000
+    id: activityIdle
+    interval: 90000
+    onTriggered: root.flushActivity()
+  }
+
+  function flushActivity() {
+    var ids = Object.keys(_dirty)
+    console.log("agents: updating " + ids.join(", ") + " after activity")
+    _dirty = {}
+    _dirtySince = 0
+    activityIdle.stop()
+    updateAgents(ids)
+  }
+
+  function updateAgents(ids) {
+    var stock = []
+    var extra = []
+    for (var i = 0; i < ids.length; i++) {
+      if (!providerShown(ids[i])) continue
+      _lastUpdate[ids[i]] = Date.now()
+      if (extraAgents.indexOf(ids[i]) >= 0) extra.push(ids[i])
+      else stock.push(ids[i])
+    }
+    if (stock.length > 0) usage.runUpdate("normal", stock)
+    if (extra.length > 0) collectExtra("normal", extra)
+  }
+
+  function refreshOnOpen() {
+    var now = Date.now()
+    var ids = Object.keys(_dirty)
+    // An agent mid-turn wrote its prompt a while ago and has been quiet on
+    // disk since, so anything active in the last half hour gets a fresh look.
+    for (var id in _lastActivity)
+      if (now - _lastActivity[id] < 1800000 && now - (_lastUpdate[id] || 0) > 60000 && ids.indexOf(id) < 0)
+        ids.push(id)
+    _dirty = {}
+    _dirtySince = 0
+    activityIdle.stop()
+    if (ids.length > 0) updateAgents(ids)
+    // Limits move without local activity (another machine, the web UI), so an
+    // open re-reads them, at most every two minutes.
+    if (now - _lastLimits > 120000) {
+      _lastLimits = now
+      usage.refreshLimits()
+      collectExtra("limits")
+    }
+  }
+
+  Process {
+    id: activityWatch
     running: true
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: root.collectExtra("normal")
+    command: [root.extraTool, "watch"].concat(root.activityPaths.map(function(p) { return p.path }))
+    stdout: SplitParser {
+      onRead: function(line) { root.agentActive(String(line)) }
+    }
+    onExited: watchRestart.start()
+  }
+
+  Timer {
+    id: watchRestart
+    interval: 300000
+    onTriggered: activityWatch.running = true
   }
   // The selection follows the provider, not the slot it happens to sit in: a
   // provider whose first scan lands while the panel is open would otherwise
@@ -271,6 +377,10 @@ Panel {
   function refreshNow() {
     usage.refreshAll(true)
     collectExtra("force")
+    _lastLimits = Date.now()
+    _dirty = {}
+    _dirtySince = 0
+    activityIdle.stop()
   }
 
   function launchAgent() {
@@ -537,8 +647,7 @@ Panel {
     cursorActive = false
     nowMs = Date.now()
     if (panelFlick) panelFlick.contentY = 0
-    usage.refreshLimits()
-    collectExtra("limits")
+    refreshOnOpen()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -548,7 +657,7 @@ Panel {
     panelOpen: root.opened
   }
 
-  Stock.Main {
+  Usage {
     id: usage
     settings: root.usageSettings
   }
@@ -579,6 +688,17 @@ Panel {
     function showProvider(id: string): string { root.setProviderShown(id, true); return "ok" }
     function hideProvider(id: string): string { root.setProviderShown(id, false); return "ok" }
     function moveProvider(id: string, delta: int): string { root.moveProvider(id, delta); return "ok" }
+    // What the usage triggers are doing, for debugging.
+    function usageStatus(): string {
+      return JSON.stringify({
+        watcher: activityWatch.running,
+        pending: Object.keys(root._dirty),
+        settlingMs: activityIdle.running ? activityIdle.interval : 0,
+        lastActivity: root._lastActivity,
+        lastUpdate: root._lastUpdate,
+        extraRunning: extraCollect.running
+      })
+    }
     function listProviders(): string {
       var out = []
       for (var i = 0; i < root.pickerRows.length; i++)

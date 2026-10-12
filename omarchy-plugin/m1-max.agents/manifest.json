@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "m1-max",
   "license": "MIT",
-  "description": "Omarchy Agents usage panel plus live lmdeck control: endpoint, loaded models, memory, throughput, cache settings, model list and Hugging Face downloads.",
+  "description": "Omarchy Agents usage panel (Claude, Codex, Copilot, Antigravity, Fireworks) plus live lmdeck control. Usage is collected when an agent is used or the panel opens, never on a timer.",
   "kinds": [
     "bar-widget"
   ],
@@ -34,7 +34,6 @@
           "enabled": true
         }
       },
-      "refreshIntervalSec": 900,
       "syncMode": "Off",
       "syncDir": "",
       "syncFileName": "",
@@ -42,15 +41,6 @@
       "lmdeckUrl": "http://127.0.0.1:11434"
     },
     "schema": [
-      {
-        "key": "refreshIntervalSec",
-        "type": "integer",
-        "label": "Refresh interval (seconds)",
-        "min": 30,
-        "max": 3600,
-        "step": 30,
-        "defaultValue": 900
-      },
       {
         "key": "syncMode",
         "type": "enum",

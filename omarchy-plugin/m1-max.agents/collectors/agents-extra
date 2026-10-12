@@ -5,14 +5,18 @@ provider picker state.
   agents-extra collect [--force] [--limits-only] [--except <id>]... [id...]
   agents-extra set-provider <id> on|off
   agents-extra save-prefs '{"providers": {...}, "order": [...]}'
+  agents-extra watch <path>...
 
 `collect` writes one display-ready record per agent into the same directory
 omarchy-agent-usage-update fills, so the stock data layer picks them up like
 any other agent. `set-provider` edits ~/.config/omarchy/agents/providers.json,
 which the panel watches; `save-prefs` replaces the provider map and order
 whole, the way the panel saves, so two quick edits can't interleave.
+`watch` prints every write under the given paths that exist, one path per
+line, by exec'ing inotifywait under a lock: nothing runs between writes.
 """
 import datetime as dt
+import fcntl
 import json
 import os
 import pathlib
@@ -372,6 +376,25 @@ def cmd_save_prefs(args):
     return 0
 
 
+def cmd_watch(args):
+    paths = [p for p in args if os.path.exists(p)]
+    if not paths:
+        # Nothing to watch yet; stay quiet instead of exiting into a restart loop.
+        os.execvp("sleep", ["sleep", "infinity"])
+    # Every bar (one per monitor) starts a watcher; only the lock holder
+    # reports, so one burst of activity runs the collectors once. The others
+    # block here and take over if that bar goes away. The lock is taken in
+    # this process and inherited across exec, so the process the shell kills
+    # is the one holding it (flock(1) would fork, and its child outlives the
+    # shell with the lock).
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    fd = os.open(os.path.join(runtime, "omarchy-agents-watch.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    os.set_inheritable(fd, True)
+    os.execvp("inotifywait", ["inotifywait", "-mrq", "-e", "modify,close_write,create,moved_to",
+                              "--format", "%w%f"] + paths)
+
+
 if __name__ == "__main__":
     cmd, rest = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("", [])
     if cmd == "collect":
@@ -380,5 +403,7 @@ if __name__ == "__main__":
         sys.exit(cmd_set_provider(rest))
     if cmd == "save-prefs":
         sys.exit(cmd_save_prefs(rest))
+    if cmd == "watch":
+        cmd_watch(rest)
     print(__doc__.strip(), file=sys.stderr)
     sys.exit(2)
