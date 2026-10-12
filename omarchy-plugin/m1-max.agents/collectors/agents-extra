@@ -387,6 +387,11 @@ def cmd_watch(args):
     # this process and inherited across exec, so the process the shell kills
     # is the one holding it (flock(1) would fork, and its child outlives the
     # shell with the lock).
+    # The shell hands us SIGPIPE ignored, so a watcher whose reader is gone
+    # would run forever; die with the shell instead (survives the exec).
+    import ctypes
+    import signal
+    ctypes.CDLL(None).prctl(1, int(signal.SIGTERM))  # PR_SET_PDEATHSIG
     runtime = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
     fd = os.open(os.path.join(runtime, "omarchy-agents-watch.lock"), os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(fd, fcntl.LOCK_EX)
