@@ -1,89 +1,59 @@
-From 7034fe9dd03e5082f47c70610627cd164e51b5d3 Mon Sep 17 00:00:00 2001
-From: Emefedez <mateofernandezrodriguez2007@gmail.com>
-Date: Fri, 9 Oct 2026 01:31:54 +0200
-Subject: [PATCH] allocator: 32 size classes per power of two instead of
- power-of-two bins
-
-Power-of-two bins (b20211a0) rounded every buffer over 1 MiB up to the
-next power of two, weights included: Qwen3.8-27B-4bit grew from 14.95 GiB
-to 21.40 GiB of device memory and overflowed the heap. Size classes keep
-reuse across neighboring KV-cache shapes with at most ~3% slack.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
----
- overlay/mlx/backend/omarchy/allocator.cpp | 22 ++++++++++++++--------
- overlay/tests/omarchy/test_runtime.cpp    | 14 +++++++++-----
- 2 files changed, 23 insertions(+), 13 deletions(-)
-
-diff --git a/overlay/mlx/backend/omarchy/allocator.cpp b/overlay/mlx/backend/omarchy/allocator.cpp
-index 8a735ecd..effedeec 100644
---- a/overlay/mlx/backend/omarchy/allocator.cpp
-+++ b/overlay/mlx/backend/omarchy/allocator.cpp
-@@ -20,20 +20,26 @@ namespace mlx::core {
- namespace omarchy {
- 
+diff --git i/overlay/mlx/backend/omarchy/allocator.cpp w/overlay/mlx/backend/omarchy/allocator.cpp
+index 91d9ee8d..ed5d8ee7 100644
+--- i/overlay/mlx/backend/omarchy/allocator.cpp
++++ w/overlay/mlx/backend/omarchy/allocator.cpp
+@@ -23,12 +23,15 @@ namespace omarchy {
  constexpr size_t kPageSize = 4096;
--constexpr size_t kPowerOfTwoBinThreshold = 1u << 20;
-+constexpr size_t kSizeClassThreshold = 1u << 20;
-+// Size classes per power of two above the threshold. Classes let a
-+// growing KV cache (a new size every decode step) reuse cached storage
-+// across neighboring shapes; 32 per octave bounds the slack to 1/32
-+// (~3%). Whole power-of-two bins did the same for reuse but rounded
-+// every weight tensor up by as much as 2x: a 15 GiB 4-bit 27B model
-+// needed 21.4 GiB of device memory and no longer fit the heap.
-+constexpr size_t kSizeClassesPerOctave = 32;
+ // Requests above kBinThreshold round up to one of kSubBinsPerOctave sizes
+ // per power of two, so a buffer wastes at most 1/kSubBinsPerOctave of its
+-// size (12.5%) and still lands in a reusable bin. The previous rule rounded
++// size (~3%) and still lands in a reusable bin. The previous rule rounded
+ // to the next power of two (up to 100% waste): a 24 MiB offload slot array
+ // became 32 MiB, 33% more device memory per array, and on a 16 GB host the
+ // offloaded Qwen3-30B-A3B ran out of the Honeykrisp heap (50% of RAM).
++// lmdeck: 32 bins instead of 8. Weight tensors are allocated once and never
++// recycled, so their slack is pure loss: 8 bins still put a 4-bit
++// Qwen3.8-27B at 14.54 GiB for 14.09 GiB of weights, 32 bins at 14.20 GiB.
+ constexpr size_t kBinThreshold = 1u << 20;
+-constexpr size_t kSubBinsPerOctave = 8;
++constexpr size_t kSubBinsPerOctave = 32;
  
  size_t round_size(size_t size) {
    if (size <= kPageSize) {
-     return kPageSize;
-   }
--  if (size > kPowerOfTwoBinThreshold) {
--    size_t bin = kPowerOfTwoBinThreshold;
--    while (bin < size && bin <= SIZE_MAX / 2) {
--      bin *= 2;
--    }
--    if (bin >= size) {
--      return bin;
-+  if (size > kSizeClassThreshold) {
-+    size_t octave = kSizeClassThreshold;
-+    while (octave <= size / 2) {
-+      octave *= 2;
-     }
-+    size_t step = std::max(kPageSize, octave / kSizeClassesPerOctave);
-+    return step * ((size + step - 1) / step);
-   }
-   return kPageSize * ((size + kPageSize - 1) / kPageSize);
+diff --git i/overlay/tests/omarchy/test_runtime.cpp w/overlay/tests/omarchy/test_runtime.cpp
+index 3b15d520..59562a0a 100644
+--- i/overlay/tests/omarchy/test_runtime.cpp
++++ w/overlay/tests/omarchy/test_runtime.cpp
+@@ -998,19 +998,19 @@ TEST_CASE(
+   unsetenv("MLX_OMARCHY_TEST_OOM_REMAINING");
  }
-diff --git a/overlay/tests/omarchy/test_runtime.cpp b/overlay/tests/omarchy/test_runtime.cpp
-index 17c506db..8be71764 100644
---- a/overlay/tests/omarchy/test_runtime.cpp
-+++ b/overlay/tests/omarchy/test_runtime.cpp
-@@ -886,16 +886,20 @@ TEST_CASE(
-   alloc.set_cache_limit(ceiling);
-   alloc.clear_cache();
  
--  // Requests grow by 64 KiB per iteration; power-of-two bins reuse
--  // storage across neighboring shapes while the GC ceiling bounds the pool.
-+  // Requests grow by 64 KiB per iteration; size classes (32 per power of
-+  // two) reuse storage across neighboring shapes while the GC ceiling
-+  // bounds the pool.
-   std::vector<omarchy::VulkanBuffer*> live;
-   for (int i = 0; i < 64; ++i) {
-     size_t sz = (1u << 20) + static_cast<size_t>(i) * (64u << 10);
-     auto* b = static_cast<omarchy::VulkanBuffer*>(alloc.malloc(sz).ptr());
-     REQUIRE(b != nullptr);
--    size_t bin = 1u << 20;
--    while (bin < sz) bin *= 2;
--    CHECK(b->size == bin);
-+    size_t octave = 1u << 20;
-+    while (octave <= sz / 2) octave *= 2;
-+    size_t step = std::max<size_t>(4096, octave / 32);
-+    size_t cls = step * ((sz + step - 1) / step);
-+    CHECK(b->size == cls);
-+    CHECK(b->size - sz < sz / 32 + 4096);
-     if (!live.empty()) {
-       alloc.free(allocator::Buffer{live.back()});
-       live.pop_back();
--- 
-2.56.0
-
+-TEST_CASE("round_size: above 1 MiB at most 12.5% waste, octave sizes exact") {
++TEST_CASE("round_size: above 1 MiB at most ~3% waste, octave sizes exact") {
+   using omarchy::round_size;
+   CHECK(round_size(1) == 4096);
+   CHECK(round_size(4096) == 4096);
+   CHECK(round_size(4097) == 8192);
+   CHECK(round_size(1u << 20) == (1u << 20));
+-  // Above 1 MiB there are 8 bins per octave: 128 KiB apart in the first one.
+-  CHECK(round_size((1u << 20) + 1) == (1u << 20) + (128u << 10));
++  // Above 1 MiB there are 32 bins per octave: 32 KiB apart in the first one.
++  CHECK(round_size((1u << 20) + 1) == (1u << 20) + (32u << 10));
+   // The oMLX expert-offload slot array of Qwen3-30B-A3B at 32 slots is
+   // 24 MiB. It must stay 24 MiB; the old power-of-two rule made it 32 MiB
+   // (33% more device memory per array) and a 16 GB host ran out of heap.
+   CHECK(round_size(24ull << 20) == (24ull << 20));
+-  CHECK(round_size((24ull << 20) + 1) == (26ull << 20));
++  CHECK(round_size((24ull << 20) + 1) == (24ull << 20) + (512u << 10));
+   for (int k = 20; k < 40; ++k) {
+     CHECK(round_size(1ull << k) == (1ull << k));
+   }
+@@ -1019,7 +1019,7 @@ TEST_CASE("round_size: above 1 MiB at most 12.5% waste, octave sizes exact") {
+     const size_t r = round_size(sz);
+     REQUIRE(r >= sz);
+     REQUIRE(r % 4096 == 0);
+-    REQUIRE((r - sz) * 8 <= sz);
++    REQUIRE((r - sz) * 32 <= sz);
+     REQUIRE(r >= prev);
+     prev = r;
+   }

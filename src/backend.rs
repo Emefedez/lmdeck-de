@@ -334,15 +334,15 @@ impl Manager {
         Ok(secs)
     }
 
-    /// " The Custom MLX runtime rounds buffers up: +X GiB ..." when that applies to `m`.
+    /// " The selected MLX runtime rounds GPU buffers up …: +X GiB" when that matters for `m`.
     fn binning_note(&self, m: &LocalModel) -> String {
         let cfg = self.cfg();
-        if m.format != Format::Mlx || !cfg.mlx.command.first().is_some_and(|c| crate::compat::runtime_bins_buffers(c)) {
-            return String::new();
-        }
-        match (crate::compat::mlx_weight_bytes(&m.path, true), crate::compat::mlx_weight_bytes(&m.path, false)) {
-            (Some(b), Some(p)) if b > p => format!(
-                " The selected Custom MLX build rounds GPU buffers up to powers of two (+{:.1} GiB for this model); the Omarchy package runtime does not (TUI: i → 1).",
+        let Some(rounding) = cfg.mlx.command.first().map(|c| crate::compat::runtime_buffer_rounding(c)) else { return String::new() };
+        let Some(what) = rounding.describe().filter(|_| m.format == Format::Mlx) else { return String::new() };
+        match (crate::compat::mlx_weight_bytes(&m.path, rounding), crate::compat::mlx_weight_bytes(&m.path, crate::compat::BufferRounding::Pages)) {
+            // Below ~0.25 GiB it is noise next to the planner's allowances.
+            (Some(b), Some(p)) if b > p + (256 << 20) => format!(
+                " The selected MLX runtime {what}: +{:.1} GiB for this model; the Omarchy package runtime does not (TUI: i → 1).",
                 gib(b - p)
             ),
             _ => String::new(),
@@ -368,8 +368,8 @@ impl Manager {
                 crate::compat::gpu_need(m.size, ctx)
             }
             Format::Mlx => {
-                let bins = cfg.mlx.command.first().is_some_and(|c| crate::compat::runtime_bins_buffers(c));
-                let weights = crate::compat::mlx_weight_bytes(&m.path, bins).unwrap_or(m.size);
+                let rounding = cfg.mlx.command.first().map_or(crate::compat::BufferRounding::Pages, |c| crate::compat::runtime_buffer_rounding(c));
+                let weights = crate::compat::mlx_weight_bytes(&m.path, rounding).unwrap_or(m.size);
                 match crate::compat::mlx_kv_per_token(&m.path) {
                     Some(per_tok) => weights + per_tok * mlx_ctx + MLX_RUNTIME + MLX_CACHE_ALLOWANCE,
                     None => crate::compat::gpu_need(weights, 8192),

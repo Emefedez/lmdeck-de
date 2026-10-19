@@ -226,10 +226,52 @@ pub fn gpu_budget() -> u64 {
 }
 
 /// Estimated GPU bytes a model needs: weights + ~8% runtime + KV/workspace.
-/// Bytes the MLX weights occupy on the GPU, from the safetensors headers. With `binned`,
-/// each tensor over 1 MiB is rounded up to a power of two the way mlx-omarchy builds after
-/// 2026-10-05 (allocator commit b20211a0) allocate it, which can add ~30% to a model.
-pub fn mlx_weight_bytes(dir: &std::path::Path, binned: bool) -> Option<u64> {
+/// How an mlx-omarchy build sizes GPU buffers. Every build rounds to 4 KiB pages; above 1 MiB
+/// some round further so freed buffers can be reused across neighbouring sizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferRounding {
+    /// Pages only (package 0.7.28 and builds before 2026-10-05 18:40 UTC).
+    Pages,
+    /// Next power of two (allocator commit b20211a0 until PR #47): can add ~30-50% to a model.
+    PowerOfTwo,
+    /// N size classes per power of two: upstream 8 since PR #47 (v0.7.32), lmdeck's fix 32.
+    PerOctave(u64),
+}
+
+impl BufferRounding {
+    pub fn round(self, size: u64) -> u64 {
+        const PAGE: u64 = 4096;
+        const THRESHOLD: u64 = 1 << 20;
+        if size <= PAGE {
+            return PAGE;
+        }
+        if size > THRESHOLD {
+            match self {
+                Self::Pages => {}
+                Self::PowerOfTwo => return size.next_power_of_two(),
+                Self::PerOctave(n) => {
+                    let octave = 1u64 << (63 - size.leading_zeros());
+                    let step = (octave / n).max(PAGE);
+                    return size.div_ceil(step) * step;
+                }
+            }
+        }
+        size.div_ceil(PAGE) * PAGE
+    }
+
+    /// "rounds GPU buffers up to …" for user-facing notes; None when only pages.
+    pub fn describe(self) -> Option<String> {
+        match self {
+            Self::Pages => None,
+            Self::PowerOfTwo => Some("rounds GPU buffers up to powers of two (often +30-40% for big models)".into()),
+            Self::PerOctave(n) => Some(format!("rounds GPU buffers up to {n} size classes per power of two (about +{:.0}% for big models)", 25.0 / n as f64)),
+        }
+    }
+}
+
+/// Bytes the MLX weights occupy on the GPU, from the safetensors headers, with each tensor
+/// rounded the way the runtime's allocator sizes it.
+pub fn mlx_weight_bytes(dir: &std::path::Path, rounding: BufferRounding) -> Option<u64> {
     use std::io::Read;
     let mut total = 0u64;
     let mut files = 0;
@@ -256,7 +298,7 @@ pub fn mlx_weight_bytes(dir: &std::path::Path, binned: bool) -> Option<u64> {
             }
             let off = t["data_offsets"].as_array()?;
             let size = off.get(1)?.as_u64()?.saturating_sub(off.first()?.as_u64()?);
-            total += if binned && size > 1 << 20 { size.next_power_of_two() } else { size };
+            total += rounding.round(size);
         }
         files += 1;
     }
@@ -283,10 +325,10 @@ pub fn mlx_kv_per_token(dir: &std::path::Path) -> Option<u64> {
     Some(2 * full * kv_heads * head_dim * 2)
 }
 
-/// Whether the MLX runtime behind `python` rounds GPU buffers up to powers of two
-/// (mlx-omarchy dev builds stamped after 2026-10-05 18:40 UTC).
-pub fn runtime_bins_buffers(python_or_wrapper: &str) -> bool {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> = std::sync::OnceLock::new();
+/// How the MLX runtime behind `python` (or its launcher) rounds GPU buffers, from the
+/// installed mlx_omarchy wheel's dev stamp (UTC).
+pub fn runtime_buffer_rounding(python_or_wrapper: &str) -> BufferRounding {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, BufferRounding>>> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     if let Some(v) = cache.lock().unwrap().get(python_or_wrapper) {
         return *v;
@@ -299,20 +341,30 @@ pub fn runtime_bins_buffers(python_or_wrapper: &str) -> bool {
         }
     }
     let venv = py.parent().and_then(|b| b.parent()).map(|v| v.join("lib")).unwrap_or_default();
-    let stamp = std::fs::read_dir(&venv).ok().into_iter().flatten().flatten()
+    let wheel = std::fs::read_dir(&venv).ok().into_iter().flatten().flatten()
         .filter_map(|pyd| std::fs::read_dir(pyd.path().join("site-packages")).ok())
         .flatten().flatten()
         .filter_map(|e| e.file_name().into_string().ok())
-        .find_map(|n| n.strip_prefix("mlx_omarchy-").and_then(|r| r.split(".dev").nth(1)).map(|d| d.chars().take(12).collect::<String>()))
-        .and_then(|d| d.parse::<u64>().ok());
-    // lmdeck's Fixed runtime replaces the bins with fine size classes (mlx-omarchy-fixes/0001).
-    let fixed = std::fs::read_dir(&venv).ok().into_iter().flatten().flatten()
-        .filter_map(|pyd| std::fs::read_dir(pyd.path().join("site-packages")).ok())
-        .flatten().flatten()
-        .any(|e| e.file_name().to_string_lossy().starts_with("mlx_omarchy-") && e.file_name().to_string_lossy().contains("lmdeckfix"));
-    let bins = !fixed && stamp.is_some_and(|s| s > 202610051840);
-    cache.lock().unwrap().insert(python_or_wrapper.to_string(), bins);
-    bins
+        .find(|n| n.starts_with("mlx_omarchy-"));
+    let rounding = rounding_for_wheel(wheel.as_deref().unwrap_or(""));
+    cache.lock().unwrap().insert(python_or_wrapper.to_string(), rounding);
+    rounding
+}
+
+fn rounding_for_wheel(name: &str) -> BufferRounding {
+    let stamp = name.split(".dev").nth(1).map(|d| d.chars().take(12).collect::<String>()).and_then(|d| d.parse::<u64>().ok());
+    let upstream = match stamp {
+        // b20211a0 (power-of-two bins) .. ad831f09 (PR #47, 8 per octave, 2026-10-09 07:27 UTC)
+        Some(s) if s > 202610090727 => BufferRounding::PerOctave(8),
+        Some(s) if s > 202610051840 => BufferRounding::PowerOfTwo,
+        _ => BufferRounding::Pages,
+    };
+    // lmdeck's Fixed runtime uses finer size classes (mlx-omarchy-fixes/0001).
+    if name.contains("lmdeckfix") && upstream != BufferRounding::Pages {
+        BufferRounding::PerOctave(32)
+    } else {
+        upstream
+    }
 }
 
 pub fn gpu_need(weights: u64, ctx_tokens: u64) -> u64 {
@@ -432,19 +484,30 @@ mod sizing_tests {
     }
 
     #[test]
-    fn binned_weights_on_local_27b() {
+    fn buffer_rounding_matches_the_allocators() {
+        use super::BufferRounding::*;
+        const MIB: u64 = 1 << 20;
+        assert_eq!(Pages.round(1), 4096);
+        assert_eq!(Pages.round(5 * MIB + 1), 5 * MIB + 4096);
+        assert_eq!(PowerOfTwo.round(17 * MIB), 32 * MIB);
+        assert_eq!(PerOctave(8).round(17 * MIB), 18 * MIB); // 16 MiB octave, 2 MiB steps
+        assert_eq!(PerOctave(32).round(17 * MIB), 17 * MIB);
+        assert_eq!(PerOctave(8).round(MIB), MIB); // at the threshold: pages
+        assert_eq!(super::rounding_for_wheel("mlx_omarchy-0.32.0.dev202610050725+abc.dist-info"), Pages);
+        assert_eq!(super::rounding_for_wheel("mlx_omarchy-0.32.2.dev202610071347+9b5c938.dist-info"), PowerOfTwo);
+        assert_eq!(super::rounding_for_wheel("mlx_omarchy-0.32.4.dev202610160529+33630f9c.dist-info"), PerOctave(8));
+        assert_eq!(super::rounding_for_wheel("mlx_omarchy-0.32.2.dev202610090000+lmdeckfix.7034fe9.dist-info"), PerOctave(32));
+    }
+
+    #[test]
+    fn rounded_weights_on_local_27b() {
+        use super::BufferRounding::*;
         let home = std::env::var("HOME").unwrap();
         let Some(dir) = std::fs::read_dir(format!("{home}/.cache/huggingface/hub/models--mlx-community--Qwen3.8-27B-4bit/snapshots")).ok().and_then(|mut d| d.next()).and_then(|e| e.ok()).map(|e| e.path()) else { return };
-        let plain = super::mlx_weight_bytes(&dir, false).unwrap();
-        let binned = super::mlx_weight_bytes(&dir, true).unwrap();
-        eprintln!("plain {:.2} GiB binned {:.2} GiB", plain as f64 / (1u64 << 30) as f64, binned as f64 / (1u64 << 30) as f64);
-        assert!(binned >= plain);
-        assert!(super::runtime_bins_buffers(&format!("{home}/.local/bin/mlx-omarchy")));
-        assert!(!super::runtime_bins_buffers("/usr/bin/mlx-omarchy"));
-        let fixed = format!("{home}/.local/bin/mlx-omarchy-fixed");
-        if std::path::Path::new(&fixed).exists() {
-            assert!(!super::runtime_bins_buffers(&fixed), "the Fixed runtime must not be planned as binning");
-        }
+        let w = |r| super::mlx_weight_bytes(&dir, r).unwrap();
+        eprintln!("pages {:.2} / 32 {:.2} / 8 {:.2} / pow2 {:.2} GiB", w(Pages) as f64 / (1u64 << 30) as f64, w(PerOctave(32)) as f64 / (1u64 << 30) as f64, w(PerOctave(8)) as f64 / (1u64 << 30) as f64, w(PowerOfTwo) as f64 / (1u64 << 30) as f64);
+        assert!(w(Pages) <= w(PerOctave(32)) && w(PerOctave(32)) <= w(PerOctave(8)) && w(PerOctave(8)) <= w(PowerOfTwo));
+        assert_eq!(super::runtime_buffer_rounding("/usr/bin/mlx-omarchy"), Pages);
     }
 }
 

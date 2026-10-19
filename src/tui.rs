@@ -1445,7 +1445,7 @@ impl Ui {
             return;
         }
         if matches!(self.input, Input::Update) {
-            self.draw_choice(f, "Update MLX", "Choose how to install and update the MLX backend.\n\nOmarchy: system-managed packages, full system update first.\nCustom Installer: latest GitHub release in your home folder.\nFixed: the latest release built from source with lmdeck's fixes\n(GPU buffers sized to fit, so big models load); takes a while to build.\nAll use the Apple GPU; release and model differences affect speed.\nYou can keep both runtimes or only the selected one afterwards.", &[
+            self.draw_choice(f, "Update MLX", "Choose how to install and update the MLX backend.\n\nOmarchy: system-managed packages, full system update first.\nCustom Installer: latest GitHub release in your home folder.\nFixed: the latest release built from source with lmdeck's fixes\n(finer GPU buffer sizes: ~0.3 GiB less for a 27B model); takes a while to build.\nAll use the Apple GPU; release and model differences affect speed.\nYou can keep both runtimes or only the selected one afterwards.", &[
                 ("1. Omarchy packages", KeyCode::Char('1')),
                 ("2. Custom Installer", KeyCode::Char('2')),
                 ("3. Fixed (build with lmdeck fixes)", KeyCode::Char('3')),
@@ -1455,12 +1455,11 @@ impl Ui {
         }
         if matches!(self.input, Input::Runtime) {
             let description = format!("Choose an already installed runtime; this does not reinstall it.\n\nSelected: {}\nOmarchy package: {}\nCustom Installer: {}\nFixed (release + lmdeck fixes): {}\n\n{}\nThe selected launcher is saved explicitly in lmdeck settings. Loaded models need a reload to switch.", self.versions.mlx_selected, self.versions.mlx_pkg.as_deref().unwrap_or("not installed — use Update MLX"), self.versions.mlx_legacy.as_deref().unwrap_or("not installed — use Update MLX"), self.versions.mlx_fixed.as_deref().unwrap_or("not built — Update MLX → 3"), {
-                let bins = |s: &str| crate::compat::runtime_bins_buffers(&sys::mlx_runtime_path(s).display().to_string());
-                match (bins("omarchy"), bins("custom")) {
-                    (false, true) => "Memory: the Custom build rounds GPU buffers up to powers of two (often +30-40% for big models); the package does not.".to_string(),
-                    (true, false) => "Memory: the package build rounds GPU buffers up to powers of two; the Custom build does not.".to_string(),
-                    _ => String::new(),
-                }
+                let notes: Vec<String> = [("omarchy", "package"), ("custom", "Custom"), ("fixed", "Fixed")].iter()
+                    .filter(|(s, _)| sys::mlx_runtime_path(s).exists())
+                    .filter_map(|(s, label)| crate::compat::runtime_buffer_rounding(&sys::mlx_runtime_path(s).display().to_string()).describe().map(|d| format!("the {label} build {d}")))
+                    .collect();
+                if notes.is_empty() { String::new() } else { format!("Memory: {}.", notes.join("; ")) }
             });
             self.draw_choice(f, "Choose MLX runtime", &description, &[
                 ("1. Use Omarchy package", KeyCode::Char('1')),
