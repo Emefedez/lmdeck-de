@@ -355,7 +355,24 @@ impl Manager {
 
     /// Estimated GPU bytes for `m` (weights + runtime + KV at its context).
     pub fn gpu_need(&self, m: &LocalModel) -> u64 {
-        self.gpu_need_ctx(m, MLX_PLAN_CTX)
+        self.gpu_need_ctx(m, self.plan_ctx(m))
+    }
+
+    /// The context the planner charges KV for. MLX serves with a prompt cache that grows
+    /// into the heap ceiling rather than being pre-allocated, so this is the overhead the
+    /// admission guard reserves up front: a per-model `ctx_size` override when set (clamped
+    /// to the model's own maximum), else the default plan context.
+    fn plan_ctx(&self, m: &LocalModel) -> u64 {
+        if m.format != Format::Mlx {
+            return MLX_PLAN_CTX;
+        }
+        match self.cfg().overrides.get(&m.name).and_then(|o| o.ctx_size) {
+            Some(c) if c > 0 => {
+                let want = (c as u64).max(MLX_MIN_CTX);
+                crate::compat::mlx_model_max_ctx(&m.path).map_or(want, |max| want.min(max))
+            }
+            _ => MLX_PLAN_CTX,
+        }
     }
 
     /// MLX: exact weights + attention cache for `mlx_ctx` tokens (from config.json) + runtime and
@@ -586,7 +603,7 @@ impl Manager {
                     // A quarter of the heap, but never more than what the weights and the planned
                     // attention cache leave free in it (a 19 GiB model in a 21 GiB heap).
                     let h = heap.unwrap_or_else(crate::compat::gpu_budget);
-                    let used = self.gpu_need_ctx(m, MLX_PLAN_CTX).saturating_sub(MLX_CACHE_ALLOWANCE);
+                    let used = self.gpu_need_ctx(m, self.plan_ctx(m)).saturating_sub(MLX_CACHE_ALLOWANCE);
                     (h / 4).min(h.saturating_sub(used)).max(MLX_CACHE_ALLOWANCE)
                 };
                 a.extend(["--prompt-cache-bytes".into(), cache_bytes.to_string()]);

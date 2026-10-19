@@ -305,6 +305,13 @@ pub fn mlx_weight_bytes(dir: &std::path::Path, rounding: BufferRounding) -> Opti
     (files > 0).then_some(total)
 }
 
+/// The model's own maximum context (max_position_embeddings) from config.json, if declared.
+pub fn mlx_model_max_ctx(dir: &std::path::Path) -> Option<u64> {
+    let c: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).ok()?).ok()?;
+    let t = c.get("text_config").filter(|t| t.is_object()).unwrap_or(&c);
+    t["max_position_embeddings"].as_u64().filter(|m| *m > 0)
+}
+
 /// Attention-cache bytes per token for an MLX model, from its config.json (f16 K and V on the
 /// full-attention layers only; hybrid models such as Qwen3.5/3.6/3.8 keep a fixed-size state on
 /// their linear-attention layers instead).
