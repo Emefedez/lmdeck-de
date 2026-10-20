@@ -65,6 +65,8 @@ enum Msg {
 enum Action {
     Script(String, String), // title, bash
     Exec(String, Vec<String>),
+    /// An editor: runs in the terminal and returns straight to lmdeck (no "press Enter").
+    Edit(Vec<String>),
 }
 
 fn parse_search_budget(text: &str) -> Result<Option<u64>, String> {
@@ -94,7 +96,6 @@ enum Input {
     RuntimeKeep(String),
     Guide,
     Override(String),
-    SystemPrompt(String),
     GpuGap(String, Option<String>),
     Free(Vec<sys::ProcGroup>, usize, Option<(String, String)>),
 }
@@ -104,6 +105,7 @@ enum Confirmed {
     ForceStop,
     Device(String, String),
     Delete(String),
+    ResetPrompt(String),
     Run(Action),
 }
 
@@ -115,6 +117,8 @@ struct RepoView {
 }
 
 struct Ui {
+    /// A prompt file open in the editor, and the text a new model file was seeded with.
+    editing: Option<(std::path::PathBuf, Option<String>)>,
     tab: Tab,
     cfg: Config,
     d: Daemon,
@@ -230,7 +234,16 @@ fn suspend_run(term: &mut DefaultTerminal, pause: &AtomicBool, a: Action) {
     std::thread::sleep(Duration::from_millis(150)); // let the input thread park
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
+    if let Action::Edit(argv) = &a {
+        let _ = std::process::Command::new(&argv[0]).args(&argv[1..]).status();
+        *term = ratatui::init();
+        let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+        let _ = term.clear();
+        pause.store(false, Ordering::Relaxed);
+        return;
+    }
     let (title, mut cmd) = match a {
+        Action::Edit(_) => unreachable!(),
         Action::Script(t, s) => {
             let mut c = std::process::Command::new("bash");
             c.arg("-c").arg(s);
@@ -265,6 +278,7 @@ fn suspend_run(term: &mut DefaultTerminal, pause: &AtomicBool, a: Action) {
 impl Ui {
     fn new(cfg: Config, tx: mpsc::UnboundedSender<Msg>) -> Self {
         Self {
+            editing: None,
             tab: Tab::Dashboard,
             d: Daemon::new(cfg.base_url()),
             models: models::scan(&cfg),
@@ -370,6 +384,20 @@ impl Ui {
     }
 
     fn after_action(&mut self) {
+        if let Some((p, seed)) = self.editing.take() {
+            let now = std::fs::read_to_string(&p).unwrap_or_default();
+            match seed {
+                // A new model file left as seeded (the backend's prompt): keep inheriting.
+                Some(seed) if now == seed => {
+                    let _ = std::fs::remove_file(&p);
+                    self.toast("unchanged: still the backend's system prompt");
+                }
+                _ if now.trim().is_empty() && p.parent().is_some_and(|d| d.ends_with("models")) => {
+                    self.toast("saved: no system prompt for this model (P = use the backend's)")
+                }
+                _ => self.toast(format!("saved {}", p.display())),
+            }
+        }
 
         self.cfg = Config::load().unwrap_or_else(|_| self.cfg.clone());
         self.refresh_versions();
@@ -704,21 +732,6 @@ impl Ui {
                             Err(e) => self.toast(format!("{key}: {e}")),
                         }
                     }
-                    Input::SystemPrompt(name) => {
-                        let mut c = self.cfg.clone();
-                        let o = c.overrides.entry(name.clone()).or_default();
-                        let t = text.trim();
-                        o.system_prompt = match t {
-                            "" => None,
-                            "-" => Some(String::new()),
-                            _ => Some(crate::sysprompt::from_line(t)),
-                        };
-                        if c.save().is_ok() {
-                            self.cfg = c;
-                            self.reload_daemon("override");
-                            self.toast(format!("{name}: system prompt {}", match t { "" => "from the backend", "-" => "off", _ => "set" }));
-                        }
-                    }
                     Input::Override(name) => {
                         let mut c = self.cfg.clone();
                         let o = c.overrides.entry(name.clone()).or_default();
@@ -758,6 +771,11 @@ impl Ui {
                     Ok(()) => self.toast("force-stopped lmdeck and its backends"),
                     Err(e) => self.toast(format!("force stop failed: {e}")),
                 }
+                None
+            }
+            Confirmed::ResetPrompt(name) => {
+                let _ = std::fs::remove_file(crate::sysprompt::model_file(&name));
+                self.toast(format!("{name}: system prompt from the backend again"));
                 None
             }
             Confirmed::Delete(name) => {
@@ -1039,13 +1057,18 @@ impl Ui {
                 }
             }
             KeyCode::Char('p') => {
+                if let Some(m) = self.selected_model() {
+                    let (name, format) = (m.name.clone(), m.format);
+                    return self.edit_model_prompt(name, format);
+                }
+            }
+            KeyCode::Char('P') => {
                 if let Some(name) = self.selected_model().map(|m| m.name.clone()) {
-                    self.buf = match self.cfg.overrides.get(&name).and_then(|o| o.system_prompt.as_deref()) {
-                        None => String::new(),
-                        Some("") => "-".into(),
-                        Some(p) => crate::sysprompt::to_line(p),
-                    };
-                    self.input = Input::SystemPrompt(name);
+                    if crate::sysprompt::model_file(&name).exists() {
+                        self.input = Input::Confirm(format!("Remove {name}'s own system prompt and use the backend's? [y/N]"), Confirmed::ResetPrompt(name));
+                    } else {
+                        self.toast(format!("{name} already uses the backend's system prompt"));
+                    }
                 }
             }
             KeyCode::Char('y') => {
@@ -1079,6 +1102,23 @@ impl Ui {
             spans.push(Span::styled(" cpu", Style::new().fg(Color::Yellow)));
         }
         Line::from(spans)
+    }
+
+    /// Open prompts/models/<model>.md in the editor. A model without one gets a new file seeded with
+    /// the backend's prompt, so you see what applies now; left unchanged it is removed again.
+    fn edit_model_prompt(&mut self, name: String, format: Format) -> Option<Action> {
+        let p = crate::sysprompt::model_file(&name);
+        let mut seed = None;
+        if !p.exists() {
+            let text = crate::sysprompt::backend_text(format);
+            if let Err(e) = std::fs::create_dir_all(p.parent().unwrap()).and_then(|_| std::fs::write(&p, &text)) {
+                self.toast(format!("{}: {e}", p.display()));
+                return None;
+            }
+            seed = Some(text);
+        }
+        self.editing = Some((p.clone(), seed));
+        Some(Action::Edit(crate::sysprompt::editor_cmd(&self.cfg, &p)))
     }
 
     fn device_of(&self, name: &str) -> String {
@@ -1299,6 +1339,21 @@ impl Ui {
             KeyCode::Up | KeyCode::Char('k') => move_sel(&mut self.settings_sel, SETTINGS.len(), -1),
             KeyCode::Enter | KeyCode::Char('e') => {
                 let i = self.settings_sel.selected().unwrap_or(0);
+                if let Some(f) = match SETTINGS[i].1 {
+                    "mlx.system_prompt" => Some(Format::Mlx),
+                    "llama.system_prompt" => Some(Format::Gguf),
+                    _ => None,
+                } {
+                    let p = crate::sysprompt::backend_file(f);
+                    if !p.exists() {
+                        if let Err(e) = crate::sysprompt::set_backend_text(f, "") {
+                            self.toast(format!("{}: {e}", p.display()));
+                            return None;
+                        }
+                    }
+                    self.editing = Some((p.clone(), None));
+                    return Some(Action::Edit(crate::sysprompt::editor_cmd(&self.cfg, &p)));
+                }
                 self.buf = get_setting(&self.cfg, SETTINGS[i].1);
                 self.input = Input::Setting(i);
             }
@@ -1307,8 +1362,7 @@ impl Ui {
                 if !p.exists() {
                     let _ = self.cfg.save();
                 }
-                let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".into());
-                return Some(Action::Exec("edit config".into(), vec![editor, p.display().to_string()]));
+                return Some(Action::Edit(crate::sysprompt::editor_cmd(&self.cfg, &p)));
             }
             _ => {}
         }
@@ -1407,7 +1461,7 @@ impl Ui {
         }
         let help = match self.tab {
             Tab::Dashboard => "Click a button · ? setup guide · i choose MLX runtime · B optional GGUF setup · r refresh",
-            Tab::Models => "⏎ load · u unload · g GPU⇄CPU · c chat · x context · p prompt · d delete · y copy · ✓ qualified ? untested ✗ GPU-incompatible",
+            Tab::Models => "⏎ load · u unload · g GPU⇄CPU · c chat · x context · p prompt (P: backend's) · d delete · y copy · ✓ qualified ? untested ✗ GPU-incompatible",
             Tab::Discover => {
                 if self.repo.is_some() {
                     "⏎ download · a recommended alternative · x cancel download · esc back"
@@ -1415,7 +1469,7 @@ impl Ui {
                     "/ search · g MLX/GGUF/Both · m RAM budget · o sort · c catalog⇄search · ⏎ open · x cancel download"
                 }
             }
-            Tab::Settings => "⏎ edit · o open config in $EDITOR",
+            Tab::Settings => "⏎ edit (prompts open in your editor) · o open config in your editor",
             Tab::Logs => "m daemon⇄model log · j/k scroll · G end",
         };
         let foot_line = match &self.toast {
@@ -1589,10 +1643,6 @@ impl Ui {
             Input::SearchBudget => ("Maximum estimated RAM in GiB (empty = unlimited)".into(), format!("{}▏", self.buf)),
             Input::Setting(i) => (format!("{} — {}", SETTINGS[*i].1, SETTINGS[*i].2), format!("{}▏", self.buf)),
             Input::Override(n) => (format!("Context size for {n} (empty = default)"), format!("{}▏", self.buf)),
-            Input::SystemPrompt(n) => (
-                format!("System prompt for {n} (empty = the backend's · - = none · \\n = newline · {{model}} {{date}})"),
-                format!("{}▏", self.buf),
-            ),
             Input::Confirm(q, _) => ("Confirm".into(), q.clone()),
             Input::GpuGap(m, rec) => (
                 "No Apple GPU kernel for this model".into(),
@@ -1882,7 +1932,7 @@ impl Ui {
     }
 
     fn draw_models(&mut self, f: &mut Frame, area: Rect) {
-        let buttons = [("Load [Enter]", KeyCode::Enter), ("Make room [m]", KeyCode::Char('m')), ("Unload [u]", KeyCode::Char('u')), ("Chat [c]", KeyCode::Char('c')), ("Context [x]", KeyCode::Char('x')), ("Delete [d]", KeyCode::Char('d'))];
+        let buttons = [("Load [Enter]", KeyCode::Enter), ("Make room [m]", KeyCode::Char('m')), ("Unload [u]", KeyCode::Char('u')), ("Chat [c]", KeyCode::Char('c')), ("Context [x]", KeyCode::Char('x')), ("Prompt [p]", KeyCode::Char('p')), ("Delete [d]", KeyCode::Char('d'))];
         let height = button_height(area.width.saturating_sub(2), &buttons);
         let [actions, area] = Layout::vertical([Constraint::Length(height + 1), Constraint::Min(0)]).areas(area);
         self.draw_buttons(f, actions.inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 }), &buttons);
@@ -1921,6 +1971,12 @@ impl Ui {
                             .unwrap_or_default(),
                     ),
                     Cell::from(caps.join(",")).fg(Color::DarkGray),
+                    match crate::sysprompt::source(&m.name, m.format) {
+                        crate::sysprompt::Source::Model => Cell::from("model").fg(Color::Cyan),
+                        crate::sysprompt::Source::Off => Cell::from("off").fg(Color::DarkGray),
+                        crate::sysprompt::Source::Backend => Cell::from(if m.format == Format::Mlx { "mlx" } else { "llama" }),
+                        crate::sysprompt::Source::None => Cell::from(""),
+                    },
                 ])
             })
             .collect();
@@ -1928,8 +1984,8 @@ impl Ui {
             (vec![Constraint::Length(1), Constraint::Min(12), Constraint::Length(5), Constraint::Length(6)], vec!["", "Name", "Fmt", "Size"])
         } else {
             (
-                vec![Constraint::Length(1), Constraint::Min(30), Constraint::Length(5), Constraint::Length(11), Constraint::Length(8), Constraint::Length(7), Constraint::Length(6), Constraint::Length(22)],
-                vec!["", "Name", "Fmt", "Quant", "Params", "Size", "Ctx", "Caps"],
+                vec![Constraint::Length(1), Constraint::Min(30), Constraint::Length(5), Constraint::Length(11), Constraint::Length(8), Constraint::Length(7), Constraint::Length(6), Constraint::Length(22), Constraint::Length(6)],
+                vec!["", "Name", "Fmt", "Quant", "Params", "Size", "Ctx", "Caps", "Prompt"],
             )
         };
         let t = Table::new(rows, widths)

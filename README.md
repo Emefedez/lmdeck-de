@@ -131,13 +131,18 @@ Every `/v1/messages` request logs the breakdown (system, messages, tools before 
 
 ### System prompts per model and backend
 
-lmdeck can add a system prompt of its own to every chat request: Ollama `/api/chat` and `/api/generate`, OpenAI `/v1/chat/completions` and Anthropic `/v1/messages`.
+lmdeck can add a system prompt of its own to every chat request: Ollama `/api/chat` and `/api/generate`, OpenAI `/v1/chat/completions` and Anthropic `/v1/messages`. The prompts are plain files, so you can see and edit them all in one editor (`code ~/.config/lmdeck/prompts`):
 
-- **Per backend:** `mlx.system_prompt` and `llama.system_prompt`, under **System prompts** in Settings and in the bar panel.
-- **Per model:** `p` on the Models tab, or `overrides."<model>".system_prompt` in `config.toml`. It wins over the backend's. `-` in the TUI (`""` in the file) means no prompt for that model.
-- **Mode** (`*.system_prompt_mode`, also per model): `prepend` (default) puts it before the client's system prompt, `replace` drops the client's, `fallback` is used only when the client sends none.
+| File | Applies to |
+|---|---|
+| `~/.config/lmdeck/prompts/mlx.md`, `llama.md` | every MLX / GGUF model |
+| `~/.config/lmdeck/prompts/models/<model>.md` (`/` in the name becomes `--`) | that model, instead of its backend's. An empty file means no prompt for that model |
 
-`{model}`, `{backend}` and `{date}` (UTC) are filled in, and `\n` is a newline in the one-line editors. Prompts apply per request, so changing one never reloads the model.
+- In the TUI, `p` on the Models tab opens the selected model's file in your editor. A model without its own file gets one filled in with the backend's prompt, so you see what applies now; left unchanged, it is removed again. `P` removes the model's file, so it uses the backend's prompt again. The **Prompt** column shows which one applies: `model`, `off`, `mlx` / `llama`, or nothing.
+- In Settings, Enter on **System prompts → mlx.system_prompt / llama.system_prompt** opens the backend file. The bar panel shows and edits them as one line, with `\n` for newlines.
+- The editor is `ui.editor` (Settings → Integration), else `$VISUAL`, `$EDITOR`, then `nvim`. VS Code (`code`, `codium`, `cursor`) gets `--wait`, so lmdeck comes back when you close the tab.
+- **Mode** (`mlx.system_prompt_mode`, `llama.system_prompt_mode`, or `overrides."<model>".system_prompt_mode`): `prepend` (default) puts the prompt before the client's system prompt, `replace` drops the client's, `fallback` is used only when the client sends none.
+- `{model}`, `{backend}` and `{date}` (UTC) are filled in. Files are read on every request, so an edit applies to the next request without reloading the model.
 
 ## VS Code / Copilot fallback
 
@@ -244,9 +249,9 @@ Token usage is counted for both Ollama and OpenAI requests. It lives in memory a
 | Tab | Keys |
 |---|---|
 | Dashboard | `s` start/stop server · `i` choose installed MLX runtime (package or Custom) · `f` processes / free memory · `?` setup and performance guide · `U` update MLX · `B` optional GGUF setup · `R` reload models · `a` unload all · `X` force stop · `S` install service · `M` switch to packages · `D` launcher + menu · `C` clear finished downloads · `r` re-check versions |
-| Models | `⏎` load · `u` unload · `c` chat in terminal · `x` per-model context · `p` per-model system prompt · `d` delete · `y` copy name |
+| Models | `⏎` load · `u` unload · `c` chat in terminal · `x` per-model context · `p` edit the model's system prompt · `P` back to the backend's · `d` delete · `y` copy name |
 | Discover | `/` search · `g` MLX/GGUF/Both · `m` RAM budget · `c` catalog⇄search · `⏎` open repo / download · `x` cancel download |
-| Settings | `⏎` edit · `←`/`→` memory sliders (reserves, GPU heap) · `o` open config in `$EDITOR` |
+| Settings | `⏎` edit (prompts open in your editor) · `←`/`→` memory sliders (reserves, GPU heap) · `o` open config in `$EDITOR` |
 | Logs | `m` daemon⇄model log · `j/k` scroll · `G` end |
 
 `1`–`5` or `Tab` switch tabs. `q` closes the TUI only; the server keeps running as a service, and the bar panel keeps working. Colors come from the terminal palette, so the Omarchy theme applies.

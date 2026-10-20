@@ -1522,8 +1522,18 @@ async fn lm_override(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         }
         "ctx_size" => o.ctx_size = value.parse().ok(),
         "keep_alive" => o.keep_alive = (!value.is_empty()).then(|| value.clone()),
-        // JSON null clears (inherit the backend's); "" sets no system prompt for this model.
-        "system_prompt" => o.system_prompt = (!b.get("value").is_none_or(|v| v.is_null())).then(|| value.clone()),
+        // prompts/models/<model>.md: JSON null removes it (inherit the backend's), "" = no prompt.
+        "system_prompt" => {
+            let p = crate::sysprompt::model_file(&m.name);
+            let r = if b.get("value").is_none_or(|v| v.is_null()) {
+                std::fs::remove_file(&p).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+            } else {
+                std::fs::create_dir_all(p.parent().unwrap()).and_then(|_| std::fs::write(&p, &value))
+            };
+            if let Err(e) = r {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{}: {e}", p.display()));
+            }
+        }
         "system_prompt_mode" => {
             if !value.is_empty() && !crate::sysprompt::MODES.contains(&value.as_str()) {
                 return err(StatusCode::BAD_REQUEST, "system_prompt_mode must be prepend, replace or fallback");

@@ -1069,18 +1069,18 @@ pub fn backend_sig(cfg: &Config, m: &LocalModel) -> String {
     // System prompts are applied per request: changing one must not restart the backend.
     let ov = cfg.overrides.get(&m.name).map(|o| {
         let mut o = o.clone();
-        (o.system_prompt, o.system_prompt_mode) = (None, None);
+        o.system_prompt_mode = None;
         serde_json::to_string(&o).unwrap_or_default()
     }).unwrap_or_default();
     let section = match m.format {
         Format::Mlx => {
             let mut s = cfg.mlx.clone();
-            (s.system_prompt, s.system_prompt_mode) = (String::new(), String::new());
+            s.system_prompt_mode = String::new();
             serde_json::to_string(&s).unwrap_or_default()
         }
         Format::Gguf => {
             let mut s = cfg.llama.clone();
-            (s.system_prompt, s.system_prompt_mode) = (String::new(), String::new());
+            s.system_prompt_mode = String::new();
             serde_json::to_string(&s).unwrap_or_default()
         }
     };
