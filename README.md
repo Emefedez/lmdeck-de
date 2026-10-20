@@ -129,6 +129,16 @@ Every `/v1/messages` request logs the breakdown (system, messages, tools before 
 
 **Prefix checkpoints.** Hybrid models such as Qwen3.5/3.8 keep part of their state in a cache that can't be rewound, so mlx_lm's single-request path (which caches prompt + answer) never reused anything and every agent turn re-read the whole prompt. lmdeck's shim now saves a checkpoint at the start of each answer, so the next turn (or the next `tool_group` round) only processes what is new: a follow-up turn went from ~99 s to ~13 s. A second checkpoint right after the system prompt (Claude Code's instructions plus tools, the same in every conversation) is also saved to `~/.cache/lmdeck/prompt-cache/` (~0.4 GB each, the 6 most recent per model and runtime), so new conversations and the first prompt after a restart or reload skip it too: a new Claude Code conversation after a restart went from ~104 s to ~50 s on Qwen3.8-27B.
 
+### System prompts per model and backend
+
+lmdeck can add a system prompt of its own to every chat request: Ollama `/api/chat` and `/api/generate`, OpenAI `/v1/chat/completions` and Anthropic `/v1/messages`.
+
+- **Per backend:** `mlx.system_prompt` and `llama.system_prompt`, under **System prompts** in Settings and in the bar panel.
+- **Per model:** `p` on the Models tab, or `overrides."<model>".system_prompt` in `config.toml`. It wins over the backend's. `-` in the TUI (`""` in the file) means no prompt for that model.
+- **Mode** (`*.system_prompt_mode`, also per model): `prepend` (default) puts it before the client's system prompt, `replace` drops the client's, `fallback` is used only when the client sends none.
+
+`{model}`, `{backend}` and `{date}` (UTC) are filled in, and `\n` is a newline in the one-line editors. Prompts apply per request, so changing one never reloads the model.
+
 ## VS Code / Copilot fallback
 
 `./install.sh --vscode` installs the **lmdeck VS Code extension** (`vscode-extension/`, packaged without vsce).
@@ -234,7 +244,7 @@ Token usage is counted for both Ollama and OpenAI requests. It lives in memory a
 | Tab | Keys |
 |---|---|
 | Dashboard | `s` start/stop server · `i` choose installed MLX runtime (package or Custom) · `f` processes / free memory · `?` setup and performance guide · `U` update MLX · `B` optional GGUF setup · `R` reload models · `a` unload all · `X` force stop · `S` install service · `M` switch to packages · `D` launcher + menu · `C` clear finished downloads · `r` re-check versions |
-| Models | `⏎` load · `u` unload · `c` chat in terminal · `x` per-model context · `d` delete · `y` copy name |
+| Models | `⏎` load · `u` unload · `c` chat in terminal · `x` per-model context · `p` per-model system prompt · `d` delete · `y` copy name |
 | Discover | `/` search · `g` MLX/GGUF/Both · `m` RAM budget · `c` catalog⇄search · `⏎` open repo / download · `x` cancel download |
 | Settings | `⏎` edit · `←`/`→` memory sliders (reserves, GPU heap) · `o` open config in `$EDITOR` |
 | Logs | `m` daemon⇄model log · `j/k` scroll · `G` end |

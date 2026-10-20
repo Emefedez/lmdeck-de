@@ -117,6 +117,10 @@ pub struct MlxCfg {
     pub max_kv_size: u32,
     pub extra_args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// System prompt for MLX models (empty = none). `{model}`, `{backend}`, `{date}` expand.
+    pub system_prompt: String,
+    /// How it combines with the client's: "prepend" / "replace" / "fallback" (only when none sent).
+    pub system_prompt_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +146,10 @@ pub struct LlamaCfg {
     pub env: BTreeMap<String, String>,
     /// Git ref built by "Build llama.cpp".
     pub git_ref: String,
+    /// System prompt for GGUF models (empty = none). `{model}`, `{backend}`, `{date}` expand.
+    pub system_prompt: String,
+    /// "prepend" / "replace" / "fallback".
+    pub system_prompt_mode: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -195,6 +203,11 @@ pub struct ModelOverride {
     pub gpu_layers: Option<i32>,
     pub extra_args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// Beats the backend's system prompt; Some("") = no system prompt for this model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt_mode: Option<String>,
 }
 
 impl Default for Config {
@@ -269,6 +282,8 @@ impl Default for MlxCfg {
             max_kv_size: 0,
             extra_args: vec![],
             env: BTreeMap::new(),
+            system_prompt: String::new(),
+            system_prompt_mode: "prepend".into(),
         }
     }
 }
@@ -289,6 +304,8 @@ impl Default for LlamaCfg {
             extra_args: vec![],
             env: BTreeMap::new(),
             git_ref: "master".into(),
+            system_prompt: String::new(),
+            system_prompt_mode: "prepend".into(),
         }
     }
 }
@@ -430,6 +447,10 @@ pub const SETTINGS: &[(&str, &str, &str)] = &[
     ("Memory & residency", "server.vm_reserve_gib", "Extra RAM kept free while the muvm VM runs (GiB)"),
     ("Memory & residency", "server.gpu_heap", "GPU heap per model: auto (raise only when needed, per process) / stock (50% of RAM) / N GiB"),
     ("Memory & residency", "server.gpu_mem_check", "Refuse GPU loads over the GPU memory budget (turning this off can freeze the machine)"),
+    ("System prompts", "mlx.system_prompt", "System prompt for MLX models (empty = none; \\n = newline; {model} {backend} {date}); per model: p in Models"),
+    ("System prompts", "mlx.system_prompt_mode", "MLX: prepend (before the client's) / replace (instead of it) / fallback (only when the client sends none)"),
+    ("System prompts", "llama.system_prompt", "System prompt for GGUF models (empty = none; \\n = newline; {model} {backend} {date}); per model: p in Models"),
+    ("System prompts", "llama.system_prompt_mode", "GGUF: prepend / replace / fallback"),
     ("KV cache · MLX", "mlx.kv_bits", "MLX KV quantization: 0 = f16, 8 or 4 bits (probed; falls back to f16)"),
     ("KV cache · MLX", "mlx.kv_group_size", "MLX KV quantization group size (32 / 64 / 128)"),
     ("KV cache · MLX", "mlx.quantized_kv_start", "MLX: quantize KV once the context passes N tokens"),
@@ -535,6 +556,10 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "vscode.fallback" => c.vscode.fallback.clone(),
         "vscode.model" => c.vscode.model.clone(),
         "mlx.max_context" => c.mlx.max_context.to_string(),
+        "mlx.system_prompt" => crate::sysprompt::to_line(&c.mlx.system_prompt),
+        "mlx.system_prompt_mode" => c.mlx.system_prompt_mode.clone(),
+        "llama.system_prompt" => crate::sysprompt::to_line(&c.llama.system_prompt),
+        "llama.system_prompt_mode" => c.llama.system_prompt_mode.clone(),
         _ => String::new(),
     }
 }
@@ -640,6 +665,14 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         }
         "vscode.model" => c.vscode.model = v.into(),
         "mlx.max_context" => c.mlx.max_context = (num(v)? as u32).clamp(2048, 1 << 20),
+        "mlx.system_prompt" => c.mlx.system_prompt = crate::sysprompt::from_line(v),
+        "llama.system_prompt" => c.llama.system_prompt = crate::sysprompt::from_line(v),
+        "mlx.system_prompt_mode" | "llama.system_prompt_mode" => {
+            if !crate::sysprompt::MODES.contains(&v) {
+                return Err("use prepend, replace or fallback".into());
+            }
+            if key == "mlx.system_prompt_mode" { c.mlx.system_prompt_mode = v.into() } else { c.llama.system_prompt_mode = v.into() }
+        }
         _ => return Err("unknown setting".into()),
     }
     Ok(())
@@ -648,5 +681,8 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
 
 /// Settings whose change only takes effect when a backend is (re)started.
 pub fn needs_reload(key: &str) -> bool {
+    if key.ends_with(".system_prompt") || key.ends_with(".system_prompt_mode") {
+        return false; // applied per request
+    }
     key.starts_with("mlx.") || (key.starts_with("llama.") && key != "llama.git_ref") || key == "server.uclamp_boost"
 }

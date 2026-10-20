@@ -1066,10 +1066,23 @@ const MLX_RUNTIME: u64 = 640 << 20;
 const MLX_CACHE_ALLOWANCE: u64 = 512 << 20;
 
 pub fn backend_sig(cfg: &Config, m: &LocalModel) -> String {
-    let ov = cfg.overrides.get(&m.name).map(|o| serde_json::to_string(o).unwrap_or_default()).unwrap_or_default();
+    // System prompts are applied per request: changing one must not restart the backend.
+    let ov = cfg.overrides.get(&m.name).map(|o| {
+        let mut o = o.clone();
+        (o.system_prompt, o.system_prompt_mode) = (None, None);
+        serde_json::to_string(&o).unwrap_or_default()
+    }).unwrap_or_default();
     let section = match m.format {
-        Format::Mlx => serde_json::to_string(&cfg.mlx).unwrap_or_default(),
-        Format::Gguf => serde_json::to_string(&cfg.llama).unwrap_or_default(),
+        Format::Mlx => {
+            let mut s = cfg.mlx.clone();
+            (s.system_prompt, s.system_prompt_mode) = (String::new(), String::new());
+            serde_json::to_string(&s).unwrap_or_default()
+        }
+        Format::Gguf => {
+            let mut s = cfg.llama.clone();
+            (s.system_prompt, s.system_prompt_mode) = (String::new(), String::new());
+            serde_json::to_string(&s).unwrap_or_default()
+        }
     };
     format!("{section}|{ov}|{}", cfg.server.uclamp_boost)
 }

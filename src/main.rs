@@ -8,6 +8,7 @@ mod launch;
 mod models;
 mod server;
 mod sys;
+mod sysprompt;
 mod toolgroups;
 mod tui;
 mod usage;

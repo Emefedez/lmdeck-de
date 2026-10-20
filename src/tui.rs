@@ -94,6 +94,7 @@ enum Input {
     RuntimeKeep(String),
     Guide,
     Override(String),
+    SystemPrompt(String),
     GpuGap(String, Option<String>),
     Free(Vec<sys::ProcGroup>, usize, Option<(String, String)>),
 }
@@ -703,6 +704,21 @@ impl Ui {
                             Err(e) => self.toast(format!("{key}: {e}")),
                         }
                     }
+                    Input::SystemPrompt(name) => {
+                        let mut c = self.cfg.clone();
+                        let o = c.overrides.entry(name.clone()).or_default();
+                        let t = text.trim();
+                        o.system_prompt = match t {
+                            "" => None,
+                            "-" => Some(String::new()),
+                            _ => Some(crate::sysprompt::from_line(t)),
+                        };
+                        if c.save().is_ok() {
+                            self.cfg = c;
+                            self.reload_daemon("override");
+                            self.toast(format!("{name}: system prompt {}", match t { "" => "from the backend", "-" => "off", _ => "set" }));
+                        }
+                    }
                     Input::Override(name) => {
                         let mut c = self.cfg.clone();
                         let o = c.overrides.entry(name.clone()).or_default();
@@ -1020,6 +1036,16 @@ impl Ui {
                 if let Some(name) = self.selected_model().map(|m| m.name.clone()) {
                     self.buf = self.cfg.overrides.get(&name).and_then(|o| o.ctx_size).map(|c| c.to_string()).unwrap_or_default();
                     self.input = Input::Override(name);
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Some(name) = self.selected_model().map(|m| m.name.clone()) {
+                    self.buf = match self.cfg.overrides.get(&name).and_then(|o| o.system_prompt.as_deref()) {
+                        None => String::new(),
+                        Some("") => "-".into(),
+                        Some(p) => crate::sysprompt::to_line(p),
+                    };
+                    self.input = Input::SystemPrompt(name);
                 }
             }
             KeyCode::Char('y') => {
@@ -1381,7 +1407,7 @@ impl Ui {
         }
         let help = match self.tab {
             Tab::Dashboard => "Click a button · ? setup guide · i choose MLX runtime · B optional GGUF setup · r refresh",
-            Tab::Models => "⏎ load · u unload · g GPU⇄CPU · c chat · x context · d delete · y copy · ✓ qualified ? untested ✗ GPU-incompatible",
+            Tab::Models => "⏎ load · u unload · g GPU⇄CPU · c chat · x context · p prompt · d delete · y copy · ✓ qualified ? untested ✗ GPU-incompatible",
             Tab::Discover => {
                 if self.repo.is_some() {
                     "⏎ download · a recommended alternative · x cancel download · esc back"
@@ -1563,6 +1589,10 @@ impl Ui {
             Input::SearchBudget => ("Maximum estimated RAM in GiB (empty = unlimited)".into(), format!("{}▏", self.buf)),
             Input::Setting(i) => (format!("{} — {}", SETTINGS[*i].1, SETTINGS[*i].2), format!("{}▏", self.buf)),
             Input::Override(n) => (format!("Context size for {n} (empty = default)"), format!("{}▏", self.buf)),
+            Input::SystemPrompt(n) => (
+                format!("System prompt for {n} (empty = the backend's · - = none · \\n = newline · {{model}} {{date}})"),
+                format!("{}▏", self.buf),
+            ),
             Input::Confirm(q, _) => ("Confirm".into(), q.clone()),
             Input::GpuGap(m, rec) => (
                 "No Apple GPU kernel for this model".into(),

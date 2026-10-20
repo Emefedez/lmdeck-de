@@ -690,7 +690,8 @@ async fn ollama_generate(a: App, b: Value, messages: Vec<Value>, is_chat: bool) 
         Ok(x) => x,
         Err(e) => return not_found_or_500(e),
     };
-    let body = openai_body(&b, messages, guard.0.backend_model_id());
+    let mut body = openai_body(&b, messages, guard.0.backend_model_id());
+    crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut body);
     let t_sent = Instant::now();
     let resp = match a.mgr.http.post(format!("{}/v1/chat/completions", guard.0.base())).json(&body).send().await {
         Ok(r) => r,
@@ -876,6 +877,7 @@ async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         sys_t + msg_t + sent_tools,
     ));
     let mut body = crate::anthropic::to_openai(&b, guard.0.backend_model_id(), mode);
+    crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut body);
     let groups = (mode == crate::anthropic::ToolMode::Groups)
         .then(|| crate::toolgroups::Groups::sync(b.get("tools").and_then(|t| t.as_array()).map(|t| t.as_slice()).unwrap_or(&[])).with_notes(mcp_notes))
         .filter(|g| !g.is_empty());
@@ -1146,6 +1148,9 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
     if let Some(o) = v.as_object_mut() {
         o.remove("keep_alive");
         o.insert("model".into(), json!(guard.0.backend_model_id()));
+    }
+    if uri.path().ends_with("/chat/completions") {
+        crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut v);
     }
     let url = format!("{}{}", guard.0.base(), uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path()));
     let mut rb = a.mgr.http.post(url).json(&v);
@@ -1517,6 +1522,14 @@ async fn lm_override(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         }
         "ctx_size" => o.ctx_size = value.parse().ok(),
         "keep_alive" => o.keep_alive = (!value.is_empty()).then(|| value.clone()),
+        // JSON null clears (inherit the backend's); "" sets no system prompt for this model.
+        "system_prompt" => o.system_prompt = (!b.get("value").is_none_or(|v| v.is_null())).then(|| value.clone()),
+        "system_prompt_mode" => {
+            if !value.is_empty() && !crate::sysprompt::MODES.contains(&value.as_str()) {
+                return err(StatusCode::BAD_REQUEST, "system_prompt_mode must be prepend, replace or fallback");
+            }
+            o.system_prompt_mode = (!value.is_empty()).then(|| value.clone());
+        }
         _ => return err(StatusCode::BAD_REQUEST, "unknown override key"),
     }
     if let Err(e) = cfg.save() {
