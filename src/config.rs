@@ -13,6 +13,7 @@ pub struct Config {
     pub download: DownloadCfg,
     pub mlx: MlxCfg,
     pub llama: LlamaCfg,
+    pub strata: StrataCfg,
     pub hooks: HooksCfg,
     pub usage: UsageCfg,
     pub vscode: VscodeCfg,
@@ -153,6 +154,55 @@ pub struct LlamaCfg {
     pub system_prompt_mode: String,
 }
 
+/// Strata (Qwen3.8-Flash-Next, 125B MoE with experts streamed from the SSD) through its own
+/// server. On Apple GPUs under Linux the engine is the Vulkan port in `repo`/`git_ref`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StrataCfg {
+    /// Install directory (the checkout, its .venv and the run configs strata-<model>.json).
+    /// Empty = ~/.local/share/lmdeck/strata.
+    pub dir: String,
+    pub repo: String,
+    pub git_ref: String,
+    /// "strata" (the real engine) or "mock" (Strata's scripted test engine: checks lmdeck's
+    /// plumbing without a model or a GPU; lists the model strata/mock).
+    pub engine: String,
+    /// Vulkan driver (ICD json) the engine runs on; empty = honeykrisp-strata's v3 build.
+    pub vk_icd: String,
+    /// How the system prompt in prompts/strata.md combines with the client's.
+    pub system_prompt_mode: String,
+    pub extra_args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+impl Default for StrataCfg {
+    fn default() -> Self {
+        Self {
+            dir: String::new(),
+            repo: "https://github.com/Emefedez/strata-asahi".into(),
+            git_ref: "vulkan-asahi".into(),
+            engine: "strata".into(),
+            vk_icd: String::new(),
+            system_prompt_mode: "prepend".into(),
+            extra_args: vec![],
+            env: BTreeMap::new(),
+        }
+    }
+}
+
+impl StrataCfg {
+    pub fn dir(&self) -> PathBuf {
+        if self.dir.trim().is_empty() { data_dir().join("strata") } else { expand(&self.dir) }
+    }
+    pub fn vk_icd(&self) -> PathBuf {
+        if self.vk_icd.trim().is_empty() {
+            home().join(".local/lib/honeykrisp-strata/v3/share/vulkan/icd.d/asahi_icd.aarch64.json")
+        } else {
+            expand(&self.vk_icd)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HooksCfg {
@@ -224,6 +274,7 @@ impl Default for Config {
             download: DownloadCfg::default(),
             mlx: MlxCfg::default(),
             llama: LlamaCfg::default(),
+            strata: StrataCfg::default(),
             hooks: HooksCfg::default(),
             usage: UsageCfg::default(),
             vscode: VscodeCfg::default(),
@@ -486,6 +537,14 @@ pub const SETTINGS: &[(&str, &str, &str)] = &[
     ("llama.cpp backend", "llama.extra_args", "Extra llama-server args"),
     ("llama.cpp backend", "llama.env", "Env for the llama backend, K=V,K=V"),
     ("llama.cpp backend", "llama.git_ref", "llama.cpp branch/tag to build"),
+    ("Strata backend", "strata.dir", "Strata install dir (empty = ~/.local/share/lmdeck/strata); install or update: T on the Dashboard"),
+    ("Strata backend", "strata.git_ref", "Branch of the Strata checkout (vulkan-asahi = the Apple GPU port)"),
+    ("Strata backend", "strata.engine", "strata (the real engine) / mock (scripted test engine, no model or GPU: lists strata/mock)"),
+    ("Strata backend", "strata.vk_icd", "Vulkan driver for the engine (ICD json; empty = honeykrisp-strata v3)"),
+    ("Strata backend", "strata.extra_args", "Extra Strata server args"),
+    ("Strata backend", "strata.env", "Env for the Strata server and engine, K=V,K=V"),
+    ("System prompts", "strata.system_prompt", "System prompt for Strata models, in prompts/strata.md: Enter opens it in your editor"),
+    ("System prompts", "strata.system_prompt_mode", "Strata: prepend / replace / fallback"),
     ("Downloads & storage", "models.hf_cache", "Hugging Face cache dir (empty = default)"),
     ("Downloads & storage", "models.extra_dirs", "Extra dirs with loose .gguf files (comma separated)"),
     ("Downloads & storage", "download.connections", "Parallel connections per large file"),
@@ -569,6 +628,14 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "mlx.system_prompt_mode" => c.mlx.system_prompt_mode.clone(),
         "llama.system_prompt" => crate::sysprompt::to_line(&crate::sysprompt::backend_text(crate::models::Format::Gguf)),
         "ui.editor" => c.ui.editor.clone(),
+        "strata.dir" => c.strata.dir.clone(),
+        "strata.git_ref" => c.strata.git_ref.clone(),
+        "strata.engine" => c.strata.engine.clone(),
+        "strata.vk_icd" => c.strata.vk_icd.clone(),
+        "strata.extra_args" => c.strata.extra_args.join(" "),
+        "strata.env" => kv_join(&c.strata.env),
+        "strata.system_prompt" => crate::sysprompt::to_line(&crate::sysprompt::backend_text(crate::models::Format::Strata)),
+        "strata.system_prompt_mode" => c.strata.system_prompt_mode.clone(),
         "llama.system_prompt_mode" => c.llama.system_prompt_mode.clone(),
         _ => String::new(),
     }
@@ -682,6 +749,22 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
             crate::sysprompt::set_backend_text(f, &crate::sysprompt::from_line(v)).map_err(|e| e.to_string())?
         }
         "ui.editor" => c.ui.editor = v.into(),
+        "strata.dir" => c.strata.dir = v.into(),
+        "strata.git_ref" => c.strata.git_ref = v.into(),
+        "strata.engine" => match v {
+            "strata" | "mock" => c.strata.engine = v.into(),
+            _ => return Err("strata or mock".into()),
+        },
+        "strata.vk_icd" => c.strata.vk_icd = v.into(),
+        "strata.extra_args" => c.strata.extra_args = words(v),
+        "strata.env" => c.strata.env = kv_parse(v),
+        "strata.system_prompt" => crate::sysprompt::set_backend_text(crate::models::Format::Strata, &crate::sysprompt::from_line(v)).map_err(|e| e.to_string())?,
+        "strata.system_prompt_mode" => {
+            if !crate::sysprompt::MODES.contains(&v) {
+                return Err("use prepend, replace or fallback".into());
+            }
+            c.strata.system_prompt_mode = v.into()
+        }
         "mlx.system_prompt_mode" | "llama.system_prompt_mode" => {
             if !crate::sysprompt::MODES.contains(&v) {
                 return Err("use prepend, replace or fallback".into());
@@ -699,5 +782,8 @@ pub fn needs_reload(key: &str) -> bool {
     if key.ends_with(".system_prompt") || key.ends_with(".system_prompt_mode") || key.starts_with("ui.") {
         return false; // applied per request
     }
-    key.starts_with("mlx.") || (key.starts_with("llama.") && key != "llama.git_ref") || key == "server.uclamp_boost"
+    key.starts_with("mlx.")
+        || (key.starts_with("llama.") && key != "llama.git_ref")
+        || matches!(key, "strata.engine" | "strata.vk_icd" | "strata.extra_args" | "strata.env")
+        || key == "server.uclamp_boost"
 }

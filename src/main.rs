@@ -83,6 +83,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: LlamaCmd,
     },
+    /// Strata (Qwen3.8-Flash-Next) backend
+    Strata {
+        #[command(subcommand)]
+        cmd: StrataCmd,
+    },
     /// systemd user service
     Service {
         #[command(subcommand)]
@@ -108,6 +113,12 @@ enum Cmd {
 enum LlamaCmd {
     /// Build (or update) llama.cpp with Vulkan into ~/.local/share/lmdeck/llama.cpp
     Build,
+}
+
+#[derive(Subcommand)]
+enum StrataCmd {
+    /// Install or update Strata (checkout, server venv, Apple GPU Vulkan driver, engine) into strata.dir
+    Install,
 }
 
 #[derive(Subcommand)]
@@ -264,6 +275,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Llama { cmd: LlamaCmd::Build }) => run_script(&sys::script_build_llama(&cfg)),
+        Some(Cmd::Strata { cmd: StrataCmd::Install }) => run_script(&sys::script_install_strata(&cfg)),
         Some(Cmd::Service { cmd }) => {
             match cmd {
                 SvcCmd::Install => {

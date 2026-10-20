@@ -740,6 +740,63 @@ done
     )
 }
 
+/// Install or update Strata: the checkout (cfg.strata.repo / git_ref), the server's venv, the
+/// Apple GPU Vulkan driver it runs on (honeykrisp-strata's private ICD; the desktop's Mesa is
+/// not touched) and, once the branch has it, the Vulkan engine.
+pub fn script_install_strata(cfg: &Config) -> String {
+    let dir = cfg.strata.dir();
+    let icd = cfg.strata.vk_icd();
+    let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    format!(
+        r#"{HEADER}
+DIR="{dir}"
+REPO="{repo}"
+REF="{gitref}"
+ICD="{icd}"
+say "Strata ($REF) into $DIR"
+need=()
+for p in git python cmake ninja; do pacman -Q "$p" >/dev/null 2>&1 || need+=("$p"); done
+if ((${{#need[@]}})); then
+  say "Installing: ${{need[*]}}"
+  if command -v omarchy-pkg-add >/dev/null; then omarchy-pkg-add "${{need[@]}}"; else sudo pacman -S --needed "${{need[@]}}"; fi || die "deps"
+fi
+if [[ -d "$DIR/.git" ]]; then
+  git -C "$DIR" fetch origin "$REF" && git -C "$DIR" checkout -q -B "$REF" FETCH_HEAD || die "git fetch"
+else
+  git clone --branch "$REF" "$REPO" "$DIR" || die "git clone"
+fi
+say "Commit: $(git -C "$DIR" log -1 --format='%h %cs %s' | cut -c1-120)"
+say "Server packages (.venv)"
+[[ -x "$DIR/.venv/bin/python" ]] || python -m venv "$DIR/.venv" || die "venv"
+"$DIR/.venv/bin/pip" install -q --disable-pip-version-check -r "$DIR/requirements.txt" || die "pip"
+if [[ -f "$ICD" ]]; then
+  say "Vulkan driver: $ICD ($(cat "$(dirname "$ICD")/../../../mesa-git-sha" 2>/dev/null || echo built))"
+else
+  say "Building the Apple GPU Vulkan driver for Strata (private ICD; the desktop keeps its Mesa)"
+  HK="$HOME/Work/honeykrisp-strata"
+  [[ -x "$HK/build-icd.sh" ]] || {{ HK="$DIR/../honeykrisp-strata"; [[ -d "$HK/.git" ]] || git clone https://github.com/Emefedez/honeykrisp-strata "$HK" || die "clone honeykrisp-strata"; }}
+  for p in meson clang llvm libclc spirv-llvm-translator spirv-tools glslang python-mako python-packaging python-yaml; do pacman -Q "$p" >/dev/null 2>&1 || need+=("$p"); done
+  ((${{#need[@]}})) && sudo pacman -S --needed "${{need[@]}}"
+  bash "$HK/build-icd.sh" || die "driver build"
+fi
+if grep -q STRATA_ENABLE_VULKAN "$DIR/CMakeLists.txt"; then
+  say "Building the Vulkan engine"
+  cmake -S "$DIR" -B "$DIR/build-vulkan" -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_VULKAN=ON || die "cmake configure"
+  cmake --build "$DIR/build-vulkan" -j{jobs} --target strata || die "engine build"
+  say "Engine: $DIR/build-vulkan/strata"
+else
+  warn "This branch has no Vulkan engine yet (the port is in progress): the server is installed,"
+  warn "Strata models are listed but refuse to load until the engine is built. strata.engine = mock tests the plumbing."
+fi
+say "Done. Run configs (strata-<model>.json) in $DIR show up as strata/<model> in lmdeck."
+"#,
+        dir = dir.display(),
+        repo = cfg.strata.repo,
+        gitref = cfg.strata.git_ref,
+        icd = icd.display(),
+    )
+}
+
 pub fn script_build_llama(cfg: &Config) -> String {
     let dir = llama_dir();
     let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);

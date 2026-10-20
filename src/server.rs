@@ -996,6 +996,8 @@ pub fn context_limit(cfg: &Config, m: &LocalModel) -> u64 {
             let model_max = m.ctx_len.unwrap_or(u64::MAX);
             ov.unwrap_or(cfg.mlx.max_context as u64).min(model_max)
         }
+        // The engine's --max-context (Strata's server enforces it itself as well).
+        Format::Strata => ov.unwrap_or(u64::MAX).min(m.ctx_len.unwrap_or(32768)),
     }
 }
 

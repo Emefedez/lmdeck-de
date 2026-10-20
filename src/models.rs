@@ -13,6 +13,8 @@ use std::time::SystemTime;
 pub enum Format {
     Mlx,
     Gguf,
+    /// A Strata run config (strata-<model>.json) served by Strata's own server.
+    Strata,
 }
 
 impl Format {
@@ -20,6 +22,7 @@ impl Format {
         match self {
             Format::Mlx => "mlx",
             Format::Gguf => "gguf",
+            Format::Strata => "strata",
         }
     }
 }
@@ -97,8 +100,67 @@ pub fn scan(cfg: &Config) -> Vec<LocalModel> {
     for d in &cfg.models.extra_dirs {
         scan_loose(&crate::config::expand(d), &mut out);
     }
+    scan_strata(cfg, &mut out);
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     out
+}
+
+/// Strata models: the run configs `strata-<model>.json` that Strata's setup writes into its
+/// install dir. With `strata.engine = mock`, also `strata/mock` (the scripted test engine).
+fn scan_strata(cfg: &Config, out: &mut Vec<LocalModel>) {
+    let dir = cfg.strata.dir();
+    let mut configs: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    let n = fname(p);
+                    n.starts_with("strata-") && n.ends_with(".json") && n != "strata-mock.json"
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if cfg.strata.engine == "mock" {
+        let p = dir.join("strata-mock.json");
+        if !p.exists() && dir.join("serve/server.py").exists() {
+            let _ = std::fs::write(&p, "{\"model_name\": \"qwen3.8-flash-next-mock\"}\n");
+        }
+        if p.exists() {
+            configs.push(p);
+        }
+    }
+    for p in configs {
+        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        let stem = fname(&p).trim_start_matches("strata-").trim_end_matches(".json").to_string();
+        let args: Vec<String> = v["args"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        let arg = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+        // The model's big files: the GGUF(s) the engine maps and the experts' streaming copy.
+        let mut files: Vec<PathBuf> = ["--native", "--ple-gguf"].iter().filter_map(|f| arg(f)).map(PathBuf::from).filter(|f| f.is_file()).collect();
+        let experts: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(format!("{}.experts", f.display()))).filter(|f| f.is_file()).collect();
+        files.extend(experts);
+        let size = files.iter().filter_map(|f| f.metadata().ok()).map(|m| m.len()).sum();
+        files.push(p.clone());
+        let quant = stem.rsplit('-').next().unwrap_or("").to_uppercase();
+        out.push(LocalModel {
+            name: format!("strata/{stem}"),
+            format: Format::Strata,
+            repo: None,
+            path: p.clone(),
+            files,
+            size,
+            quant: if stem == "mock" { "mock".into() } else { quant },
+            qmode: None,
+            arch: "qwen3.8-flash-next".into(),
+            params: "125B".into(),
+            ctx_len: arg("--max-context").and_then(|c| c.parse().ok()).or(Some(32768)),
+            mmproj: None,
+            modified: p.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH),
+            tools: true,
+            thinking: true,
+            vision: false,
+        });
+    }
 }
 
 /// refs/main -> snapshots/<sha>; else most recently modified snapshot.

@@ -58,7 +58,7 @@ impl Running {
     pub fn backend_model_id(&self) -> &str {
         match self.model.format {
             Format::Mlx => "default_model",
-            Format::Gguf => &self.name,
+            Format::Gguf | Format::Strata => &self.name,
         }
     }
     pub fn expires_in(&self) -> Option<Duration> {
@@ -384,6 +384,9 @@ impl Manager {
                 let ctx = cfg.overrides.get(&m.name).and_then(|o| o.ctx_size).unwrap_or(cfg.llama.ctx_size) as u64;
                 crate::compat::gpu_need(m.size, ctx)
             }
+            // The experts stream from the SSD into an arena the engine sizes itself from what is
+            // free, so admission only needs the floor: the dense weights, buffers and a small arena.
+            Format::Strata => if cfg.strata.engine == "mock" { 0 } else { STRATA_FLOOR },
             Format::Mlx => {
                 let rounding = cfg.mlx.command.first().map_or(crate::compat::BufferRounding::Pages, |c| crate::compat::runtime_buffer_rounding(c));
                 let weights = crate::compat::mlx_weight_bytes(&m.path, rounding).unwrap_or(m.size);
@@ -399,7 +402,7 @@ impl Manager {
     /// Per process only: nothing global changes, and it ends with the backend.
     fn heap_plan(&self, m: &LocalModel) -> Result<Option<u64>> {
         let cfg = self.cfg();
-        if !self.on_gpu(m) {
+        if !self.on_gpu(m) || (m.format == Format::Strata && cfg.strata.engine == "mock") {
             return Ok(None);
         }
         partial_layers().lock().unwrap().remove(&m.name);
@@ -413,7 +416,9 @@ impl Manager {
         let heap = match policy.as_str() {
             "stock" => stock,
             "auto" | "" => {
-                if need <= stock * 92 / 100 {
+                // Strata always gets the safe free memory: whatever the arena cannot hold is read
+                // from the SSD on every token, so a bigger arena is directly faster.
+                if need <= stock * 92 / 100 && m.format != Format::Strata {
                     return Ok(None);
                 }
                 // Room the model can really take: what is free now (already net of
@@ -421,7 +426,7 @@ impl Manager {
                 let cap = avail.saturating_sub(reserve).min(total.saturating_sub(reserve));
                 // MLX needs are exact (weights from the files, KV from the config): a fixed margin.
                 // GGUF keeps the proportional one.
-                let margin = |n: u64| if m.format == Format::Mlx { 512 << 20 } else { n / 12 + (512 << 20) };
+                let margin = |n: u64| if m.format != Format::Gguf { 512 << 20 } else { n / 12 + (512 << 20) };
                 let mut need = need;
                 let mut want = need + margin(need);
                 if want > cap && m.format == Format::Mlx {
@@ -566,7 +571,7 @@ impl Manager {
         let cfg = self.cfg();
         let ctx = cfg.overrides.get(&m.name).and_then(|o| o.ctx_size).unwrap_or(cfg.llama.ctx_size) as u64;
         // weights + ~10% runtime overhead + rough KV/compute workspace scaled by context.
-        let need = if m.format == Format::Mlx && self.on_gpu(m) {
+        let need = if (m.format == Format::Mlx && self.on_gpu(m)) || m.format == Format::Strata {
             // Unified memory: the GPU estimate is the RAM it takes (at the shortest planned context).
             self.gpu_need_ctx(m, MLX_MIN_CTX)
         } else {
@@ -585,6 +590,7 @@ impl Manager {
         let cfg = self.cfg();
         let ov = cfg.overrides.get(&m.name).cloned().unwrap_or_default();
         let port = free_port()?;
+        let mut cwd: Option<std::path::PathBuf> = None;
         let (mut argv, mut env): (Vec<String>, Vec<(String, String)>) = match m.format {
             Format::Mlx => {
                 let mut a = cfg.mlx.command.clone();
@@ -672,6 +678,59 @@ impl Manager {
                 a.extend(cfg.llama.extra_args.clone());
                 (a, cfg.llama.env.clone().into_iter().collect())
             }
+            Format::Strata => {
+                let dir = cfg.strata.dir();
+                let python = dir.join(".venv/bin/python");
+                if !python.exists() || !dir.join("serve/server.py").exists() {
+                    bail!("Strata is not installed: Dashboard → T (or `lmdeck strata install`) sets it up in {}", dir.display());
+                }
+                let mock = cfg.strata.engine == "mock";
+                if !mock {
+                    let run: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&m.path)?)
+                        .with_context(|| format!("reading {}", m.path.display()))?;
+                    let exe = run["exe"].as_str().unwrap_or("");
+                    if exe.is_empty() || !std::path::Path::new(exe).exists() {
+                        bail!(
+                            "{}: the Strata engine for Apple GPUs under Linux is not built yet (the Vulkan port, {} branch {}); nothing was loaded",
+                            m.name, cfg.strata.repo, cfg.strata.git_ref
+                        );
+                    }
+                }
+                let ready = crate::config::state_dir().join(format!("strata-{port}.ready.json"));
+                std::fs::create_dir_all(crate::config::state_dir())?;
+                let _ = std::fs::remove_file(&ready);
+                let mut a = vec![
+                    python.display().to_string(),
+                    dir.join("serve/server.py").display().to_string(),
+                    "--engine".into(),
+                    if mock { "mock".into() } else { "strata".into() },
+                    "--config".into(),
+                    m.path.display().to_string(),
+                    "--host".into(),
+                    "127.0.0.1".into(),
+                    "--port".into(),
+                    port.to_string(),
+                    "--ready-file".into(),
+                    ready.display().to_string(),
+                ];
+                if mock {
+                    // The template opens a thinking block; the script closes it so the text is the answer.
+                    a.extend(["--script".into(), "</think>\n\nHello from Strata's mock engine, served through lmdeck.".into()]);
+                }
+                a.extend(cfg.strata.extra_args.clone());
+                let mut env: Vec<(String, String)> = cfg.strata.env.clone().into_iter().collect();
+                let icd = cfg.strata.vk_icd();
+                if icd.exists() {
+                    env.push(("VK_DRIVER_FILES".into(), icd.display().to_string()));
+                }
+                if let Some(h) = heap {
+                    // The arena the engine may fill with experts: the heap planned for it.
+                    env.push(("STRATA_VK_ARENA_BYTES".into(), h.saturating_sub(STRATA_FLOOR).to_string()));
+                }
+                env.push(("PYTHONPATH".into(), dir.display().to_string()));
+                cwd = Some(dir);
+                (a, env)
+            }
         };
         argv.extend(ov.extra_args.clone());
         env.extend(ov.env.clone());
@@ -704,6 +763,9 @@ impl Manager {
         }
 
         let mut cmd = Command::new(&argv[0]);
+        if let Some(d) = &cwd {
+            cmd.current_dir(d);
+        }
         cmd.args(&argv[1..])
             .envs(env)
             .stdin(Stdio::null())
@@ -1063,6 +1125,9 @@ mod work_tests {
 /// Context the MLX planner sizes the attention cache for (agents send long prompts); a tight
 /// machine falls back to MLX_MIN_CTX before refusing.
 const MLX_PLAN_CTX: u64 = 32768;
+/// Strata's admission floor: the dense weights and buffers (~5 GiB on Qwen3.8-Flash-Next Q2_0)
+/// plus the smallest useful expert arena; the engine fills the rest of its heap with experts.
+const STRATA_FLOOR: u64 = 9 << 30;
 const MLX_MIN_CTX: u64 = 8192;
 /// Activations at prefill_step_size 512 plus Vulkan pipelines and scratch.
 const MLX_RUNTIME: u64 = 640 << 20;
@@ -1084,6 +1149,11 @@ pub fn backend_sig(cfg: &Config, m: &LocalModel) -> String {
         }
         Format::Gguf => {
             let mut s = cfg.llama.clone();
+            s.system_prompt_mode = String::new();
+            serde_json::to_string(&s).unwrap_or_default()
+        }
+        Format::Strata => {
+            let mut s = cfg.strata.clone();
             s.system_prompt_mode = String::new();
             serde_json::to_string(&s).unwrap_or_default()
         }

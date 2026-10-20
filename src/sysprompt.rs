@@ -1,6 +1,6 @@
 //! System prompts, kept as plain files so any editor can show and change them:
 //!
-//!   ~/.config/lmdeck/prompts/mlx.md, llama.md          per backend
+//!   ~/.config/lmdeck/prompts/mlx.md, llama.md, strata.md   per backend
 //!   ~/.config/lmdeck/prompts/models/<model>.md          per model ('/' in the name becomes "--")
 //!
 //! A model file beats its backend's; an empty model file means no system prompt for that model.
@@ -24,6 +24,7 @@ fn backend_name(f: Format) -> &'static str {
     match f {
         Format::Mlx => "mlx",
         Format::Gguf => "llama",
+        Format::Strata => "strata",
     }
 }
 
@@ -87,9 +88,15 @@ pub fn for_model_in(cfg: &Config, dir: &Path, name: &str, f: Format) -> Option<(
     let backend_mode = match f {
         Format::Mlx => &cfg.mlx.system_prompt_mode,
         Format::Gguf => &cfg.llama.system_prompt_mode,
+        Format::Strata => &cfg.strata.system_prompt_mode,
     };
     let mode = cfg.overrides.get(name).and_then(|o| o.system_prompt_mode.clone()).unwrap_or_else(|| backend_mode.clone());
-    Some((expand(text, name, if f == Format::Mlx { "mlx" } else { "llama.cpp" }), mode))
+    let label = match f {
+        Format::Mlx => "mlx",
+        Format::Gguf => "llama.cpp",
+        Format::Strata => "strata",
+    };
+    Some((expand(text, name, label), mode))
 }
 
 /// `{model}`, `{backend}` and `{date}` (YYYY-MM-DD, UTC).

@@ -129,6 +129,15 @@ Every `/v1/messages` request logs the breakdown (system, messages, tools before 
 
 **Prefix checkpoints.** Hybrid models such as Qwen3.5/3.8 keep part of their state in a cache that can't be rewound, so mlx_lm's single-request path (which caches prompt + answer) never reused anything and every agent turn re-read the whole prompt. lmdeck's shim now saves a checkpoint at the start of each answer, so the next turn (or the next `tool_group` round) only processes what is new: a follow-up turn went from ~99 s to ~13 s. A second checkpoint right after the system prompt (Claude Code's instructions plus tools, the same in every conversation) is also saved to `~/.cache/lmdeck/prompt-cache/` (~0.4 GB each, the 6 most recent per model and runtime), so new conversations and the first prompt after a restart or reload skip it too: a new Claude Code conversation after a restart went from ~104 s to ~50 s on Qwen3.8-27B.
 
+### Strata (Qwen3.8-Flash-Next, 125B MoE)
+
+[Strata](https://github.com/Niko1221/Strata) runs a 125B mixture-of-experts model on 32 GB machines. It keeps the most-used experts in memory and streams the rest from the SSD. lmdeck runs Strata's own server (OpenAI, Anthropic and Responses APIs) as a third backend next to MLX and llama.cpp.
+
+- **Install / update:** `T` on the Dashboard, or `lmdeck strata install`. It clones `strata.repo` at branch `strata.git_ref` (default: `Emefedez/strata-asahi`, `vulkan-asahi`, the Apple GPU port) into `strata.dir`, sets up the server's venv, and builds the Apple GPU Vulkan driver the engine runs on if it is missing. That driver is [honeykrisp-strata](https://github.com/Emefedez/honeykrisp-strata)'s private ICD; the desktop keeps its Mesa. The engine itself is built once the branch contains the Vulkan port. The model is not downloaded by the installer.
+- **Models:** every run config `strata-<model>.json` in `strata.dir` shows up as `strata/<model>`. Loading starts `serve/server.py` with that config, `VK_DRIVER_FILES` set to the private driver, and `STRATA_VK_ARENA_BYTES`, the expert arena: all the safe free memory minus a 9 GiB floor for the dense weights.
+- **Status:** the Vulkan engine is in progress, so Strata models are listed but refuse to load ("the Strata engine for Apple GPUs under Linux is not built yet"). `strata.engine = mock` lists `strata/mock`, Strata's scripted test engine. It checks the whole path (install, load, `/api/chat`, `/v1/messages`, `/v1/responses`, unload) without a model or a GPU, and loads in 0.3 s.
+- The system prompt file is `prompts/strata.md`; the settings are under **Strata backend** in Settings.
+
 ### Codex and the Responses API
 
 `POST /v1/responses` (what Codex speaks) is translated onto the backend's Chat Completions, on MLX and GGUF alike. Text and reasoning stream; tool calls come back as whole items. Codex's `apply_patch` (a free-form "custom" tool) is offered to the model as a function with one `input` string. `previous_response_id` works for the last 32 responses (kept in memory). As on `/v1/messages`, `server.local_tools` other than `all` drops the MCP tools: Codex sends each MCP server as a `namespace`, and with 9 servers that was 284 tools, ~83k tokens, against ~8k without them. lmdeck reports itself as Ollama 0.14.0, since Codex 0.16x refuses older versions. `lmdeck launch codex` on Qwen3.5-4B: a shell tool call and the answer, first turn 23 s, follow-up 3 s.
@@ -258,7 +267,7 @@ Token usage is counted for both Ollama and OpenAI requests. It lives in memory a
 
 | Tab | Keys |
 |---|---|
-| Dashboard | `s` start/stop server · `i` choose installed MLX runtime (package or Custom) · `f` processes / free memory · `?` setup and performance guide · `U` update MLX · `B` optional GGUF setup · `R` reload models · `a` unload all · `X` force stop · `S` install service · `M` switch to packages · `D` launcher + menu · `C` clear finished downloads · `r` re-check versions |
+| Dashboard | `s` start/stop server · `i` choose installed MLX runtime (package or Custom) · `f` processes / free memory · `?` setup and performance guide · `U` update MLX · `B` optional GGUF setup · `T` install or update Strata · `R` reload models · `a` unload all · `X` force stop · `S` install service · `M` switch to packages · `D` launcher + menu · `C` clear finished downloads · `r` re-check versions |
 | Models | `⏎` load · `u` unload · `c` chat in terminal · `x` per-model context · `p` edit the model's system prompt · `P` back to the backend's · `d` delete · `y` copy name |
 | Discover | `/` search · `g` MLX/GGUF/Both · `m` RAM budget · `c` catalog⇄search · `⏎` open repo / download · `x` cancel download |
 | Settings | `⏎` edit (prompts open in your editor) · `←`/`→` memory sliders (reserves, GPU heap) · `o` open config in `$EDITOR` |

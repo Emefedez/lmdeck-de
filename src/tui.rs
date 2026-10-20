@@ -976,6 +976,12 @@ impl Ui {
                     Confirmed::Run(Action::Script("build llama.cpp (Vulkan)".into(), sys::script_build_llama(&self.cfg))),
                 );
             }
+            KeyCode::Char('T') => {
+                self.input = Input::Confirm(
+                    format!("Install or update Strata (Qwen3.8-Flash-Next, {} branch {})? Clones it, sets up its server and builds the Apple GPU Vulkan driver it runs on. The model itself is not downloaded. [y/N]", self.cfg.strata.repo, self.cfg.strata.git_ref),
+                    Confirmed::Run(Action::Script("install Strata".into(), sys::script_install_strata(&self.cfg))),
+                );
+            }
             KeyCode::Char('C') => {
                 let d = self.d.clone();
                 let tx = self.tx.clone();
@@ -1342,6 +1348,7 @@ impl Ui {
                 if let Some(f) = match SETTINGS[i].1 {
                     "mlx.system_prompt" => Some(Format::Mlx),
                     "llama.system_prompt" => Some(Format::Gguf),
+                    "strata.system_prompt" => Some(Format::Strata),
                     _ => None,
                 } {
                     let p = crate::sysprompt::backend_file(f);
@@ -1672,7 +1679,7 @@ impl Ui {
             _ => "Custom",
         });
         let primary = [(server, KeyCode::Char('s')), ("Update MLX [U]", KeyCode::Char('U')), (runtime.as_str(), KeyCode::Char('i')), ("Setup guide [?]", KeyCode::Char('?'))];
-        let secondary = [("Models [2]", KeyCode::Char('2')), ("Free memory [f]", KeyCode::Char('f')), ("GGUF setup [B]", KeyCode::Char('B')), ("Reload models [R]", KeyCode::Char('R')), ("Unload all [a]", KeyCode::Char('a')), ("Cancel download [x]", KeyCode::Char('x'))];
+        let secondary = [("Models [2]", KeyCode::Char('2')), ("Free memory [f]", KeyCode::Char('f')), ("GGUF setup [B]", KeyCode::Char('B')), ("Strata [T]", KeyCode::Char('T')), ("Reload models [R]", KeyCode::Char('R')), ("Unload all [a]", KeyCode::Char('a')), ("Cancel download [x]", KeyCode::Char('x'))];
         let width = area.width.saturating_sub(4);
         let primary_height = button_height(width, &primary);
         let secondary_height = button_height(width, &secondary);
