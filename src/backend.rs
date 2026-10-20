@@ -611,6 +611,7 @@ impl Manager {
                 a.extend(cfg.mlx.extra_args.clone());
                 let mut env: Vec<(String, String)> = cfg.mlx.env.clone().into_iter().collect();
                 env.push(("LMDECK_MLX_BATCH".into(), if cfg.mlx.batching { "1" } else { "0" }.into()));
+                env.push(("LMDECK_MLX_CACHE_LIMIT_GIB".into(), cfg.mlx.cache_limit_gib.to_string()));
                 env.push(("LMDECK_MLX_DECODE_ATTN".into(), cfg.mlx.decode_attention.clone()));
                 env.push(("LMDECK_MLX_CHECKPOINTS".into(), if cfg.mlx.prefix_checkpoints { "1" } else { "0" }.into()));
                 env.push(("LMDECK_MLX_KV_BITS".into(), cfg.mlx.kv_bits.to_string()));

@@ -430,9 +430,56 @@ def lmdeck_checkpoint(server, model, tokenizer, prompt, rest, cache, progress):
     return prompt[pos:]
 
 
+def limit_buffer_cache():
+    """Cap MLX's cache of freed GPU buffers (LMDECK_MLX_CACHE_LIMIT_GIB; 0 = MLX's default).
+
+    MLX keeps every freed buffer for reuse and its default cap is the whole memory limit, so
+    the temporaries of one long prompt stayed allocated until the model unloaded: a 4B model
+    held 19 GiB of GPU memory after an 82k-token prompt. Prompt caches are not affected.
+    """
+    try:
+        gib = float(os.environ.get("LMDECK_MLX_CACHE_LIMIT_GIB", "1"))
+    except ValueError:
+        return ""
+    if gib <= 0:
+        return ""
+    try:
+        import mlx.core as mx
+
+        mx.set_cache_limit(int(gib * (1 << 30)))
+        return f", buffer cache {gib:g} GiB"
+    except Exception as e:  # an MLX without the call keeps its default
+        print(f"lmdeck: could not cap the MLX buffer cache: {e}", file=sys.stderr, flush=True)
+        return ""
+
+
+def log_memory_changes(period=10.0):
+    """Log MLX's memory counters (in use, freed-buffer cache, peak) whenever they change."""
+    import threading
+
+    def run():
+        import time
+        import mlx.core as mx
+
+        last = None
+        while True:
+            time.sleep(period)
+            try:
+                now = tuple(round(x / (1 << 30), 2) for x in (mx.get_active_memory(), mx.get_cache_memory(), mx.get_peak_memory()))
+            except Exception:
+                return
+            if now != last:
+                print(f"lmdeck: MLX memory {now[0]} GiB in use, {now[1]} GiB cached, {now[2]} GiB peak", file=sys.stderr, flush=True)
+                last = now
+
+    threading.Thread(target=run, name="lmdeck-memlog", daemon=True).start()
+
+
 def main():
     if os.environ.get("LMDECK_MLX_DEVICE") == "cpu":
         enable_cpu_mode()
+    cache_note = limit_buffer_cache()
+    log_memory_changes()
     path = _orig.__file__
     src = open(path, encoding="utf-8").read()
     applied = 0
@@ -448,7 +495,7 @@ def main():
             checkpoint = True
     if applied != len(PATCHES):
         print(
-            f"lmdeck: mlx_lm.server fast path not applicable ({applied}/{len(PATCHES)} patches matched); running stock server",
+            f"lmdeck: mlx_lm.server fast path not applicable ({applied}/{len(PATCHES)} patches matched); running stock server{cache_note}",
             file=sys.stderr,
             flush=True,
         )
@@ -472,7 +519,7 @@ def main():
         kv += ", composed decode attention"
     print(
         f"lmdeck: mlx_lm.server fast path active (no per-token logprob sync, batching {'on' if batching else 'off'}, {kv}"
-        f"{', prefix checkpoints' if checkpoint else ''})",
+        f"{', prefix checkpoints' if checkpoint else ''}{cache_note})",
         file=sys.stderr,
         flush=True,
     )

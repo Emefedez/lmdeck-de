@@ -21,8 +21,12 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Conversations behind recent Responses ids (`previous_response_id`).
+static RESPONSES: crate::responses::Store = crate::responses::Store::new();
 
-pub const OLLAMA_COMPAT_VERSION: &str = "0.12.6";
+/// Codex (0.16x) refuses Ollama older than 0.13.4, the release that added /v1/responses, which
+/// lmdeck serves too (responses.rs).
+pub const OLLAMA_COMPAT_VERSION: &str = "0.14.0";
 
 #[derive(Clone)]
 pub struct App {
@@ -84,6 +88,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/v1/models/{*id}", get(v1_model))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/messages/count_tokens", post(anthropic_count))
+        .route("/v1/responses", post(openai_responses))
         .route("/v1/{*rest}", any(v1_proxy))
         .route("/lmdeck/status", get(status))
         .route("/lmdeck/models", get(lm_models))
@@ -264,14 +269,7 @@ async fn show(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         "general.basename": m.name.clone(),
         "general.size_label": m.params,
     });
-    let cfg = a.mgr.cfg();
-    let ctx = match m.format {
-        Format::Mlx => m.ctx_len.map(|c| c.min(cfg.mlx.max_context as u64)).or(Some(cfg.mlx.max_context as u64)),
-        Format::Gguf => Some(cfg.overrides.get(&m.name).and_then(|o| o.ctx_size).unwrap_or(cfg.llama.ctx_size) as u64),
-    };
-    if let Some(c) = ctx {
-        info[format!("{arch}.context_length")] = json!(c);
-    }
+    info[format!("{arch}.context_length")] = json!(context_limit(&a.mgr.cfg(), &m));
     Json(json!({
         "license": "",
         "modelfile": format!("# served by lmdeck\nFROM {}\n", m.path.display()),
@@ -692,6 +690,10 @@ async fn ollama_generate(a: App, b: Value, messages: Vec<Value>, is_chat: bool) 
     };
     let mut body = openai_body(&b, messages, guard.0.backend_model_id());
     crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut body);
+    if let Err((est, limit)) = context_check(&a.mgr.cfg(), &guard.0.model, &mut body) {
+        sys::log(&format!("{}: refused a ~{est}-token prompt (window {limit})", guard.0.name));
+        return err(StatusCode::BAD_REQUEST, format!("prompt is too long: ~{est} tokens > {limit} maximum. {}", too_long_hint(&guard.0.name)));
+    }
     let t_sent = Instant::now();
     let resp = match a.mgr.http.post(format!("{}/v1/chat/completions", guard.0.base())).json(&body).send().await {
         Ok(r) => r,
@@ -878,6 +880,11 @@ async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     ));
     let mut body = crate::anthropic::to_openai(&b, guard.0.backend_model_id(), mode);
     crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut body);
+    if let Err((est, limit)) = context_check(&a.mgr.cfg(), &guard.0.model, &mut body) {
+        sys::log(&format!("/v1/messages {}: refused a ~{est}-token prompt (window {limit})", guard.0.name));
+        // "prompt is too long" is what Claude Code recognises to offer /compact.
+        return anth_err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("prompt is too long: {est} tokens > {limit} maximum. {}", too_long_hint(&guard.0.name)));
+    }
     let groups = (mode == crate::anthropic::ToolMode::Groups)
         .then(|| crate::toolgroups::Groups::sync(b.get("tools").and_then(|t| t.as_array()).map(|t| t.as_slice()).unwrap_or(&[])).with_notes(mcp_notes))
         .filter(|g| !g.is_empty());
@@ -971,6 +978,191 @@ async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         let gen_secs = first.map(|f| f.elapsed().as_secs_f64()).unwrap_or(0.0);
         let ttft = first.map(|f| f.duration_since(t0).as_secs_f64()).unwrap_or(0.0);
         USAGE.record(&model_name, st.input_tokens, st.output_tokens, ttft, gen_secs, ttft);
+    });
+    let mut r = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+    r.headers_mut().insert("content-type", HeaderValue::from_static("text/event-stream"));
+    r.headers_mut().insert("cache-control", HeaderValue::from_static("no-cache"));
+    r
+}
+
+/// The context window lmdeck serves a model with (and advertises to clients): GGUF = its
+/// llama-server context; MLX = the model's own window, capped by `mlx.max_context`, or the
+/// per-model `ctx_size` override.
+pub fn context_limit(cfg: &Config, m: &LocalModel) -> u64 {
+    let ov = cfg.overrides.get(&m.name).and_then(|o| o.ctx_size).filter(|c| *c > 0).map(|c| c as u64);
+    match m.format {
+        Format::Gguf => ov.unwrap_or(cfg.llama.ctx_size as u64),
+        Format::Mlx => {
+            let model_max = m.ctx_len.unwrap_or(u64::MAX);
+            ov.unwrap_or(cfg.mlx.max_context as u64).min(model_max)
+        }
+    }
+}
+
+/// Rough token count of a chat body: ~3.8 characters per token over the JSON of the messages
+/// and tools, an inline image as ~1k tokens instead of its base64 text.
+fn estimate_tokens(body: &Value) -> u64 {
+    fn chars(v: &Value) -> u64 {
+        match v {
+            Value::String(s) if s.starts_with("data:") => 3500,
+            Value::String(s) => s.len() as u64 + 2,
+            Value::Array(a) => a.iter().map(chars).sum::<u64>() + a.len() as u64,
+            Value::Object(o) => o.iter().map(|(k, v)| k.len() as u64 + 3 + chars(v)).sum(),
+            other => other.to_string().len() as u64,
+        }
+    }
+    let c = chars(&body["messages"]) + body.get("tools").map(chars).unwrap_or(0);
+    // Qwen3.5's tokenizer on a Codex request: 4.3 chars/token for text, 4.0 for tool JSON.
+    c * 5 / 19
+}
+
+/// Refuse a prompt larger than the model's window before the backend reads it (an MLX backend
+/// has no limit of its own: an 82k-token Codex prompt filled the GPU heap on a 4B model), and
+/// trim `max_tokens` to the room left. Err = (estimated prompt tokens, window).
+fn context_check(cfg: &Config, m: &LocalModel, body: &mut Value) -> Result<(), (u64, u64)> {
+    let limit = context_limit(cfg, m);
+    let est = estimate_tokens(body);
+    if est > limit {
+        return Err((est, limit));
+    }
+    let left = (limit - est).max(256);
+    if body.get("max_tokens").and_then(|n| n.as_u64()).is_some_and(|n| n > left) {
+        body["max_tokens"] = json!(left);
+    }
+    Ok(())
+}
+
+fn too_long_hint(name: &str) -> String {
+    format!("Shorten the conversation, send fewer tools (server.local_tools = lean drops MCP tools), or raise {name}'s context in lmdeck (x on the Models tab) if memory allows.")
+}
+
+fn oai_err(code: StatusCode, kind: &str, msg: impl std::fmt::Display) -> Resp {
+    (code, Json(json!({"error": {"message": msg.to_string(), "type": kind, "param": null, "code": null}}))).into_response()
+}
+
+/// OpenAI Responses (Codex) over the backend's Chat Completions; see responses.rs.
+async fn openai_responses(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
+    let t0 = Instant::now();
+    let Some(name) = model_field(&b) else { return oai_err(StatusCode::BAD_REQUEST, "invalid_request_error", "model is required") };
+    let stream = b.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    let prior = match b.get("previous_response_id").and_then(|p| p.as_str()) {
+        Some(id) => match RESPONSES.get(id) {
+            Some(c) => c,
+            None => return oai_err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("Previous response with id '{id}' not found.")),
+        },
+        None => Vec::new(),
+    };
+    let (guard, _) = match a.mgr.acquire(&name, keep_alive_field(&b).as_deref()).await {
+        Ok(x) => x,
+        Err(e) => {
+            let s = format!("{e:#}");
+            let code = if s.contains("not found") { StatusCode::NOT_FOUND } else if s.contains("can be given to it right now") || s.contains("too big for the GPU heap") { StatusCode::BAD_REQUEST } else { StatusCode::INTERNAL_SERVER_ERROR };
+            return oai_err(code, if code == StatusCode::INTERNAL_SERVER_ERROR { "server_error" } else { "invalid_request_error" }, s);
+        }
+    };
+    let mode = crate::anthropic::ToolMode::parse(&a.mgr.cfg().server.local_tools);
+    let mut conv = match crate::responses::to_openai(&b, guard.0.backend_model_id(), &prior, mode) {
+        Ok(c) => c,
+        Err(e) => return oai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
+    crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut conv.body);
+    let _ = std::fs::write(crate::config::log_dir().join("last-responses.json"), serde_json::to_vec_pretty(&b).unwrap_or_default());
+    if let Err((est, limit)) = context_check(&a.mgr.cfg(), &guard.0.model, &mut conv.body) {
+        sys::log(&format!("/v1/responses {}: refused a ~{est}-token prompt (window {limit}, {} tools)", guard.0.name, conv.body["tools"].as_array().map(|t| t.len()).unwrap_or(0)));
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": {
+            "message": format!("This model's maximum context length is {limit} tokens, but the request is about {est} tokens. {}", too_long_hint(&guard.0.name)),
+            "type": "invalid_request_error", "param": "input", "code": "context_length_exceeded"}}))).into_response();
+    }
+    sys::log(&format!(
+        "/v1/responses {}: {} messages, {} tools{}{}",
+        guard.0.name,
+        conv.body["messages"].as_array().map(|m| m.len()).unwrap_or(0),
+        conv.body["tools"].as_array().map(|t| t.len()).unwrap_or(0),
+        if conv.dropped_tools.is_empty() { String::new() } else { format!(" ({} dropped [{mode:?}]: {})", conv.dropped_tools.len(), conv.dropped_tools.join(", ")) },
+        if prior.is_empty() { "" } else { ", continues a stored response" },
+    ));
+    let resp = match a.mgr.http.post(format!("{}/v1/chat/completions", guard.0.base())).json(&conv.body).send().await {
+        Ok(r) => r,
+        Err(e) => return oai_err(StatusCode::BAD_GATEWAY, "server_error", format!("backend unreachable: {e}")),
+    };
+    if !resp.status().is_success() {
+        let t = resp.text().await.unwrap_or_default();
+        return oai_err(StatusCode::BAD_GATEWAY, "server_error", format!("backend: {t}"));
+    }
+    let model_name = guard.0.name.clone();
+    let store = b.get("store").and_then(|s| s.as_bool()) != Some(false);
+
+    async fn pump(resp: reqwest::Response, st: &mut crate::responses::RStream, tx: Option<&mpsc::Sender<Result<Bytes, std::io::Error>>>) -> Option<Instant> {
+        let mut s = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut first = None;
+        while let Some(chunk) = s.next().await {
+            let Ok(chunk) = chunk else { break };
+            buf.extend_from_slice(&chunk);
+            let mut out = String::new();
+            while let Some(pos) = buf.iter().position(|&c| c == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line);
+                let Some(data) = line.trim().strip_prefix("data:") else { continue };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                    let piece = st.feed(&v);
+                    if !piece.is_empty() {
+                        first.get_or_insert_with(Instant::now);
+                    }
+                    out.push_str(&piece);
+                }
+            }
+            if let Some(tx) = tx {
+                if !out.is_empty() && tx.send(Ok(Bytes::from(out))).await.is_err() {
+                    return first; // client went away
+                }
+            }
+        }
+        first
+    }
+
+    let mut st = crate::responses::RStream::new(&model_name, &conv);
+    let done = move |st: &crate::responses::RStream, first: Option<Instant>, conv: crate::responses::Converted| {
+        if store {
+            let mut c = conv.history;
+            c.extend(st.as_chat());
+            RESPONSES.put(st.id.clone(), c);
+        }
+        let gen_secs = first.map(|f| f.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let ttft = first.map(|f| f.duration_since(t0).as_secs_f64()).unwrap_or(0.0);
+        USAGE.record(&st.model, st.input_tokens, st.output_tokens, ttft, gen_secs, ttft);
+        sys::log(&format!("/v1/responses {}: {} in / {} out, {:.1}s", st.model, st.input_tokens, st.output_tokens, t0.elapsed().as_secs_f64()));
+    };
+    if !stream {
+        let first = pump(resp, &mut st, None).await;
+        if st.failed() {
+            return oai_err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("local model backend failed: {}", sys::error_summary(&guard.0.log)));
+        }
+        drop(guard);
+        let _ = st.finish();
+        let r = st.final_response();
+        done(&st, first, conv);
+        return Json(r).into_response();
+    }
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    tokio::spawn(async move {
+        let _g = guard;
+        let start = st.start();
+        let _ = tx.send(Ok(Bytes::from(start))).await;
+        let first = pump(resp, &mut st, Some(&tx)).await;
+        if st.failed() {
+            let msg = format!("local model backend failed: {}", sys::error_summary(&_g.0.log));
+            sys::log(&format!("/v1/responses {model_name}: {msg}"));
+            let _ = tx.send(Ok(Bytes::from(st.fail(&msg)))).await;
+            return;
+        }
+        let end = st.finish();
+        let _ = tx.send(Ok(Bytes::from(end))).await;
+        done(&st, first, conv);
     });
     let mut r = Response::new(Body::from_stream(ReceiverStream::new(rx)));
     r.headers_mut().insert("content-type", HeaderValue::from_static("text/event-stream"));
@@ -1151,6 +1343,12 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
     }
     if uri.path().ends_with("/chat/completions") {
         crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut v);
+        if let Err((est, limit)) = context_check(&a.mgr.cfg(), &guard.0.model, &mut v) {
+            sys::log(&format!("{}: refused a ~{est}-token prompt (window {limit})", guard.0.name));
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": {
+                "message": format!("This model's maximum context length is {limit} tokens, but the request is about {est} tokens. {}", too_long_hint(&guard.0.name)),
+                "type": "invalid_request_error", "param": "messages", "code": "context_length_exceeded"}}))).into_response();
+        }
     }
     let url = format!("{}{}", guard.0.base(), uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path()));
     let mut rb = a.mgr.http.post(url).json(&v);
@@ -1683,4 +1881,20 @@ async fn lm_logs(State(a): State<App>, Query(q): Query<LogQ>) -> Resp {
         None => crate::config::log_dir().join("lmdeck.log"),
     };
     sys::tail(&path, n).into_response()
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn estimate_counts_images_as_a_fixed_cost() {
+        let text = "word ".repeat(700); // 3500 chars
+        let b = json!({"messages": [{"role": "user", "content": text}]});
+        let t = estimate_tokens(&b);
+        assert!((880..1000).contains(&t), "{t}");
+        let img = format!("data:image/png;base64,{}", "A".repeat(2_000_000));
+        let b = json!({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": img}}]}]});
+        assert!(estimate_tokens(&b) < 1000);
+    }
 }

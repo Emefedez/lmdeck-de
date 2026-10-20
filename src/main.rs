@@ -6,6 +6,7 @@ mod config;
 mod hf;
 mod launch;
 mod models;
+mod responses;
 mod server;
 mod sys;
 mod sysprompt;

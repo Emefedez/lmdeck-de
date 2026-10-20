@@ -102,6 +102,9 @@ pub struct MlxCfg {
     pub prompt_cache_size: u32,
     /// Cap on prompt cache memory in GiB (0 = auto: a quarter of the GPU heap).
     pub prompt_cache_gib: f64,
+    /// Cap on MLX's cache of freed GPU buffers in GiB (0 = MLX's default, the whole memory
+    /// limit: one long prompt's temporaries then stay allocated until the model unloads).
+    pub cache_limit_gib: f64,
     /// Context window advertised to clients (Copilot, Claude Code) for MLX
     /// models; their native windows (e.g. 262k) would exhaust GPU memory.
     pub max_context: u32,
@@ -278,6 +281,7 @@ impl Default for MlxCfg {
             batching: false,
             prompt_cache_size: 10,
             prompt_cache_gib: 0.0,
+            cache_limit_gib: 1.0,
             prefill_step_size: 512,
             max_context: 65536,
             kv_bits: 0,
@@ -459,6 +463,7 @@ pub const SETTINGS: &[(&str, &str, &str)] = &[
     ("KV cache · MLX", "mlx.max_kv_size", "MLX rotating KV window in tokens (0 = unbounded)"),
     ("KV cache · MLX", "mlx.prompt_cache_size", "MLX prompt caches kept between requests (0 = no reuse)"),
     ("KV cache · MLX", "mlx.prompt_cache_gib", "Cap on MLX prompt cache memory in GiB (0 = auto: ¼ of the GPU heap)"),
+    ("KV cache · MLX", "mlx.cache_limit_gib", "Cap on MLX's free-buffer cache in GiB (0 = unlimited: long prompts then keep GPU memory until unload)"),
     ("KV cache · MLX", "mlx.max_context", "Context window advertised to clients for MLX models (tokens)"),
     ("KV cache · MLX", "mlx.prefill_step_size", "Prompt tokens per prefill step (smaller = less peak memory on long prompts)"),
     ("KV cache · GGUF", "llama.ctx_size", "GGUF context window (KV is allocated for all of it)"),
@@ -533,6 +538,7 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "mlx.batching" => c.mlx.batching.to_string(),
         "mlx.prompt_cache_size" => c.mlx.prompt_cache_size.to_string(),
         "mlx.prompt_cache_gib" => c.mlx.prompt_cache_gib.to_string(),
+        "mlx.cache_limit_gib" => c.mlx.cache_limit_gib.to_string(),
         "mlx.prefill_step_size" => c.mlx.prefill_step_size.to_string(),
         "mlx.kv_bits" => c.mlx.kv_bits.to_string(),
         "mlx.kv_group_size" => c.mlx.kv_group_size.to_string(),
@@ -617,6 +623,7 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "mlx.batching" => c.mlx.batching = boolean(v)?,
         "mlx.prompt_cache_size" => c.mlx.prompt_cache_size = num(v)? as u32,
         "mlx.prompt_cache_gib" => c.mlx.prompt_cache_gib = v.parse().map_err(|_| "not a number".to_string())?,
+        "mlx.cache_limit_gib" => c.mlx.cache_limit_gib = v.parse::<f64>().map_err(|_| "not a number".to_string())?.max(0.0),
         "mlx.prefill_step_size" => c.mlx.prefill_step_size = (num(v)? as u32).clamp(64, 8192),
         "mlx.kv_bits" => {
             let b = num(v)? as u32;

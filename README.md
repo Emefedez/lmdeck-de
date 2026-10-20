@@ -129,6 +129,16 @@ Every `/v1/messages` request logs the breakdown (system, messages, tools before 
 
 **Prefix checkpoints.** Hybrid models such as Qwen3.5/3.8 keep part of their state in a cache that can't be rewound, so mlx_lm's single-request path (which caches prompt + answer) never reused anything and every agent turn re-read the whole prompt. lmdeck's shim now saves a checkpoint at the start of each answer, so the next turn (or the next `tool_group` round) only processes what is new: a follow-up turn went from ~99 s to ~13 s. A second checkpoint right after the system prompt (Claude Code's instructions plus tools, the same in every conversation) is also saved to `~/.cache/lmdeck/prompt-cache/` (~0.4 GB each, the 6 most recent per model and runtime), so new conversations and the first prompt after a restart or reload skip it too: a new Claude Code conversation after a restart went from ~104 s to ~50 s on Qwen3.8-27B.
 
+### Codex and the Responses API
+
+`POST /v1/responses` (what Codex speaks) is translated onto the backend's Chat Completions, on MLX and GGUF alike. Text and reasoning stream; tool calls come back as whole items. Codex's `apply_patch` (a free-form "custom" tool) is offered to the model as a function with one `input` string. `previous_response_id` works for the last 32 responses (kept in memory). As on `/v1/messages`, `server.local_tools` other than `all` drops the MCP tools: Codex sends each MCP server as a `namespace`, and with 9 servers that was 284 tools, ~83k tokens, against ~8k without them. lmdeck reports itself as Ollama 0.14.0, since Codex 0.16x refuses older versions. `lmdeck launch codex` on Qwen3.5-4B: a shell tool call and the answer, first turn 23 s, follow-up 3 s.
+
+### Context guard
+
+Every chat request (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/messages`, `/v1/responses`) is checked against the window lmdeck advertises for the model: the per-model context (`x`), else `mlx.max_context` / `llama.ctx_size`, never above the model's own maximum. A prompt over it is refused at once with a clear error ("prompt is too long" on `/v1/messages`, which Claude Code offers to `/compact`; `context_length_exceeded` on the OpenAI paths), and `max_tokens` is trimmed to the room left. The size is an estimate: ~3.8 characters per token, an inline image counted as ~1k tokens. Measured with Qwen3.5's tokenizer on a Codex request, text runs 4.3 characters per token and tool JSON 4.0. An MLX backend has no limit of its own: before this guard, an 82k-token Codex prompt on a 4B model filled the whole GPU heap (19 GiB) while it was read.
+
+**MLX buffer cache.** MLX keeps freed GPU buffers for reuse, by default up to its whole memory limit, so one long prompt's temporaries stayed allocated until the model unloaded. `mlx.cache_limit_gib` (default 1) caps that cache. Prompt caches are separate (`mlx.prompt_cache_gib`). The MLX log prints `MLX memory … in use, … cached, … peak` whenever the numbers change. A Codex run on Qwen3.5-4B ended at 3.45 GiB in use, 0.83 cached, 3.71 peak.
+
 ### System prompts per model and backend
 
 lmdeck can add a system prompt of its own to every chat request: Ollama `/api/chat` and `/api/generate`, OpenAI `/v1/chat/completions` and Anthropic `/v1/messages`. The prompts are plain files, so you can see and edit them all in one editor (`code ~/.config/lmdeck/prompts`):
