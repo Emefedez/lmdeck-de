@@ -466,7 +466,10 @@ impl Manager {
             }
             n => (n.parse::<f64>().unwrap_or(0.0) * (1u64 << 30) as f64) as u64,
         };
-        if cfg.server.gpu_mem_check && need > heap * 92 / 100 {
+        // "auto" already sized the heap with its own margin (need + 512 MiB within the safe free
+        // RAM); a second 8% here refused a 17.2 GiB model with 18.2 GiB available.
+        let auto = matches!(policy.as_str(), "auto" | "");
+        if cfg.server.gpu_mem_check && !auto && need > heap * 92 / 100 {
             bail!(
                 "{} is too big for the GPU heap: needs ~{:.1} GiB, heap is {:.1} GiB (server.gpu_heap = {}). \
                  Overcommitting the GPU can hang the whole machine, so lmdeck refuses. Set server.gpu_heap to auto, or pick a smaller model{}",
