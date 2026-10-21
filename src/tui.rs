@@ -94,7 +94,12 @@ enum Input {
     Update,
     Runtime,
     RuntimeKeep(String),
-    Guide,
+    /// Install, update and choose the three backends.
+    Backends,
+    /// Keys for every tab (scrollable).
+    Help,
+    /// The model grader: local models ranked for a goal.
+    Grade(crate::grade::View),
     Override(String),
     GpuGap(String, Option<String>),
     Free(Vec<sys::ProcGroup>, usize, Option<(String, String)>),
@@ -491,6 +496,8 @@ impl Ui {
                 else { self.input = Input::Downloads(specs, 0); }
             }
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('g') => self.open_grade(),
+            KeyCode::Char('?') => { self.popup_scroll = 0; self.input = Input::Help; }
             KeyCode::Char(c @ '1'..='5') => self.tab = TABS[(c as u8 - b'1') as usize],
             KeyCode::Tab => self.tab = TABS[(TABS.iter().position(|t| *t == self.tab).unwrap() + 1) % TABS.len()],
             KeyCode::BackTab => self.tab = TABS[(TABS.iter().position(|t| *t == self.tab).unwrap() + TABS.len() - 1) % TABS.len()],
@@ -528,7 +535,7 @@ impl Ui {
                     None => {}
                 }
             }
-            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if matches!(self.input, Input::Guide) => {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if matches!(self.input, Input::Help) => {
                 self.popup_scroll = if m.kind == MouseEventKind::ScrollDown { self.popup_scroll.saturating_add(3) } else { self.popup_scroll.saturating_sub(3) };
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if matches!(self.input, Input::None) => {
@@ -542,13 +549,12 @@ impl Ui {
 
     fn key_input(&mut self, k: KeyEvent) -> Option<Action> {
         let input = std::mem::replace(&mut self.input, Input::None);
-        if matches!(input, Input::Guide) {
+        if matches!(input, Input::Help) {
             return match k.code {
-                KeyCode::Esc | KeyCode::Char('q') => None,
-                KeyCode::Char('U' | 'B') => self.key_dashboard(k),
-                KeyCode::Down | KeyCode::PageDown => { self.popup_scroll = self.popup_scroll.saturating_add(3); self.input = Input::Guide; None }
-                KeyCode::Up | KeyCode::PageUp => { self.popup_scroll = self.popup_scroll.saturating_sub(3); self.input = Input::Guide; None }
-                _ => { self.input = Input::Guide; None }
+                KeyCode::Esc | KeyCode::Char('q' | '?') => None,
+                KeyCode::Down | KeyCode::PageDown => { self.popup_scroll = self.popup_scroll.saturating_add(3); self.input = Input::Help; None }
+                KeyCode::Up | KeyCode::PageUp => { self.popup_scroll = self.popup_scroll.saturating_sub(3); self.input = Input::Help; None }
+                _ => { self.input = Input::Help; None }
             };
         }
         if let Input::Downloads(specs, mut sel) = input {
@@ -636,15 +642,41 @@ impl Ui {
             self.input = Input::Free(groups, sel, ctx);
             return None;
         }
+        if matches!(input, Input::Backends) {
+            return match k.code {
+                KeyCode::Char('1') => { self.input = Input::Update; None }
+                KeyCode::Char('2') => { self.input = Input::Runtime; None }
+                KeyCode::Char(c @ ('3' | '4' | '5' | 'r')) => {
+                    let key = match c { '3' => 'B', '4' => 'T', '5' => 'M', _ => 'r' };
+                    self.key_dashboard(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+                }
+                KeyCode::Char('q') | KeyCode::Esc => None,
+                _ => { self.input = Input::Backends; None }
+            };
+        }
+        if let Input::Grade(mut v) = input {
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q' | 'g') => return None,
+                KeyCode::Down | KeyCode::Char('j') => v.sel = (v.sel + 1).min(v.rows.len().saturating_sub(1)),
+                KeyCode::Up | KeyCode::Char('k') => v.sel = v.sel.saturating_sub(1),
+                KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => v.next_goal(1),
+                KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => v.next_goal(-1),
+                KeyCode::Char(c @ '1'..='4') => v.set_goal(c as usize - '1' as usize),
+                KeyCode::Enter => {
+                    if let Some(name) = v.rows.get(v.sel).map(|r| r.name.clone()) {
+                        self.load_model(name);
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+            self.input = Input::Grade(v);
+            return None;
+        }
         if matches!(input, Input::Runtime) {
             self.input = match k.code {
                 KeyCode::Char('1') => Input::RuntimeKeep("omarchy".into()),
                 KeyCode::Char('2') => Input::RuntimeKeep("custom".into()),
-                KeyCode::Char('3') => {
-                    // The Fixed runtime has its own folder: select it, nothing to keep or remove.
-                    let exe = std::env::current_exe().ok().map(|p| p.display().to_string()).unwrap_or_else(|| "lmdeck".into());
-                    return Some(Action::Exec("select Fixed MLX runtime".into(), vec![exe, "runtime".into(), "fixed".into()]));
-                }
                 KeyCode::Char('q') | KeyCode::Esc => Input::None,
                 _ => Input::Runtime,
             };
@@ -670,9 +702,8 @@ impl Ui {
         }
         if matches!(input, Input::Update) {
             return match k.code {
-                KeyCode::Char('1') => Some(Action::Script("update MLX via Omarchy".into(), sys::script_update_mlx())),
-                KeyCode::Char('2') => Some(Action::Script("update MLX via Custom Installer".into(), sys::script_update_mlx_custom())),
-                KeyCode::Char('3') => Some(Action::Script("build Fixed MLX runtime (release + lmdeck fixes)".into(), sys::script_build_mlx_fixed())),
+                KeyCode::Char('1') => Some(Action::Script("update MLX via Omarchy".into(), sys::script_update_mlx(false))),
+                KeyCode::Char('2') => Some(Action::Script("update MLX via Custom Installer".into(), sys::script_update_mlx_custom(false))),
                 KeyCode::Char('q' | 'Q') | KeyCode::Esc => None,
                 _ => { self.input = Input::Update; None }
             };
@@ -968,8 +999,8 @@ impl Ui {
                 self.input = Input::Update;
             }
             KeyCode::Char('i') => self.input = Input::Runtime,
+            KeyCode::Char('b') => self.input = Input::Backends,
             KeyCode::Char('f') => self.input = Input::Free(sys::proc_groups(unsafe { libc::getuid() }, false), 0, None),
-            KeyCode::Char('?') => { self.popup_scroll = 0; self.input = Input::Guide; }
             KeyCode::Char('B') => {
                 self.input = Input::Confirm(
                     format!("Set up the optional GGUF backend (llama.cpp, {})? Builds with Vulkan GPU support; takes a few minutes. MLX models do not need this. [y/N]", self.cfg.llama.git_ref),
@@ -1023,7 +1054,7 @@ impl Ui {
                     self.load_model(m.name.clone());
                 }
             }
-            KeyCode::Char('g') => {
+            KeyCode::Char('G') => {
                 if let Some(m) = self.selected_model() {
                     let name = m.name.clone();
                     if self.device_of(&name) == "cpu" {
@@ -1294,7 +1325,7 @@ impl Ui {
                 self.buf = self.query.clone();
                 self.input = Input::Search;
             }
-            KeyCode::Char('g') => {
+            KeyCode::Char('t') => {
                 self.search_kind = (self.search_kind + 1) % 3;
                 self.catalog_mode = false;
                 self.search();
@@ -1467,21 +1498,21 @@ impl Ui {
             Tab::Logs => self.draw_logs(f, body),
         }
         let help = match self.tab {
-            Tab::Dashboard => "Click a button · ? setup guide · i choose MLX runtime · B optional GGUF setup · r refresh",
-            Tab::Models => "⏎ load · u unload · g GPU⇄CPU · c chat · x context · p prompt (P: backend's) · d delete · y copy · ✓ qualified ? untested ✗ GPU-incompatible",
+            Tab::Dashboard => "s server · g recommend · b backends · f free memory",
+            Tab::Models => "⏎ load · u unload · c chat · x context · p prompt · d delete · ✓ qualified ? untested ✗ won't run",
             Tab::Discover => {
                 if self.repo.is_some() {
                     "⏎ download · a recommended alternative · x cancel download · esc back"
                 } else {
-                    "/ search · g MLX/GGUF/Both · m RAM budget · o sort · c catalog⇄search · ⏎ open · x cancel download"
+                    "/ search · t MLX/GGUF/Both · m RAM budget · o sort · c catalog⇄search · ⏎ open"
                 }
             }
-            Tab::Settings => "⏎ edit (prompts open in your editor) · o open config in your editor",
+            Tab::Settings => "⏎ edit · ←/→ memory sliders · o config file in your editor",
             Tab::Logs => "m daemon⇄model log · j/k scroll · G end",
         };
         let foot_line = match &self.toast {
             Some((t, _)) => Line::from(Span::styled(t.clone(), Style::new().fg(Color::Yellow))),
-            None => Line::from(vec![Span::styled(help, Style::new().fg(Color::DarkGray)), Span::styled("  · q closes TUI (server keeps running)", Style::new().fg(Color::DarkGray))]),
+            None => Line::from(vec![Span::styled(help, Style::new().fg(Color::DarkGray)), Span::styled("  · ? keys · q quit (the server keeps running)", Style::new().fg(Color::DarkGray))]),
         };
         f.render_widget(foot_line, foot);
         self.draw_input(f);
@@ -1513,7 +1544,7 @@ impl Ui {
         let [text, _, actions] = Layout::vertical([
             Constraint::Min(0), Constraint::Length(1), Constraint::Length(actions_height),
         ]).areas(inner);
-        let scroll = if matches!(self.input, Input::Guide) {
+        let scroll = if matches!(self.input, Input::Help) {
             self.popup_scroll = self.popup_scroll.min((lines as u16).saturating_sub(text.height));
             self.popup_scroll
         } else { 0 };
@@ -1532,17 +1563,16 @@ impl Ui {
             return;
         }
         if matches!(self.input, Input::Update) {
-            self.draw_choice(f, "Update MLX", "Choose how to install and update the MLX backend.\n\nOmarchy: system-managed packages, full system update first.\nCustom Installer: latest GitHub release in your home folder.\nFixed: the latest release built from source with lmdeck's fixes\n(finer GPU buffer sizes: ~0.3 GiB less for a 27B model); takes a while to build.\nAll use the Apple GPU; release and model differences affect speed.\nYou can keep both runtimes or only the selected one afterwards.", &[
+            self.draw_choice(f, "Update MLX", "Choose how to install and update the MLX backend.\n\nOmarchy: system-managed packages, full system update first.\nCustom Installer: latest GitHub release in your home folder.\nBoth use the Apple GPU. You can keep both runtimes or only the selected one afterwards.", &[
                 ("1. Omarchy packages", KeyCode::Char('1')),
                 ("2. Custom Installer", KeyCode::Char('2')),
-                ("3. Fixed (build with lmdeck fixes)", KeyCode::Char('3')),
                 ("q. Cancel", KeyCode::Char('q')),
             ]);
             return;
         }
         if matches!(self.input, Input::Runtime) {
-            let description = format!("Choose an already installed runtime; this does not reinstall it.\n\nSelected: {}\nOmarchy package: {}\nCustom Installer: {}\nFixed (release + lmdeck fixes): {}\n\n{}\nThe selected launcher is saved explicitly in lmdeck settings. Loaded models need a reload to switch.", self.versions.mlx_selected, self.versions.mlx_pkg.as_deref().unwrap_or("not installed — use Update MLX"), self.versions.mlx_legacy.as_deref().unwrap_or("not installed — use Update MLX"), self.versions.mlx_fixed.as_deref().unwrap_or("not built — Update MLX → 3"), {
-                let notes: Vec<String> = [("omarchy", "package"), ("custom", "Custom"), ("fixed", "Fixed")].iter()
+            let description = format!("Choose an already installed runtime; this does not reinstall it.\n\nSelected: {}\nOmarchy package: {}\nCustom Installer: {}\n\n{}\nThe selected launcher is saved explicitly in lmdeck settings. Loaded models need a reload to switch.", self.versions.mlx_selected, self.versions.mlx_pkg.as_deref().unwrap_or("not installed — use Update MLX"), self.versions.mlx_legacy.as_deref().unwrap_or("not installed — use Update MLX"), {
+                let notes: Vec<String> = [("omarchy", "package"), ("custom", "Custom")].iter()
                     .filter(|(s, _)| sys::mlx_runtime_path(s).exists())
                     .filter_map(|(s, label)| crate::compat::runtime_buffer_rounding(&sys::mlx_runtime_path(s).display().to_string()).describe().map(|d| format!("the {label} build {d}")))
                     .collect();
@@ -1551,7 +1581,6 @@ impl Ui {
             self.draw_choice(f, "Choose MLX runtime", &description, &[
                 ("1. Use Omarchy package", KeyCode::Char('1')),
                 ("2. Use Custom Installer", KeyCode::Char('2')),
-                ("3. Use Fixed (release + lmdeck fixes)", KeyCode::Char('3')),
                 ("q. Cancel", KeyCode::Char('q')),
             ]);
             return;
@@ -1634,16 +1663,32 @@ impl Ui {
             f.render_widget(Paragraph::new("↑↓ select · Enter/x cancel · Esc close\nDownload the same model again to resume.").fg(Color::DarkGray), help);
             return;
         }
-        if matches!(self.input, Input::Guide) {
-            self.draw_choice(f, "Setup guide", "MLX / safetensors\nRuns compatible MLX models on your Apple GPU. Omarchy and Custom\nInstaller are two installation sources for this same backend.\n\nGGUF / llama.cpp — optional\nRuns GGUF models with Vulkan GPU offload. Set it up only if you want\nGGUF models; MLX inference does not need a llama.cpp build.\n\nPerformance\nSpeed depends on the model, quantization, context length and GPU\noffload. CPU execution can be much slower. Compare the same workload\nusing generation tokens/s, prompt tokens/s and first-token latency\nin Usage. A newer release is not a guarantee of faster inference.", &[
-                ("Update MLX [U]", KeyCode::Char('U')),
-                ("Set up optional GGUF [B]", KeyCode::Char('B')),
-                ("Close [q]", KeyCode::Char('q')),
-            ]);
+        if matches!(self.input, Input::Backends) {
+            let description = self.backends_text();
+            let mut buttons = vec![
+                ("1. Update MLX", KeyCode::Char('1')),
+                ("2. Choose MLX runtime", KeyCode::Char('2')),
+                ("3. Build llama.cpp (GGUF)", KeyCode::Char('3')),
+                ("4. Install / update Strata", KeyCode::Char('4')),
+            ];
+            if self.versions.mlx_legacy.is_some() && self.versions.mlx_pkg.is_none() {
+                buttons.push(("5. Move MLX to the Omarchy packages", KeyCode::Char('5')));
+            }
+            buttons.push(("r. Re-check versions", KeyCode::Char('r')));
+            buttons.push(("q. Close", KeyCode::Char('q')));
+            self.draw_choice(f, "Backends", &description, &buttons);
+            return;
+        }
+        if matches!(self.input, Input::Help) {
+            self.draw_choice(f, "Keys", HELP, &[("Close [q]", KeyCode::Char('q'))]);
+            return;
+        }
+        if matches!(self.input, Input::Grade(_)) {
+            self.draw_grade(f);
             return;
         }
         let (title, text) = match &self.input {
-            Input::Update | Input::Runtime | Input::RuntimeKeep(_) | Input::Guide | Input::Free(..) => unreachable!(),
+            Input::Update | Input::Runtime | Input::RuntimeKeep(_) | Input::Backends | Input::Help | Input::Grade(_) | Input::Free(..) => unreachable!(),
             Input::None => return,
             Input::Downloads(..) => unreachable!(),
             Input::Search => (format!("Search Hugging Face ({})", self.search_kind().to_uppercase()), format!("{}▏", self.buf)),
@@ -1673,30 +1718,13 @@ impl Ui {
 
     fn draw_dashboard(&mut self, f: &mut Frame, area: Rect) {
         let server = if self.status.is_some() { "Stop server [s]" } else { "Start server [s]" };
-        let runtime = format!("MLX: {} [i]", match self.cfg.mlx.command.first() {
-            Some(c) if c.starts_with("/usr/") => "package",
-            Some(c) if c.ends_with("-fixed") => "Fixed",
-            _ => "Custom",
-        });
-        let primary = [(server, KeyCode::Char('s')), ("Update MLX [U]", KeyCode::Char('U')), (runtime.as_str(), KeyCode::Char('i')), ("Setup guide [?]", KeyCode::Char('?'))];
-        let secondary = [("Models [2]", KeyCode::Char('2')), ("Free memory [f]", KeyCode::Char('f')), ("GGUF setup [B]", KeyCode::Char('B')), ("Strata [T]", KeyCode::Char('T')), ("Reload models [R]", KeyCode::Char('R')), ("Unload all [a]", KeyCode::Char('a')), ("Cancel download [x]", KeyCode::Char('x'))];
-        let width = area.width.saturating_sub(4);
-        let primary_height = button_height(width, &primary);
-        let secondary_height = button_height(width, &secondary);
-        let description_height = if width < 60 { 2 } else { 1 };
-        let [controls, area] = Layout::vertical([
-            Constraint::Length(primary_height + secondary_height + description_height + 3), Constraint::Min(0),
-        ]).areas(area);
+        let buttons = [(server, KeyCode::Char('s')), ("Recommend a model [g]", KeyCode::Char('g')), ("Backends [b]", KeyCode::Char('b')), ("Free memory [f]", KeyCode::Char('f')), ("Unload all [a]", KeyCode::Char('a')), ("Keys [?]", KeyCode::Char('?'))];
+        let height = button_height(area.width.saturating_sub(4), &buttons);
+        let [controls, area] = Layout::vertical([Constraint::Length(height + 2), Constraint::Min(0)]).areas(area);
         let block = panel("Actions");
         let inner = block.inner(controls).inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 });
         f.render_widget(block, controls);
-        let [primary_area, _, secondary_area, explanation] = Layout::vertical([
-            Constraint::Length(primary_height), Constraint::Length(1),
-            Constraint::Length(secondary_height), Constraint::Length(description_height),
-        ]).areas(inner);
-        self.draw_buttons(f, primary_area, &primary);
-        self.draw_buttons(f, secondary_area, &secondary);
-        f.render_widget(Paragraph::new("MLX: Apple GPU models · GGUF: optional llama.cpp").fg(Color::DarkGray).wrap(Wrap { trim: true }), explanation);
+        self.draw_buttons(f, inner, &buttons);
         let narrow = area.width < 100;
         let (srv, loaded, usage_area, dls, right) = if narrow {
             let usage_height = if area.height >= 25 { 5 } else { 0 };
@@ -1836,33 +1864,111 @@ impl Ui {
         self.draw_usage(f, usage_area);
         self.draw_downloads(f, dls);
 
-        // Show the selected backend first; setup details live in the guide.
+        let rl: Vec<Line> = self.backends_text().lines().map(|l| {
+            match l.split_once(" · ") {
+                Some((head, rest)) if !l.starts_with(' ') => Line::from(vec![Span::styled(head.to_string(), Style::new().fg(Color::Magenta).bold()), Span::styled(format!(" · {rest}"), Style::new().fg(Color::DarkGray))]),
+                _ => Line::raw(l.to_string()),
+            }
+        }).collect();
+        f.render_widget(Paragraph::new(rl).wrap(Wrap { trim: false }).block(panel("Backends [b]")), right);
+    }
+
+    fn open_grade(&mut self) {
+        if self.models.is_empty() {
+            self.toast("no local models to grade; download some in Discover (3)");
+            return;
+        }
+        self.input = Input::Grade(crate::grade::build(&self.cfg, &self.models));
+    }
+
+    fn draw_grade(&mut self, f: &mut Frame) {
+        use crate::grade::{Src, GOALS};
+        let Input::Grade(v) = &self.input else { return };
+        self.clicks.clear();
+        let a = f.area();
+        let w = a.width.saturating_sub(4).min(110);
+        let h = a.height.saturating_sub(2).min(v.rows.len() as u16 + 11).max(12);
+        let r = Rect::new(a.x + (a.width - w) / 2, a.y + (a.height - h) / 2, w, h);
+        f.render_widget(Clear, r);
+        let block = panel("Recommended models");
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+        let [goals, table, help] = Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(4)]).areas(inner);
+        let spans: Vec<Span> = GOALS.iter().enumerate().flat_map(|(i, (g, _))| {
+            let st = if i == v.goal { Style::new().fg(Color::Black).bg(Color::Cyan).bold() } else { Style::new().fg(Color::DarkGray) };
+            [Span::styled(format!(" {} {g} ", i + 1), st), Span::raw(" ")]
+        }).collect();
+        f.render_widget(Line::from(spans), goals);
+        let mark = |s: Src| match s { Src::Measured => "", Src::User => "*", Src::Estimate => "~" };
+        let rows: Vec<Row> = v.rows.iter().enumerate().map(|(i, row)| {
+            let fit_color = match row.fit { "fits" => Color::Green, "tight" => Color::Yellow, _ => Color::Red };
+            let short = row.name.rsplit('/').next().unwrap_or(&row.name).to_string();
+            let params = match (row.total_b, row.active_b) {
+                (Some(t), Some(a)) if a < t * 0.95 => format!("{t:.0}B/{a:.1}B"),
+                (Some(t), _) => format!("{t:.1}B"),
+                _ => "?".into(),
+            };
+            let cells = vec![
+                Cell::from(format!("{:>2}", i + 1)),
+                Cell::from(short),
+                Cell::from(row.format.as_str()),
+                Cell::from(params),
+                Cell::from(row.bits.map(|b| format!("{b:.1}")).unwrap_or_else(|| "?".into())),
+                Cell::from(row.intelligence.map(|(x, s)| format!("{x:.0}{}", mark(s))).unwrap_or_else(|| "?".into())),
+                Cell::from(row.tps.map(|(x, s)| format!("{x:.1}{}", mark(s))).unwrap_or_else(|| "?".into())),
+                Cell::from(row.watts.map(|(x, s)| format!("{x:.0}{}", mark(s))).unwrap_or_else(|| "?".into())),
+                Cell::from(row.joules().map(|j| format!("{j:.1}")).unwrap_or_else(|| "?".into())),
+                Cell::from(row.fit).fg(fit_color),
+                Cell::from(format!("{:.0}", row.score)).bold(),
+            ];
+            let mut rw = Row::new(cells);
+            if row.fit == "too big" { rw = rw.fg(Color::DarkGray); }
+            if i == v.sel { rw = rw.add_modifier(Modifier::REVERSED); }
+            rw
+        }).collect();
+        let t = Table::new(rows, [
+            Constraint::Length(2), Constraint::Min(18), Constraint::Length(6), Constraint::Length(10), Constraint::Length(4),
+            Constraint::Length(6), Constraint::Length(7), Constraint::Length(5), Constraint::Length(5), Constraint::Length(7), Constraint::Length(5),
+        ]).header(Row::new(["#", "Model", "Fmt", "Params", "Bits", "Intel", "tok/s", "W", "J/tok", "Fit", "Score"]).style(Style::new().fg(Color::DarkGray)));
+        f.render_widget(t, table);
+        f.render_widget(Paragraph::new(
+            "Intel: size estimate from total/active parameters and bits (~), or your score from grades.toml (*). \
+             tok/s and W: measured here while generating; ~ = estimated from the models measured so far. \
+             Models that do not fit in free memory now go last.\n\
+             1-4 / ←→ goal · ↑↓ select · Enter load · esc close"
+        ).fg(Color::DarkGray).wrap(Wrap { trim: true }), help);
+    }
+
+    /// What each backend runs and whether it is ready: the Dashboard panel and the Backends popup.
+    fn backends_text(&self) -> String {
         let v = &self.versions;
-        let selected_version = match v.mlx_selected.as_str() {
+        let count = |fmt: Format| self.models.iter().filter(|m| m.format == fmt).count();
+        let mlx_version = match v.mlx_selected.as_str() {
             "Custom Installer" => v.mlx_legacy.as_deref(),
             "Omarchy package" => v.mlx_pkg.as_deref(),
             _ => None,
         };
-        let mut rl = vec![
-            Line::from(Span::styled("MLX · Apple GPU", Style::new().fg(Color::Magenta).bold())),
-            kv("Selected", &v.mlx_selected),
-            kv("Version", selected_version.unwrap_or("not installed — Update MLX")),
-        ];
-        if let Some(p) = &v.mlx_pkg { rl.push(kv("Package", p)); }
-        if v.mlx_selected != "Custom Installer" {
-            if let Some(c) = &v.mlx_legacy { rl.push(kv("Custom", c)); }
+        let strata_ready = self.cfg.strata.dir().join("vulkan").is_dir();
+        let mut t = format!(
+            "MLX · Apple GPU · {} models\n  {} {}\n",
+            count(Format::Mlx),
+            v.mlx_selected,
+            mlx_version.unwrap_or("(not installed: Update MLX)")
+        );
+        if let Some(u) = &v.mlx_upstream {
+            t.push_str(&format!("  latest release {u}\n"));
         }
-        if let Some(u) = &v.mlx_upstream { rl.push(kv("Latest", &format!("{u} (GitHub)"))); }
-        rl.push(Line::raw(""));
-        rl.push(Line::from(Span::styled("GGUF · llama.cpp · optional", Style::new().fg(Color::Blue).bold())));
-        rl.push(Line::raw(if v.llama_path.is_some() { "Ready for GGUF models (Vulkan GPU offload)." } else { "Not set up. Only needed to run GGUF models." }));
-        rl.push(Line::from(Span::styled("MLX models do not need a llama.cpp build.", Style::new().fg(Color::DarkGray))));
-        rl.push(Line::raw(""));
-        let n_mlx = self.models.iter().filter(|m| m.format == Format::Mlx).count();
-        let disk: u64 = self.models.iter().map(|m| m.size).sum();
-        rl.push(kv("Library", &format!("{n_mlx} MLX · {} GGUF · {}", self.models.len() - n_mlx, human(disk))));
-        rl.push(Line::from(Span::styled("Compare speed and latency in Usage.", Style::new().fg(Color::DarkGray))));
-        f.render_widget(Paragraph::new(rl).wrap(Wrap { trim: false }).block(panel("Backends · setup guide [?]")), right);
+        t.push_str(&format!(
+            "\nGGUF · llama.cpp Vulkan · {} models\n  {}\n",
+            count(Format::Gguf),
+            v.llama.as_deref().map(|l| format!("built ({l})")).unwrap_or_else(|| "not built (optional, only for GGUF models)".into())
+        ));
+        t.push_str(&format!(
+            "\nStrata · 125B MoE, experts from the SSD · {} models\n  {}\n",
+            count(Format::Strata),
+            if strata_ready { format!("installed in {}", self.cfg.strata.dir().display()) } else { "not installed (optional)".into() }
+        ));
+        t
     }
 
     fn draw_usage(&self, f: &mut Frame, area: Rect) {
@@ -2012,7 +2118,7 @@ impl Ui {
     }
 
     fn draw_discover(&mut self, f: &mut Frame, area: Rect) {
-        let buttons = [("Search [/]", KeyCode::Char('/')), ("MLX / GGUF / Both [g]", KeyCode::Char('g')), ("RAM budget [m]", KeyCode::Char('m')), ("Catalog / HF [c]", KeyCode::Char('c')), ("Open [Enter]", KeyCode::Enter), ("Sort [o]", KeyCode::Char('o')), ("Cancel download [x]", KeyCode::Char('x'))];
+        let buttons = [("Search [/]", KeyCode::Char('/')), ("MLX / GGUF / Both [t]", KeyCode::Char('t')), ("RAM budget [m]", KeyCode::Char('m')), ("Catalog / HF [c]", KeyCode::Char('c')), ("Open [Enter]", KeyCode::Enter), ("Sort [o]", KeyCode::Char('o')), ("Cancel download [x]", KeyCode::Char('x'))];
         let height = button_height(area.width.saturating_sub(2), &buttons);
         let [actions, area] = Layout::vertical([Constraint::Length(height + 1), Constraint::Min(0)]).areas(area);
         self.draw_buttons(f, actions.inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 }), &buttons);
@@ -2094,7 +2200,7 @@ impl Ui {
         match &mut self.repo {
             None => {
                 let mut l = vec![
-                    Line::from("/ search · g MLX/GGUF/Both · m RAM budget · ⏎ open"),
+                    Line::from("/ search · t MLX/GGUF/Both · m RAM budget · ⏎ open"),
                     Line::from("RAM is estimated for the configured context. Unreadable repos are excluded. Search checks up to 100 repos per format."),
                     Line::raw(""),
                     Line::from(vec![Span::styled("MLX ", Style::new().fg(Color::Magenta).bold()), Span::raw("runs on the Apple GPU via omarchy-mlx (mlx_lm.server).")]),
@@ -2241,6 +2347,39 @@ impl Ui {
         f.render_widget(Paragraph::new(text).block(panel(&format!("{} {}", if self.logs_model { "Model log" } else { "Daemon log" }, p.display()))), area);
     }
 }
+
+/// The Keys popup (`?`).
+const HELP: &str = "Everywhere
+  1-5 / Tab   switch tabs          g   recommend a model (the grader)
+  ?           this list            q   quit (the server keeps running)
+
+Dashboard
+  s  start / stop the server       b   backends: update MLX, choose the MLX runtime,
+  f  free memory (processes)           build llama.cpp, install Strata
+  a  unload all models             R   reload models after a settings change
+  x  cancel a download             C   clear finished downloads
+  X  force stop (SIGKILL)          S   install the user service
+  D  launcher + Omarchy menu rows
+
+Models
+  Enter  load       u  unload      c  chat in the terminal
+  m  make room for the selected model (memory popup)
+  x  context size   p  system prompt in your editor (P: back to the backend's)
+  G  GPU / CPU      d  delete      y  copy the name
+
+Discover
+  /  search Hugging Face           t   MLX / GGUF / Both
+  m  RAM budget     o  sort        c   omarchy-mlx catalog / search
+  Enter  open a repo, then Enter to download a variant
+
+Settings
+  Enter  edit (prompts open in your editor)   ←/→  memory sliders
+  o  the config file in your editor
+
+Logs
+  m  daemon / model log   j/k scroll   G  end
+
+Mouse: click tabs, buttons and rows; the wheel scrolls.";
 
 // ---------- small helpers ----------
 
@@ -2448,7 +2587,7 @@ mod tests {
         let mut ui = ui();
         ui.tab = Tab::Discover;
         for kind in ["gguf", "both", "mlx"] {
-            ui.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+            ui.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
             assert_eq!(ui.search_kind(), kind);
             assert!(!ui.catalog_mode);
         }
@@ -2514,7 +2653,10 @@ mod tests {
     fn clickable_runtime_removal_requires_confirmation() {
         let mut ui = ui();
         draw(&mut ui, 120, 36);
-        assert!(click_key(&mut ui, KeyCode::Char('i')).is_none());
+        assert!(click_key(&mut ui, KeyCode::Char('b')).is_none());
+        assert!(matches!(ui.input, Input::Backends));
+        draw(&mut ui, 120, 36);
+        assert!(click_key(&mut ui, KeyCode::Char('2')).is_none());
         assert!(matches!(ui.input, Input::Runtime));
         draw(&mut ui, 120, 36);
         assert!(click_key(&mut ui, KeyCode::Char('2')).is_none());
@@ -2531,7 +2673,9 @@ mod tests {
     fn gguf_setup_explains_optional_backend_and_blocks_background_clicks() {
         let mut ui = ui();
         draw(&mut ui, 120, 36);
-        assert!(click_key(&mut ui, KeyCode::Char('B')).is_none());
+        assert!(click_key(&mut ui, KeyCode::Char('b')).is_none());
+        draw(&mut ui, 120, 36);
+        assert!(click_key(&mut ui, KeyCode::Char('3')).is_none());
         let text = draw(&mut ui, 120, 36);
         assert!(text.contains("optional GGUF backend"));
         assert!(text.contains("MLX models do not need this"));
@@ -2545,8 +2689,8 @@ mod tests {
         for (width, height) in [(120, 36), (80, 24), (40, 12)] {
             let mut ui = ui();
             let text = draw(&mut ui, width, height);
-            if width >= 80 { assert!(text.contains("MLX runtime")); }
-            ui.input = Input::Guide;
+            if width >= 80 { assert!(text.contains("Backends")); }
+            ui.input = Input::Help;
             draw(&mut ui, width, height);
             click_key(&mut ui, KeyCode::Char('q'));
             assert!(matches!(ui.input, Input::None));
@@ -2555,6 +2699,21 @@ mod tests {
             click_key(&mut ui, KeyCode::Char('q'));
             assert!(matches!(ui.input, Input::None));
         }
+    }
+
+    #[test]
+    fn grader_opens_from_any_tab_and_switches_goals() {
+        let mut ui = ui();
+        ui.models.clear();
+        ui.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert!(matches!(ui.input, Input::None));
+        ui.tab = Tab::Models;
+        ui.input = Input::Grade(crate::grade::build(&ui.cfg, &[]));
+        for (w, h) in [(120, 36), (80, 24), (40, 12)] { draw(&mut ui, w, h); }
+        ui.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert!(matches!(&ui.input, Input::Grade(v) if v.goal == 2));
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(ui.input, Input::None));
     }
 
     #[test]

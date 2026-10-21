@@ -386,6 +386,25 @@ impl Config {
         Ok(())
     }
 
+    /// Change the config file: re-read it, apply `f`, and write back only the keys that changed.
+    /// Comments, key order and edits made elsewhere (an editor, the bar panel, the daemon, another
+    /// lmdeck window) are kept; nothing is written when nothing changed.
+    pub fn edit(f: impl FnOnce(&mut Config) -> Result<(), String>) -> Result<Config, String> {
+        let p = config_path();
+        let text = match std::fs::read_to_string(&p) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("reading {}: {e}", p.display())),
+        };
+        let (out, cfg) = edit_text(&text, f).map_err(|e| format!("{}: {e}", p.display()))?;
+        if let Some(out) = out {
+            std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
+            let tmp = p.with_extension("toml.tmp");
+            std::fs::write(&tmp, out).and_then(|_| std::fs::rename(&tmp, &p)).map_err(|e| format!("writing {}: {e}", p.display()))?;
+        }
+        Ok(cfg)
+    }
+
     pub fn base_url(&self) -> String {
         let host = if self.server.host == "0.0.0.0" { "127.0.0.1" } else { &self.server.host };
         format!("http://{}:{}", host, self.server.port)
@@ -447,6 +466,66 @@ pub fn expand(p: &str) -> PathBuf {
         home().join(rest)
     } else {
         PathBuf::from(p)
+    }
+}
+
+/// The config file's text after `f`, or None when nothing changed.
+fn edit_text(text: &str, f: impl FnOnce(&mut Config) -> Result<(), String>) -> Result<(Option<String>, Config), String> {
+    let before: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+    let mut after = before.clone();
+    f(&mut after)?;
+    let table = |c: &Config| match toml::Value::try_from(c) {
+        Ok(toml::Value::Table(t)) => Ok(t),
+        Ok(_) => Err("config is not a table".to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    let (old, new) = (table(&before)?, table(&after)?);
+    if old == new {
+        return Ok((None, after));
+    }
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
+    merge_changes(doc.as_table_mut(), &old, &new);
+    Ok((Some(doc.to_string()), after))
+}
+
+/// Write the keys that differ between `old` and `new` into `doc`, leaving everything else as is.
+fn merge_changes(doc: &mut dyn toml_edit::TableLike, old: &toml::Table, new: &toml::Table) {
+    let empty = toml::Table::new();
+    for (k, nv) in new {
+        let ov = old.get(k);
+        if ov == Some(nv) {
+            continue;
+        }
+        if let toml::Value::Table(nt) = nv {
+            let ot = match ov { Some(toml::Value::Table(t)) => t, _ => &empty };
+            if let Some(sub) = doc.get_mut(k).and_then(|i| i.as_table_like_mut()) {
+                merge_changes(sub, ot, nt);
+                continue;
+            }
+            if doc.get(k).is_none() {
+                let mut t = toml_edit::Table::new();
+                t.set_implicit(true);
+                merge_changes(&mut t, &empty, nt);
+                doc.insert(k, toml_edit::Item::Table(t));
+                continue;
+            }
+        }
+        let line = format!("x = {}", toml::Value::to_string(nv));
+        let item = match nv {
+            toml::Value::Table(_) => toml::to_string(&toml::Table::from_iter([("x".to_string(), nv.clone())]))
+                .ok()
+                .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
+                .and_then(|d| d.get("x").cloned()),
+            _ => line.parse::<toml_edit::DocumentMut>().ok().and_then(|d| d.get("x").cloned()),
+        };
+        if let Some(item) = item {
+            doc.insert(k, item);
+        }
+    }
+    for k in old.keys() {
+        if !new.contains_key(k) {
+            doc.remove(k);
+        }
     }
 }
 
@@ -786,4 +865,26 @@ pub fn needs_reload(key: &str) -> bool {
         || (key.starts_with("llama.") && key != "llama.git_ref")
         || matches!(key, "strata.engine" | "strata.vk_icd" | "strata.extra_args" | "strata.env")
         || key == "server.uclamp_boost"
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn edit_keeps_comments_unknown_keys_and_untouched_values() {
+        let text = "# my notes\n[server]\n# keep this\nport = 11434\nkeep_alive = \"30m\" # inline\n\n[mystery]\nx = 1\n";
+        let (out, cfg) = super::edit_text(text, |c| { c.server.mem_reserve_gib = 2.5; Ok(()) }).unwrap();
+        let out = out.unwrap();
+        assert!(out.contains("# my notes") && out.contains("# keep this") && out.contains("# inline"), "{out}");
+        assert!(out.contains("[mystery]") && out.contains("keep_alive = \"30m\""), "{out}");
+        assert!(out.contains("mem_reserve_gib = 2.5"), "{out}");
+        assert_eq!(cfg.server.mem_reserve_gib, 2.5);
+        // Nothing changed: nothing to write.
+        assert!(super::edit_text(text, |_| Ok(())).unwrap().0.is_none());
+        // A new table (a per-model override) is added without touching the rest.
+        let (out, _) = super::edit_text(text, |c| { c.overrides.entry("org/m".into()).or_default().ctx_size = Some(8192); Ok(()) }).unwrap();
+        let out = out.unwrap();
+        assert!(out.contains("ctx_size = 8192") && out.contains("# keep this"), "{out}");
+        let back: super::Config = toml::from_str(&out).unwrap();
+        assert_eq!(back.overrides["org/m"].ctx_size, Some(8192));
+    }
 }

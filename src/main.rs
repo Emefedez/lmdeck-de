@@ -3,6 +3,7 @@ mod backend;
 mod client;
 mod compat;
 mod config;
+mod grade;
 mod hf;
 mod launch;
 mod models;
@@ -62,6 +63,11 @@ enum Cmd {
     },
     /// Show runtime/daemon status and versions
     Status,
+    /// Rank the local models for a goal (the TUI's `g`)
+    Grade {
+        #[arg(default_value = "balanced", value_parser = ["balanced", "smartest", "fastest", "efficient"])]
+        goal: String,
+    },
     /// Migrate the legacy $HOME mlx-omarchy install to the Omarchy packages
     Migrate {
         /// Also install the ANE driver package (omarchy-ane-dkms)
@@ -72,7 +78,7 @@ enum Cmd {
     Update,
     /// Select an installed MLX runtime; optionally remove the other runtime
     Runtime {
-        #[arg(value_parser = ["omarchy", "custom", "fixed"])]
+        #[arg(value_parser = ["omarchy", "custom"])]
         source: String,
         /// Keep only this runtime (models, chat data, and GPU driver are kept)
         #[arg(long)]
@@ -229,6 +235,26 @@ async fn async_main(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Some(Cmd::Grade { goal }) => {
+            let ms = models::scan(&cfg);
+            let mut v = grade::build(&cfg, &ms);
+            v.set_goal(grade::GOALS.iter().position(|g| g.0.eq_ignore_ascii_case(&goal)).unwrap_or(0));
+            println!("{:<3} {:<48} {:<7} {:>12} {:>5} {:>6} {:>7} {:>5} {:>6} {:<8} {:>5}", "#", "model", "fmt", "params", "bits", "intel", "tok/s", "W", "J/tok", "fit", "score");
+            let mark = |s: grade::Src| match s { grade::Src::Measured => " ", grade::Src::User => "*", grade::Src::Estimate => "~" };
+            let opt = |x: Option<(f64, grade::Src)>, p: usize| x.map(|(v, s)| format!("{v:.p$}{}", mark(s))).unwrap_or_else(|| "? ".into());
+            for (i, r) in v.rows.iter().enumerate() {
+                let params = match (r.total_b, r.active_b) {
+                    (Some(t), Some(a)) if a < t * 0.95 => format!("{t:.0}B/{a:.1}B"),
+                    (Some(t), _) => format!("{t:.1}B"),
+                    _ => "?".into(),
+                };
+                println!("{:<3} {:<48} {:<7} {:>12} {:>5} {:>6} {:>7} {:>5} {:>6} {:<8} {:>5.0}", i + 1, r.name, r.format.as_str(), params,
+                    r.bits.map(|b| format!("{b:.1}")).unwrap_or("?".into()), opt(r.intelligence, 0), opt(r.tps, 1), opt(r.watts, 0),
+                    r.joules().map(|j| format!("{j:.1}")).unwrap_or("?".into()), r.fit, r.score);
+            }
+            println!("~ estimated  * from grades.toml  (blank) measured on this machine");
+            Ok(())
+        }
         Some(Cmd::Status) => {
             let mut v = sys::versions_local(&cfg);
             v.mlx_upstream = sys::upstream_release(&hf::client()).await;
@@ -240,11 +266,8 @@ async fn async_main(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Migrate { ane }) => run_script(&sys::script_migrate(ane)),
-        Some(Cmd::Update) => run_script(&sys::script_update_menu()),
+        Some(Cmd::Update) => run_script(&sys::script_update_menu(sys::versions_local(&cfg).mlx_selected == "not found")),
         Some(Cmd::Runtime { source, only }) => {
-            if only && source == "fixed" {
-                bail!("--only is for omarchy/custom; the Fixed runtime lives in its own folder and leaves the others alone");
-            }
             let path = sys::mlx_runtime_path(&source);
             if !path.is_file() {
                 bail!("{} runtime is not installed; run lmdeck update first", source);
@@ -262,9 +285,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            let mut cfg = cfg;
-            sys::set_mlx_executable(&mut cfg, &path);
-            cfg.save()?;
+            crate::config::Config::edit(|c| { sys::set_mlx_executable(c, &path); Ok(()) }).map_err(anyhow::Error::msg)?;
             if d.up().await {
                 d.reload().await?;
             }

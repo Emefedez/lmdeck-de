@@ -68,6 +68,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             reaper.reap().await;
+            if reaper.busy() {
+                crate::usage::sample_power();
+            }
         }
     });
 
@@ -292,11 +295,10 @@ async fn copy(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         Ok(m) => m,
         Err(e) => return not_found_or_500(e),
     };
-    let mut cfg = a.mgr.cfg();
-    cfg.aliases.insert(crate::models::normalize(dst), m.name);
-    if let Err(e) = cfg.save() {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
+    let cfg = match crate::config::Config::edit(|c| { c.aliases.insert(crate::models::normalize(dst), m.name.clone()); Ok(()) }) {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
     *a.mgr.cfg.write().unwrap() = cfg;
     StatusCode::OK.into_response()
 }
@@ -1530,13 +1532,10 @@ async fn lm_config_set(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     };
-    let mut cfg = a.mgr.cfg();
-    if let Err(e) = crate::config::set_setting(&mut cfg, key, &value) {
-        return err(StatusCode::BAD_REQUEST, format!("{key}: {e}"));
-    }
-    if let Err(e) = cfg.save() {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
+    let cfg = match crate::config::Config::edit(|c| crate::config::set_setting(c, key, &value).map_err(|e| format!("{key}: {e}"))) {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
     *a.mgr.cfg.write().unwrap() = cfg;
     a.mgr.invalidate();
     EVENTS.bump();
@@ -1711,40 +1710,50 @@ async fn lm_override(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         Ok(m) => m,
         Err(e) => return not_found_or_500(e),
     };
-    let mut cfg = a.mgr.cfg();
-    let o = cfg.overrides.entry(m.name.clone()).or_default();
-    match key {
-        "device" => {
-            if !["", "gpu", "cpu"].contains(&value.as_str()) {
-                return err(StatusCode::BAD_REQUEST, "device must be gpu or cpu");
-            }
-            o.device = (value == "cpu").then(|| value.clone());
+    // The prompt file is not part of the config.
+    if key == "system_prompt" {
+        let p = crate::sysprompt::model_file(&m.name);
+        let r = if b.get("value").is_none_or(|v| v.is_null()) {
+            std::fs::remove_file(&p).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+        } else {
+            std::fs::create_dir_all(p.parent().unwrap()).and_then(|_| std::fs::write(&p, &value))
+        };
+        if let Err(e) = r {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{}: {e}", p.display()));
         }
-        "ctx_size" => o.ctx_size = value.parse().ok(),
-        "keep_alive" => o.keep_alive = (!value.is_empty()).then(|| value.clone()),
-        // prompts/models/<model>.md: JSON null removes it (inherit the backend's), "" = no prompt.
-        "system_prompt" => {
-            let p = crate::sysprompt::model_file(&m.name);
-            let r = if b.get("value").is_none_or(|v| v.is_null()) {
-                std::fs::remove_file(&p).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
-            } else {
-                std::fs::create_dir_all(p.parent().unwrap()).and_then(|_| std::fs::write(&p, &value))
-            };
-            if let Err(e) = r {
-                return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{}: {e}", p.display()));
-            }
-        }
-        "system_prompt_mode" => {
-            if !value.is_empty() && !crate::sysprompt::MODES.contains(&value.as_str()) {
-                return err(StatusCode::BAD_REQUEST, "system_prompt_mode must be prepend, replace or fallback");
-            }
-            o.system_prompt_mode = (!value.is_empty()).then(|| value.clone());
-        }
-        _ => return err(StatusCode::BAD_REQUEST, "unknown override key"),
+        EVENTS.bump();
+        return Json(json!({"ok": true})).into_response();
     }
-    if let Err(e) = cfg.save() {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
+    let name = m.name.clone();
+    let edited = crate::config::Config::edit(|cfg| {
+        let o = cfg.overrides.entry(name.clone()).or_default();
+        match key {
+            "device" => {
+                if !["", "gpu", "cpu"].contains(&value.as_str()) {
+                    return Err("device must be gpu or cpu".into());
+                }
+                o.device = (value == "cpu").then(|| value.clone());
+            }
+            "ctx_size" => o.ctx_size = value.parse().ok(),
+            "keep_alive" => o.keep_alive = (!value.is_empty()).then(|| value.clone()),
+            "system_prompt_mode" => {
+                if !value.is_empty() && !crate::sysprompt::MODES.contains(&value.as_str()) {
+                    return Err("system_prompt_mode must be prepend, replace or fallback".into());
+                }
+                o.system_prompt_mode = (!value.is_empty()).then(|| value.clone());
+            }
+            _ => return Err("unknown override key".into()),
+        }
+        // An override with nothing left in it is removed.
+        if o.device.is_none() && o.ctx_size.is_none() && o.keep_alive.is_none() && o.system_prompt_mode.is_none() && o.gpu_layers.is_none() && o.extra_args.is_empty() && o.env.is_empty() {
+            cfg.overrides.remove(&name);
+        }
+        Ok(())
+    });
+    let cfg = match edited {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
     *a.mgr.cfg.write().unwrap() = cfg;
     EVENTS.bump();
     sys::log(&format!("override {}: {key} = {value:?}", m.name));

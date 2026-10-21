@@ -360,17 +360,11 @@ pub fn runtime_buffer_rounding(python_or_wrapper: &str) -> BufferRounding {
 
 fn rounding_for_wheel(name: &str) -> BufferRounding {
     let stamp = name.split(".dev").nth(1).map(|d| d.chars().take(12).collect::<String>()).and_then(|d| d.parse::<u64>().ok());
-    let upstream = match stamp {
+    match stamp {
         // b20211a0 (power-of-two bins) .. ad831f09 (PR #47, 8 per octave, 2026-10-09 07:27 UTC)
         Some(s) if s > 202610090727 => BufferRounding::PerOctave(8),
         Some(s) if s > 202610051840 => BufferRounding::PowerOfTwo,
         _ => BufferRounding::Pages,
-    };
-    // lmdeck's Fixed runtime uses finer size classes (mlx-omarchy-fixes/0001).
-    if name.contains("lmdeckfix") && upstream != BufferRounding::Pages {
-        BufferRounding::PerOctave(32)
-    } else {
-        upstream
     }
 }
 
@@ -503,7 +497,6 @@ mod sizing_tests {
         assert_eq!(super::rounding_for_wheel("mlx_omarchy-0.32.0.dev202610050725+abc.dist-info"), Pages);
         assert_eq!(super::rounding_for_wheel("mlx_omarchy-0.32.2.dev202610071347+9b5c938.dist-info"), PowerOfTwo);
         assert_eq!(super::rounding_for_wheel("mlx_omarchy-0.32.4.dev202610160529+33630f9c.dist-info"), PerOctave(8));
-        assert_eq!(super::rounding_for_wheel("mlx_omarchy-0.32.2.dev202610090000+lmdeckfix.7034fe9.dist-info"), PerOctave(32));
     }
 
     #[test]

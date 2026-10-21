@@ -236,6 +236,11 @@ impl Manager {
         self.running.lock().unwrap().clone()
     }
 
+    /// A request is being served by some model.
+    pub fn busy(&self) -> bool {
+        self.running.lock().unwrap().iter().any(|r| r.in_flight.load(Ordering::Relaxed) > 0)
+    }
+
     pub fn views(&self) -> Vec<RunningView> {
         self.running()
             .iter()
@@ -1127,6 +1132,17 @@ fn partial_layers() -> &'static Mutex<std::collections::HashMap<String, i32>> {
 
 /// `<arch>.block_count` from a GGUF file's metadata (transformer layers).
 pub fn gguf_block_count(path: &std::path::Path) -> Option<u32> {
+    gguf_u32s(path, &[".block_count"])[0]
+}
+
+/// Integer metadata from a GGUF file's header, one per key suffix (e.g. ".expert_count").
+pub fn gguf_u32s(path: &std::path::Path, suffixes: &[&str]) -> Vec<Option<u32>> {
+    let mut out = vec![None; suffixes.len()];
+    let _ = gguf_scan(path, suffixes, &mut out);
+    out
+}
+
+fn gguf_scan(path: &std::path::Path, suffixes: &[&str], out: &mut [Option<u32>]) -> Option<()> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::io::BufReader::new(std::fs::File::open(path).ok()?);
     let mut b8 = [0u8; 8];
@@ -1162,13 +1178,17 @@ pub fn gguf_block_count(path: &std::path::Path) -> Option<u32> {
         f.read_exact(&mut key).ok()?;
         f.read_exact(&mut b4).ok()?;
         let ty = u32::from_le_bytes(b4);
-        if key.ends_with(b".block_count") && (ty == 4 || ty == 5) {
-            f.read_exact(&mut b4).ok()?;
-            return Some(u32::from_le_bytes(b4));
+        let hit = suffixes.iter().position(|s| key.ends_with(s.as_bytes()));
+        match hit {
+            Some(i) if ty == 4 || ty == 5 => {
+                f.read_exact(&mut b4).ok()?;
+                out[i] = Some(u32::from_le_bytes(b4));
+                if out.iter().all(Option::is_some) { return Some(()); }
+            }
+            _ => skip(&mut f, ty)?,
         }
-        skip(&mut f, ty)?;
     }
-    None
+    Some(())
 }
 
 #[cfg(test)]
@@ -1193,7 +1213,7 @@ mod work_tests {
 const MLX_PLAN_CTX: u64 = 32768;
 /// Strata's admission floor: the dense weights and buffers (~5 GiB on Qwen3.8-Flash-Next Q2_0)
 /// plus the smallest useful expert arena; the engine fills the rest of its heap with experts.
-const STRATA_FLOOR: u64 = 9 << 30;
+pub const STRATA_FLOOR: u64 = 9 << 30;
 const MLX_MIN_CTX: u64 = 8192;
 /// Activations at prefill_step_size 512 plus Vulkan pipelines and scratch.
 const MLX_RUNTIME: u64 = 640 << 20;

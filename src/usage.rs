@@ -66,12 +66,87 @@ pub struct Last {
     pub at: String,
 }
 
+/// Measured speed and power of one model on this machine (the model grader reads it).
+/// Moving averages over requests that generated at least `PERF_MIN_TOKENS`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Perf {
+    pub runs: u64,
+    pub gen_tps: f64,
+    pub prompt_tps: f64,
+    /// Total system power while generating (SMC sensor), 0 = not measured.
+    pub watts: f64,
+    pub at: String,
+}
+
+const PERF_MIN_TOKENS: u64 = 32;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UsageData {
     pub days: BTreeMap<String, Counts>,
     pub models: BTreeMap<String, Counts>,
     pub last: Option<Last>,
+    pub perf: BTreeMap<String, Perf>,
+}
+
+/// The perf records as last flushed to usage.json (for the TUI, which is another process).
+pub fn read_perf() -> BTreeMap<String, Perf> {
+    let mut d: UsageData = std::fs::read(usage_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    seed_perf(&mut d);
+    d.perf
+}
+
+/// usage.json from before the perf records still has the last request's numbers: use them.
+fn seed_perf(d: &mut UsageData) {
+    if !d.perf.is_empty() {
+        return;
+    }
+    if let Some(l) = d.last.as_ref().filter(|l| l.completion_tokens >= PERF_MIN_TOKENS && l.gen_tps > 0.0) {
+        d.perf.insert(l.model.clone(), Perf { runs: 1, gen_tps: l.gen_tps, prompt_tps: l.prompt_tps, watts: 0.0, at: l.at.clone() });
+    }
+}
+
+/// Power samples taken while a request is being served (the daemon's 2 s housekeeping tick,
+/// only when busy): (time, watts). Nothing is read while lmdeck is idle.
+static POWER: Mutex<std::collections::VecDeque<(std::time::Instant, f64)>> = Mutex::new(std::collections::VecDeque::new());
+
+/// The SMC's "Total System Power" sensor (µW), found once.
+fn power_sensor() -> Option<&'static PathBuf> {
+    static P: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let dirs = std::fs::read_dir("/sys/class/hwmon").ok()?;
+        for d in dirs.flatten() {
+            for e in std::fs::read_dir(d.path()).ok()?.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.starts_with("power") && n.ends_with("_label")
+                    && std::fs::read_to_string(e.path()).is_ok_and(|l| l.trim() == "Total System Power")
+                {
+                    return Some(d.path().join(n.replace("_label", "_input")));
+                }
+            }
+        }
+        None
+    })
+    .as_ref()
+}
+
+pub fn sample_power() {
+    let Some(p) = power_sensor() else { return };
+    let Some(uw) = std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse::<f64>().ok()) else { return };
+    let mut q = POWER.lock().unwrap();
+    q.push_back((std::time::Instant::now(), uw / 1e6));
+    while q.len() > 600 {
+        q.pop_front();
+    }
+}
+
+/// Mean power over the last `secs` seconds, if it was sampled.
+fn mean_power(secs: f64) -> Option<f64> {
+    let q = POWER.lock().unwrap();
+    let since = std::time::Instant::now().checked_sub(Duration::from_secs_f64(secs.max(0.0)))?;
+    let w: Vec<f64> = q.iter().filter(|(t, _)| *t >= since).map(|s| s.1).collect();
+    (!w.is_empty()).then(|| w.iter().sum::<f64>() / w.len() as f64)
 }
 
 pub struct Usage {
@@ -80,9 +155,11 @@ pub struct Usage {
 }
 
 pub static USAGE: LazyLock<Usage> = LazyLock::new(|| Usage {
-    data: Mutex::new(
-        std::fs::read(usage_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default(),
-    ),
+    data: Mutex::new({
+        let mut d: UsageData = std::fs::read(usage_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        seed_perf(&mut d);
+        d
+    }),
     dirty: AtomicBool::new(false),
 });
 
@@ -103,6 +180,20 @@ impl Usage {
         let mut d = self.data.lock().unwrap();
         d.days.entry(crate::sys::local_date(0)).or_default().add(prompt, completion);
         d.models.entry(model.to_string()).or_default().add(prompt, completion);
+        if completion >= PERF_MIN_TOKENS && gen_secs > 0.0 {
+            let p = d.perf.entry(model.to_string()).or_default();
+            let a = if p.runs == 0 { 1.0 } else { 0.3 };
+            let ema = |old: f64, new: f64| if old > 0.0 { old + a * (new - old) } else { new };
+            p.gen_tps = ema(p.gen_tps, completion as f64 / gen_secs);
+            if prompt_secs > 0.0 && prompt >= PERF_MIN_TOKENS {
+                p.prompt_tps = ema(p.prompt_tps, prompt as f64 / prompt_secs);
+            }
+            if let Some(w) = mean_power(gen_secs) {
+                p.watts = ema(p.watts, w);
+            }
+            p.runs += 1;
+            p.at = crate::sys::now_rfc3339();
+        }
         d.last = Some(Last {
             model: model.to_string(),
             prompt_tokens: prompt,
