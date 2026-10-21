@@ -29,12 +29,18 @@ impl Ui {
             Kind::Prompt => "Open in your editor",
             _ => "Edit",
         };
-        vec![
+        let mut acts = vec![
             Act::new(KeyCode::Enter, enter),
             Act::new(KeyCode::Right, "Change").or(KeyCode::Left).hint("←/→").when(matches!(s.kind, Kind::Bool | Kind::Choice(_) | Kind::Gib), "only on/off, choices and GiB sliders change with ←/→; Enter edits"),
             Act::new(KeyCode::Char('r'), "Reset to default").when(value != default && s.kind != Kind::Prompt, "already the default"),
             Act::new(KeyCode::Char('o'), "Open config.toml"),
-        ]
+        ];
+        // ctx-trim (a separate TUI) edits local_tools / tool_allow / tool_deny per tool; offered
+        // only where it is installed.
+        if crate::config::which("ctx-trim").is_some() {
+            acts.push(Act::new(KeyCode::Char('t'), "Trim agent tools (ctx-trim)"));
+        }
+        acts
     }
 
     pub(super) fn settings_act(&mut self, key: KeyCode) -> Option<Action> {
@@ -51,6 +57,7 @@ impl Ui {
                 let default = get_setting(&Config::default(), s.key);
                 self.edit_config(s.key, |c| set_setting(c, s.key, &default));
             }
+            KeyCode::Char('t') => return Some(Action::Edit(vec!["ctx-trim".into(), "--tab".into(), "lmdeck".into()])),
             KeyCode::Char('o') => {
                 let p = crate::config::config_path();
                 if !p.exists() {
