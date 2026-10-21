@@ -779,11 +779,25 @@ else
   ((${{#need[@]}})) && sudo pacman -S --needed "${{need[@]}}"
   bash "$HK/build-icd.sh" || die "driver build"
 fi
-if grep -q STRATA_ENABLE_VULKAN "$DIR/CMakeLists.txt"; then
+if [[ -f "$DIR/vulkan/CMakeLists.txt" ]] && grep -q STRATA_ENABLE_VULKAN "$DIR/vulkan/CMakeLists.txt"; then
   say "Building the Vulkan engine"
-  cmake -S "$DIR" -B "$DIR/build-vulkan" -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_VULKAN=ON || die "cmake configure"
+  # Slang (the kernel compiler, a library the engine links) and llama.cpp's ggml at the commit Strata pins
+  SLANG="$HOME/.local/share/slang/2026.18.2"
+  if [[ ! -f "$SLANG/include/slang.h" ]]; then
+    say "Slang 2026.18.2 into $SLANG"
+    mkdir -p "$SLANG"
+    curl -fL https://github.com/shader-slang/slang/releases/download/v2026.18.2/slang-2026.18.2-linux-aarch64.tar.gz | tar -xz -C "$SLANG" || die "slang download"
+  fi
+  LLAMA="$DIR/third_party/llama.cpp"
+  if [[ ! -f "$LLAMA/ggml/CMakeLists.txt" ]]; then
+    (cd "$DIR" && "$DIR/.venv/bin/python" -c 'import setup; setup.get_llama_cpp()') || die "llama.cpp download"
+  fi
+  cmake -S "$DIR/vulkan" -B "$DIR/build-vulkan" -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_VULKAN=ON \
+    -DSTRATA_GGML_DIR="$LLAMA" -DSLANG_DIR="$SLANG" || die "cmake configure"
   cmake --build "$DIR/build-vulkan" -j{jobs} --target strata || die "engine build"
   say "Engine: $DIR/build-vulkan/strata"
+  say "Model setup (download, pack, the experts' streaming copy, the MTP draft layer, the run config):"
+  say "  $DIR/.venv/bin/python $DIR/vulkan/setup_asahi.py --model Q2_0 --yes --no-start"
 else
   warn "This branch has no Vulkan engine yet (the port is in progress): the server is installed,"
   warn "Strata models are listed but refuse to load until the engine is built. strata.engine = mock tests the plumbing."
