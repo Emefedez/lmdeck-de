@@ -87,9 +87,17 @@ Every `/v1/messages` request logs the breakdown (system, messages, tools before 
 
 `POST /v1/responses` (what Codex speaks) is translated onto the backend's Chat Completions, on MLX and GGUF alike. Text and reasoning stream; tool calls come back as whole items. Codex's `apply_patch` (a free-form "custom" tool) is offered to the model as a function with one `input` string. `previous_response_id` works for the last 32 responses (kept in memory). As on `/v1/messages`, `server.local_tools` other than `all` drops the MCP tools: Codex sends each MCP server as a `namespace`, and with 9 servers that was 284 tools, ~83k tokens, against ~8k without them. lmdeck reports itself as Ollama 0.14.0, since Codex 0.16x refuses older versions. `lmdeck launch codex` on Qwen3.5-4B: a shell tool call and the answer, first turn 23 s, follow-up 3 s.
 
+### VS Code Copilot
+
+Copilot's chat requests (`/v1/chat/completions`, recognised by their user agent) get the same `server.local_tools`
+treatment: MCP tools (`mcp_<server>_<tool>`) are dropped unless the mode is `all`, and in `lean`/`groups` each tool
+description is cut to its first paragraph and each parameter doc to one line. The server log records the request's
+size before and after.
+
 ## Context guard
 
-Every chat request (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/messages`, `/v1/responses`) is checked against the window lmdeck advertises for the model: the per-model context (Models → `e`), else `mlx.max_context` / `llama.ctx_size`, never above the model's own maximum. A prompt over it is refused at once with a clear error ("prompt is too long" on `/v1/messages`, which Claude Code offers to `/compact`; `context_length_exceeded` on the OpenAI paths), and `max_tokens` is trimmed to the room left. The size is an estimate: ~3.8 characters per token, an inline image counted as ~1k tokens. Measured with Qwen3.5's tokenizer on a Codex request, text runs 4.3 characters per token and tool JSON 4.0. An MLX backend has no limit of its own: before this guard, an 82k-token Codex prompt on a 4B model filled the whole GPU heap (19 GiB) while it was read.
+Every chat request (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/messages`, `/v1/responses`) is checked against the window lmdeck advertises for the model: the per-model context (Models → `e`), else `mlx.max_context` / `llama.ctx_size`, never above the model's own maximum. For Strata the window is the run config's `--max-context`; a context set in Models → `e` is passed to the engine
+instead, in a copy of the run config (the file itself is not changed). A prompt over the window is refused at once with a clear error ("prompt is too long" on `/v1/messages`, which Claude Code offers to `/compact`; `context_length_exceeded` on the OpenAI paths), and `max_tokens` is trimmed to the room left. The size is an estimate: ~3.8 characters per token, an inline image counted as ~1k tokens. Measured with Qwen3.5's tokenizer on a Codex request, text runs 4.3 characters per token and tool JSON 4.0. An MLX backend has no limit of its own: before this guard, an 82k-token Codex prompt on a 4B model filled the whole GPU heap (19 GiB) while it was read.
 
 **MLX buffer cache.** MLX keeps freed GPU buffers for reuse, by default up to its whole memory limit, so one long prompt's temporaries stayed allocated until the model unloaded. `mlx.cache_limit_gib` (default 1) caps that cache. Prompt caches are separate (`mlx.prompt_cache_gib`). The MLX log prints `MLX memory … in use, … cached, … peak` whenever the numbers change. A Codex run on Qwen3.5-4B ended at 3.45 GiB in use, 0.83 cached, 3.71 peak.
 

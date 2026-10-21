@@ -38,7 +38,7 @@ const LEAN_DROP: &[&str] = &[
     "ReportFindings", "Artifact", "ArtifactComments", "ArtifactData", "DesignSync",
 ];
 
-fn shorten(text: &str, max: usize) -> String {
+pub fn shorten(text: &str, max: usize) -> String {
     let first = text.split("\n\n").next().unwrap_or(text).trim();
     if first.chars().count() <= max {
         first.to_string()
@@ -49,7 +49,7 @@ fn shorten(text: &str, max: usize) -> String {
 }
 
 /// Lean JSON schema: parameter descriptions cut to one short line, structure untouched.
-fn lean_schema(v: &Value) -> Value {
+pub fn lean_schema(v: &Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(m.iter().map(|(k, v)| {
             let v = if k == "description" { v.as_str().map(|s| json!(shorten(s, 160))).unwrap_or_else(|| v.clone()) } else { lean_schema(v) };
@@ -80,6 +80,31 @@ pub fn filter_tools(tools: &[Value], mode: ToolMode) -> Vec<Value> {
         }
         Some(t.clone())
     }).collect()
+}
+
+/// `server.local_tools` on an OpenAI chat request's tools (VS Code Copilot's): MCP tools
+/// (`mcp_<server>_<tool>`, VS Code's naming) dropped unless `all`; in lean/groups, descriptions cut
+/// to their first paragraph and parameter docs to one line. Schemas are untouched. Returns the
+/// number of tools before and after.
+pub fn trim_openai_tools(body: &mut Value, mode: ToolMode) -> (usize, usize) {
+    let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) else { return (0, 0) };
+    let before = tools.len();
+    if mode == ToolMode::All {
+        return (before, before);
+    }
+    tools.retain(|t| !t["function"]["name"].as_str().unwrap_or("").starts_with("mcp_"));
+    if matches!(mode, ToolMode::Lean | ToolMode::Groups) {
+        for t in tools.iter_mut() {
+            let f = &mut t["function"];
+            if let Some(d) = f.get("description").and_then(|d| d.as_str()) {
+                f["description"] = json!(shorten(d, 600));
+            }
+            if f.get("parameters").is_some() {
+                f["parameters"] = lean_schema(&f["parameters"]);
+            }
+        }
+    }
+    (before, tools.len())
 }
 
 pub fn to_openai(b: &Value, model_id: &str, mode: ToolMode) -> Value {
@@ -667,5 +692,25 @@ mod mcp_tool_tests {
         assert_eq!(out[0]["description"], "Runs a command.");
         assert_eq!(out[0]["input_schema"]["required"][0], "command");
         assert!(out[0]["input_schema"]["properties"]["command"]["description"].as_str().unwrap().chars().count() <= 161);
+    }
+}
+
+#[cfg(test)]
+mod vscode_tests {
+    use super::*;
+
+    #[test]
+    fn copilot_tools_lose_mcp_and_long_docs() {
+        let long = format!("Reads a file.\n\n{}", "More detail. ".repeat(200));
+        let mut body = json!({"tools": [
+            {"type": "function", "function": {"name": "read_file", "description": long, "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "x ".repeat(300)}}}}},
+            {"type": "function", "function": {"name": "mcp_rea_open_binary", "description": "MCP", "parameters": {}}},
+        ]});
+        assert_eq!(trim_openai_tools(&mut body, ToolMode::Lean), (2, 1));
+        assert_eq!(body["tools"][0]["function"]["description"], "Reads a file.");
+        assert!(body["tools"][0]["function"]["parameters"]["properties"]["path"]["description"].as_str().unwrap().chars().count() <= 161);
+        assert_eq!(body["tools"][0]["function"]["parameters"]["properties"]["path"]["type"], "string");
+        let mut all = json!({"tools": [{"type": "function", "function": {"name": "mcp_x_y"}}]});
+        assert_eq!(trim_openai_tools(&mut all, ToolMode::All), (1, 1));
     }
 }

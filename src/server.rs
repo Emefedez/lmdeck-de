@@ -1002,8 +1002,9 @@ pub fn context_limit(cfg: &Config, m: &LocalModel) -> u64 {
             let model_max = m.ctx_len.unwrap_or(u64::MAX);
             ov.unwrap_or(cfg.mlx.max_context as u64).min(model_max)
         }
-        // The engine's --max-context (Strata's server enforces it itself as well).
-        Format::Strata => ov.unwrap_or(u64::MAX).min(m.ctx_len.unwrap_or(32768)),
+        // The run config's --max-context, or lmdeck's override (passed to the engine as its
+        // --max-context; Strata's server enforces it itself as well).
+        Format::Strata => ov.unwrap_or(m.ctx_len.unwrap_or(32768)).min(262_144),
     }
 }
 
@@ -1041,7 +1042,7 @@ fn context_check(cfg: &Config, m: &LocalModel, body: &mut Value) -> Result<(), (
 }
 
 fn too_long_hint(name: &str) -> String {
-    format!("Shorten the conversation, send fewer tools (server.local_tools = lean drops MCP tools), or raise {name}'s context in lmdeck (x on the Models tab) if memory allows.")
+    format!("Shorten the conversation, send fewer tools (server.local_tools = lean drops MCP tools), or raise {name}'s context in lmdeck (Models → e → Context size) if memory allows.")
 }
 
 fn oai_err(code: StatusCode, kind: &str, msg: impl std::fmt::Display) -> Resp {
@@ -1350,6 +1351,15 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
         o.insert("model".into(), json!(guard.0.backend_model_id()));
     }
     if uri.path().ends_with("/chat/completions") {
+        // VS Code Copilot sends its whole tool list, MCP servers included: trim it the way
+        // server.local_tools trims Claude Code's and Codex's.
+        let ua = headers.get("user-agent").and_then(|u| u.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+        if ua.contains("copilot") || ua.contains("vscode") {
+            let est = estimate_tokens(&v);
+            let mode = crate::anthropic::ToolMode::parse(&a.mgr.cfg().server.local_tools);
+            let (n0, n1) = crate::anthropic::trim_openai_tools(&mut v, mode);
+            sys::log(&format!("{}: VS Code request ~{est} -> ~{} tokens, tools {n0} -> {n1} (server.local_tools = {})", guard.0.name, estimate_tokens(&v), a.mgr.cfg().server.local_tools));
+        }
         crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut v);
         if let Err((est, limit)) = context_check(&a.mgr.cfg(), &guard.0.model, &mut v) {
             sys::log(&format!("{}: refused a ~{est}-token prompt (window {limit})", guard.0.name));

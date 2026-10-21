@@ -715,6 +715,22 @@ impl Manager {
                         }
                     }
                 }
+                // A context set in lmdeck (Models → e) replaces the run config's --max-context, in a
+                // copy of the run config: the file itself is not changed.
+                let mut run_config = m.path.clone();
+                if let Some(ctx) = cfg.overrides.get(&m.name).and_then(|o| o.ctx_size).filter(|c| *c > 0 && !mock) {
+                    let mut run: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&m.path)?)?;
+                    if let Some(args) = run["args"].as_array_mut() {
+                        match args.iter().position(|a| a == "--max-context") {
+                            Some(i) if i + 1 < args.len() => args[i + 1] = serde_json::json!(ctx.to_string()),
+                            _ => args.extend([serde_json::json!("--max-context"), serde_json::json!(ctx.to_string())]),
+                        }
+                    }
+                    run_config = crate::config::state_dir().join(format!("strata-{port}.run.json"));
+                    std::fs::create_dir_all(crate::config::state_dir())?;
+                    std::fs::write(&run_config, serde_json::to_vec_pretty(&run)?)?;
+                    sys::log(&format!("{}: --max-context {ctx} (lmdeck override)", m.name));
+                }
                 let ready = crate::config::state_dir().join(format!("strata-{port}.ready.json"));
                 std::fs::create_dir_all(crate::config::state_dir())?;
                 let _ = std::fs::remove_file(&ready);
@@ -724,7 +740,7 @@ impl Manager {
                     "--engine".into(),
                     if mock { "mock".into() } else { "strata".into() },
                     "--config".into(),
-                    m.path.display().to_string(),
+                    run_config.display().to_string(),
                     "--host".into(),
                     "127.0.0.1".into(),
                     "--port".into(),
