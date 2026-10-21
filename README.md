@@ -92,6 +92,7 @@ Details and the formula are in [docs/REFERENCE.md](docs/REFERENCE.md#model-grade
 - [IDEAS.md](docs/IDEAS.md): what could come next
 - [LIMITATIONS.md](docs/LIMITATIONS.md): what does not work, or was never tested
 - [MODELS.md](docs/MODELS.md): what runs, and how to tell before downloading
+- [PLAN-strata-in-editors.md](docs/PLAN-strata-in-editors.md): the plan to make Strata fast in VS Code and coding agents
 - [REFERENCE.md](docs/REFERENCE.md): the server's APIs, coding agents, system prompts, memory planning, settings,
   files
 
