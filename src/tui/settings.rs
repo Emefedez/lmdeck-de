@@ -162,7 +162,7 @@ impl Ui {
         }
         l.push(kv("Applies", applies(s.key)));
         l.push(Line::raw(""));
-        l.push(dim(format!("Saved to {}; only this key is rewritten.", crate::config::config_path().display())));
+        l.push(dim(format!("Saved to {}; only this key is rewritten.", super::widgets::tilde(&crate::config::config_path().display().to_string()))));
         f.render_widget(Paragraph::new(l).wrap(Wrap { trim: false }).block(panel("About this setting")), detail);
     }
 }

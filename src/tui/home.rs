@@ -1,14 +1,14 @@
 //! Home: is the server up, what is loaded, how much memory is free, what is downloading.
 
 use super::popup::{Confirmed, Popup};
-use super::widgets::{all_downloads, active_downloads, compact, dim, dur, kv, load_label, panel, plural, Act};
+use super::widgets::{all_downloads, active_downloads, bar_line, compact, dim, dur, kv, load_label, panel, plural, Act};
 use super::{Action, Ui};
 use crate::{client, human, sys};
 use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Gauge, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 use serde_json::Value;
 
@@ -158,7 +158,7 @@ impl Ui {
                 let [label, gauge, rest] = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)]).areas(inner);
                 f.render_widget(Line::from(Span::styled(load_label(l), Style::new().fg(Color::Cyan))), label);
                 let p = l["progress"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0);
-                f.render_widget(Gauge::default().ratio(p).gauge_style(Style::new().fg(Color::Cyan).bg(Color::Reset)).use_unicode(true).label(format!("{:.0}%", p * 100.0)), gauge);
+                f.render_widget(bar_line(p, 24, Color::Cyan, format!("{:.0}%", p * 100.0)), gauge);
                 rest
             }
             None => inner,
@@ -166,7 +166,7 @@ impl Ui {
         let running = self.running();
         if running.is_empty() {
             if progress.is_none() {
-                f.render_widget(Paragraph::new(vec![dim("Nothing loaded."), dim("Load one in Models (2), or let a client's first request load it.")]), table_area);
+                f.render_widget(Paragraph::new(vec![dim("Nothing loaded."), dim("Load one in Models (2), or let a client's first request load it.")]).wrap(Wrap { trim: true }), table_area);
             }
             return;
         }
@@ -192,7 +192,7 @@ impl Ui {
         f.render_widget(block, area);
         let [gauge, text] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
         let used = 1.0 - avail as f64 / total.max(1) as f64;
-        f.render_widget(Gauge::default().ratio(used.clamp(0.0, 1.0)).gauge_style(Style::new().fg(if used > 0.85 { Color::Yellow } else { Color::Green }).bg(Color::Reset)).use_unicode(true).label(format!("{} free of {}", human(avail), human(total))), gauge);
+        f.render_widget(bar_line(used, 20, if used > 0.85 { Color::Yellow } else { Color::Green }, format!("{} used · {} free of {}", human(total.saturating_sub(avail)), human(avail), human(total))), gauge);
         let c = &self.cfg.server;
         let gib = |g: f64| (g * (1u64 << 30) as f64) as u64;
         let vm = sys::muvm_rss();
@@ -244,7 +244,7 @@ impl Ui {
         match u["last"].as_object() {
             Some(last) => {
                 let n = |k: &str| last.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                l.push(kv("Last", &format!("{} · {:.1} tok/s · prompt {:.0} tok/s · TTFT {:.1}s", last.get("model").and_then(|m| m.as_str()).unwrap_or("").rsplit('/').next().unwrap_or(""), n("gen_tps"), n("prompt_tps"), n("ttft_secs"))));
+                l.push(kv("Last", &format!("{} · {:.1} tok/s · prompt {:.0} tok/s · {:.1}s to first", last.get("model").and_then(|m| m.as_str()).unwrap_or("").rsplit('/').next().unwrap_or(""), n("gen_tps"), n("prompt_tps"), n("ttft_secs"))));
             }
             None => l.push(kv("Last", "no requests yet")),
         }
@@ -283,7 +283,7 @@ impl Ui {
                 "failed" => Color::Red,
                 _ => Color::Cyan,
             };
-            f.render_widget(Gauge::default().ratio(pct.clamp(0.0, 1.0)).label(label).gauge_style(Style::new().fg(color).bg(Color::Reset)).use_unicode(true), rows[i]);
+            f.render_widget(bar_line(pct, 12, color, label), rows[i]);
         }
     }
 }

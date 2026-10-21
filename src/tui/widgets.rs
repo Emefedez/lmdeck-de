@@ -78,6 +78,17 @@ pub fn button_height(width: u16, acts: &[Act]) -> u16 {
     button_cells(Rect::new(0, 0, width, u16::MAX), acts).last().map(|(_, r)| r.bottom()).unwrap_or(0)
 }
 
+/// A bar of `width` cells, filled to `ratio`, then the text beside it (never on top of the fill,
+/// where a gauge's label becomes unreadable).
+pub fn bar_line(ratio: f64, width: usize, color: Color, text: String) -> Line<'static> {
+    let n = (ratio.clamp(0.0, 1.0) * width as f64).round() as usize;
+    Line::from(vec![
+        Span::styled("█".repeat(n), Style::new().fg(color)),
+        Span::styled("░".repeat(width - n), Style::new().fg(Color::DarkGray)),
+        Span::raw(format!(" {text}")),
+    ])
+}
+
 pub fn panel(title: &str) -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)

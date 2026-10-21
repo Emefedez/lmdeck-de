@@ -51,6 +51,17 @@ and `?` lists the keys of the screen you are on.
 | 5 Settings | Every setting, with its description, default and when a change applies |
 | 6 Logs | The server's log and the loaded model's log |
 
+Drawn from the real TUI on the M1 Max (`cargo test screenshots -- --ignored`), Tokyo Night palette:
+
+| | |
+|---|---|
+| ![Home](docs/screenshots/home.svg) | ![Models, sorted by the grader](docs/screenshots/models.svg) |
+| Home | Models, sorted by the grader (Balanced) |
+| ![Backends](docs/screenshots/backends.svg) | ![Memory manager](docs/screenshots/memory.svg) |
+| Backends: each action's plan before it runs | The memory manager (`f`); process list trimmed to the desktop's own |
+| ![Get models](docs/screenshots/get-models.svg) | ![Settings](docs/screenshots/settings.svg) |
+| Get models: the omarchy-mlx catalog | Settings: description, default, when it applies |
+
 ### Model grader (`g`)
 
 `g` sorts Models by a grade for a goal (Balanced, Smartest, Fastest, Efficient; `g` again for the next goal).

@@ -45,7 +45,7 @@ impl Ui {
         let h = area.height.saturating_sub(2) as usize;
         let end = lines.len().saturating_sub(self.logs_scroll as usize);
         let text = lines[end.saturating_sub(h)..end].join("\n");
-        let title = format!("{} · {} · ↑↓ scroll", if self.logs_model { "Model log" } else { "Server log" }, self.logs_path().display());
+        let title = format!("{} · {} · ↑↓ scroll", if self.logs_model { "Model log" } else { "Server log" }, super::widgets::tilde(&self.logs_path().display().to_string()));
         f.render_widget(Paragraph::new(text).block(panel(&title)), area);
     }
 }

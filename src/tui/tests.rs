@@ -281,3 +281,127 @@ async fn print_screens() {
         }
     }
 }
+
+/// `cargo test screenshots -- --ignored`: the README's screenshots (docs/screenshots/*.svg),
+/// drawn from this machine's models and server state with the Tokyo Night palette.
+#[tokio::test]
+#[ignore]
+async fn screenshots() {
+    use ratatui::style::{Color, Modifier};
+    const PALETTE: [&str; 16] = [
+        "#1a1b26", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#ad8ee6", "#449dab", "#a9b1d6",
+        "#414868", "#ff7a93", "#b9f27c", "#ff9e64", "#7da6ff", "#bb9af7", "#0db9d7", "#c0caf5",
+    ];
+    let (bg0, fg0) = ("#1a1b26", "#a9b1d6");
+    let hex = |c: Color, default: &str| -> String {
+        match c {
+            Color::Reset => default.to_string(),
+            Color::Black => PALETTE[0].into(),
+            Color::Red => PALETTE[1].into(),
+            Color::Green => PALETTE[2].into(),
+            Color::Yellow => PALETTE[3].into(),
+            Color::Blue => PALETTE[4].into(),
+            Color::Magenta => PALETTE[5].into(),
+            Color::Cyan => PALETTE[6].into(),
+            Color::Gray => PALETTE[7].into(),
+            Color::DarkGray => PALETTE[8].into(),
+            Color::LightRed => PALETTE[9].into(),
+            Color::LightGreen => PALETTE[10].into(),
+            Color::LightYellow => PALETTE[11].into(),
+            Color::LightBlue => PALETTE[12].into(),
+            Color::LightMagenta => PALETTE[13].into(),
+            Color::LightCyan => PALETTE[14].into(),
+            Color::White => PALETTE[15].into(),
+            Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+            Color::Indexed(i) => PALETTE.get(i as usize).map(|s| s.to_string()).unwrap_or_else(|| default.into()),
+        }
+    };
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let cfg = Config::load().unwrap();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/screenshots");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (w, h) = (120u16, 34u16);
+    let (cw, ch) = (8.4f64, 18.0f64);
+    let shots: Vec<(&str, Tab, Option<fn(&mut Ui)>)> = vec![
+        ("home", Tab::Home, None),
+        ("models", Tab::Models, None),
+        ("get-models", Tab::Discover, None),
+        ("backends", Tab::Backends, None),
+        ("settings", Tab::Settings, Some(|ui: &mut Ui| ui.settings_sel.select(Some(crate::config::SETTINGS.iter().position(|s| s.key == "server.gpu_heap").unwrap())))),
+        // The process list trimmed to the desktop's own processes (the rest is what you run).
+        ("memory", Tab::Home, Some(|ui: &mut Ui| {
+            let mut p = Popup::free_memory(None);
+            if let Popup::Free { groups, .. } = &mut p {
+                groups.retain(|g| ["Hyprland", "quickshell", "ghostty", "bash", "xdg-desktop-por", "pipewire", "wireplumber", "mako", "swaybg", "walker"].contains(&g.name.as_str()));
+            }
+            ui.popup = Some(p);
+        })),
+    ];
+    for (name, tab, setup) in shots {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut ui = Ui::new(cfg.clone(), tx);
+        ui.versions = sys::versions_local(&cfg);
+        ui.status = ui.d.status().await;
+        // The planner's answers, as the TUI gets them.
+        let mut plans = std::collections::HashMap::new();
+        for m in &ui.models {
+            if let Ok(r) = ui.d.http().get(format!("{}/lmdeck/plan?model={}", cfg.base_url(), m.name)).send().await {
+                if let Ok(v) = r.json::<Value>().await {
+                    plans.insert(m.name.clone(), v);
+                }
+            }
+        }
+        ui.plans = plans;
+        ui.tab = tab;
+        if let Some(f) = setup {
+            f(&mut ui);
+        }
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| ui.draw(f)).unwrap(); // first draw builds the grade
+        terminal.draw(|f| ui.draw(f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{:.0}\" height=\"{:.0}\" viewBox=\"0 0 {:.0} {:.0}\" font-family=\"'JetBrains Mono','DejaVu Sans Mono',Menlo,monospace\" font-size=\"14\">\n<rect width=\"100%\" height=\"100%\" fill=\"{bg0}\" rx=\"8\"/>\n",
+            w as f64 * cw + 24.0, h as f64 * ch + 24.0, w as f64 * cw + 24.0, h as f64 * ch + 24.0
+        );
+        for y in 0..h {
+            let mut x = 0u16;
+            while x < w {
+                let c = &buf[(x, y)];
+                let rev = c.modifier.contains(Modifier::REVERSED);
+                let (mut fg, mut bg) = (hex(c.fg, fg0), hex(c.bg, bg0));
+                if rev {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                let bold = c.modifier.contains(Modifier::BOLD);
+                // A run of cells with the same style.
+                let mut text = String::new();
+                let start = x;
+                while x < w {
+                    let d = &buf[(x, y)];
+                    if d.fg != c.fg || d.bg != c.bg || d.modifier != c.modifier {
+                        break;
+                    }
+                    text.push_str(d.symbol());
+                    x += 1;
+                }
+                let (px, py) = (12.0 + start as f64 * cw, 12.0 + y as f64 * ch);
+                let width = (x - start) as f64 * cw;
+                if bg != bg0 {
+                    svg.push_str(&format!("<rect x=\"{px:.1}\" y=\"{py:.1}\" width=\"{width:.1}\" height=\"{ch}\" fill=\"{bg}\"/>"));
+                }
+                if !text.trim().is_empty() {
+                    svg.push_str(&format!(
+                        "<text x=\"{px:.1}\" y=\"{:.1}\" fill=\"{fg}\"{} xml:space=\"preserve\" textLength=\"{width:.1}\" lengthAdjust=\"spacingAndGlyphs\">{}</text>",
+                        py + 13.5,
+                        if bold { " font-weight=\"bold\"" } else { "" },
+                        esc(&text)
+                    ));
+                }
+            }
+            svg.push('\n');
+        }
+        svg.push_str("</svg>\n");
+        std::fs::write(dir.join(format!("{name}.svg")), svg).unwrap();
+    }
+}
