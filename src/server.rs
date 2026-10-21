@@ -1520,7 +1520,7 @@ async fn lm_config_get(State(a): State<App>) -> Json<Value> {
     let cfg = a.mgr.cfg();
     Json(json!(crate::config::SETTINGS
         .iter()
-        .map(|(sec, k, help)| json!({"section": sec, "key": k, "value": crate::config::get_setting(&cfg, k), "help": help, "reload": crate::config::needs_reload(k)}))
+        .map(|s| json!({"section": s.section, "key": s.key, "value": crate::config::get_setting(&cfg, s.key), "help": s.help, "reload": crate::config::needs_reload(s.key)}))
         .collect::<Vec<_>>()))
 }
 

@@ -55,9 +55,6 @@ impl Daemon {
     pub async fn restart(&self, model: Option<&str>) -> Result<Value> {
         self.post("/lmdeck/restart", model.map(|m| json!({"model": m})).unwrap_or(json!({})), Duration::from_secs(3600)).await
     }
-    pub async fn set_override(&self, model: &str, key: &str, value: &str) -> Result<Value> {
-        self.post("/lmdeck/override", json!({"model": model, "key": key, "value": value}), Duration::from_secs(5)).await
-    }
     pub async fn clear_downloads(&self) -> Result<()> {
         self.http.delete(format!("{}/lmdeck/downloads", self.base)).send().await?;
         Ok(())

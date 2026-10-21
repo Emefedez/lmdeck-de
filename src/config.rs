@@ -569,73 +569,96 @@ fn is_executable(p: &Path) -> bool {
 // ---------- editable settings (shared by TUI, daemon API and bar panel) ----------
 
 /// (section, key, help). Sections group the TUI Settings tab and the bar panel.
-pub const SETTINGS: &[(&str, &str, &str)] = &[
-    ("Server", "server.host", "Listen address: 127.0.0.1 = this machine, 0.0.0.0 = LAN"),
-    ("Server", "server.port", "Port (11434 = Ollama's, so clients work unchanged)"),
-    ("Server", "server.load_timeout_secs", "Max seconds to load a model"),
-    ("Server", "server.uclamp_boost", "Run backends under uclampset -m 1024 (helps on power-saver)"),
-    ("Memory & residency", "server.keep_alive", "Idle time before unloading: 5m, 1h, 0, -1 (forever)"),
-    ("Memory & residency", "server.max_loaded", "Models resident at once"),
-    ("Memory & residency", "server.mem_check", "Refuse loads that would not fit in RAM (true/false)"),
-    ("Memory & residency", "server.mem_reserve_gib", "RAM kept free for the desktop (GiB)"),
-    ("Coding agents", "server.local_prompt", "Claude Code prompt for local models: lean (drop MCP instructions and Claude model notes) / original"),
-    ("Coding agents", "server.local_tools", "Claude Code tools sent to local models: lean (no MCP, essential tools, short descriptions) / groups (lean + MCP on demand) / core (no MCP) / all"),
-    ("Memory & residency", "server.vm_reserve_gib", "Extra RAM kept free while the muvm VM runs (GiB)"),
-    ("Memory & residency", "server.gpu_heap", "GPU heap per model: auto (raise only when needed, per process) / stock (50% of RAM) / N GiB"),
-    ("Memory & residency", "server.gpu_mem_check", "Refuse GPU loads over the GPU memory budget (turning this off can freeze the machine)"),
-    ("System prompts", "mlx.system_prompt", "System prompt for MLX models, in prompts/mlx.md: Enter opens it in your editor ({model} {backend} {date} expand); per model: p in Models"),
-    ("System prompts", "mlx.system_prompt_mode", "MLX: prepend (before the client's) / replace (instead of it) / fallback (only when the client sends none)"),
-    ("System prompts", "llama.system_prompt", "System prompt for GGUF models, in prompts/llama.md: Enter opens it in your editor; per model: p in Models"),
-    ("System prompts", "llama.system_prompt_mode", "GGUF: prepend / replace / fallback"),
-    ("KV cache · MLX", "mlx.kv_bits", "MLX KV quantization: 0 = f16, 8 or 4 bits (probed; falls back to f16)"),
-    ("KV cache · MLX", "mlx.kv_group_size", "MLX KV quantization group size (32 / 64 / 128)"),
-    ("KV cache · MLX", "mlx.quantized_kv_start", "MLX: quantize KV once the context passes N tokens"),
-    ("KV cache · MLX", "mlx.max_kv_size", "MLX rotating KV window in tokens (0 = unbounded)"),
-    ("KV cache · MLX", "mlx.prompt_cache_size", "MLX prompt caches kept between requests (0 = no reuse)"),
-    ("KV cache · MLX", "mlx.prompt_cache_gib", "Cap on MLX prompt cache memory in GiB (0 = auto: ¼ of the GPU heap)"),
-    ("KV cache · MLX", "mlx.cache_limit_gib", "Cap on MLX's free-buffer cache in GiB (0 = unlimited: long prompts then keep GPU memory until unload)"),
-    ("KV cache · MLX", "mlx.max_context", "Context window advertised to clients for MLX models (tokens)"),
-    ("KV cache · MLX", "mlx.prefill_step_size", "Prompt tokens per prefill step (smaller = less peak memory on long prompts)"),
-    ("KV cache · GGUF", "llama.ctx_size", "GGUF context window (KV is allocated for all of it)"),
-    ("KV cache · GGUF", "llama.cache_type_k", "GGUF K cache type: f16 / q8_0 / q4_0 (q8_0 halves KV memory)"),
-    ("KV cache · GGUF", "llama.cache_type_v", "GGUF V cache type: f16 / q8_0 / q4_0 (needs flash attention)"),
-    ("KV cache · GGUF", "llama.cache_reuse", "GGUF: reuse cached prompt chunks ≥ N tokens (0 = off)"),
-    ("MLX backend", "mlx.command", "Command that starts the MLX server"),
-    ("MLX backend", "mlx.fast_path", "Patch out mlx_lm.server's per-token GPU sync (~2x decode)"),
-    ("MLX backend", "mlx.decode_attention", "Decode attention over long contexts: composed (faster on omarchy-mlx: 4.8 -> 8.5 tok/s at 12k on a 27B) / fused"),
-    ("MLX backend", "mlx.prefix_checkpoints", "Reuse the conversation between turns on hybrid models (agent follow-ups ~99 s -> ~13 s)"),
-    ("MLX backend", "mlx.batching", "Batched generator: only for concurrent requests (slower per stream)"),
-    ("MLX backend", "mlx.extra_args", "Extra mlx_lm.server args"),
-    ("MLX backend", "mlx.env", "Env for the MLX backend, K=V,K=V (e.g. MLX_OMARCHY_GDN_RAW_REPEAT=0)"),
-    ("llama.cpp backend", "llama.server_path", "llama-server binary (empty = lmdeck build, then PATH)"),
-    ("llama.cpp backend", "llama.gpu_layers", "Layers offloaded to the GPU (999 = all)"),
-    ("llama.cpp backend", "llama.auto_offload", "GGUF too big for free memory: put only the layers that fit on the GPU (true/false)"),
-    ("llama.cpp backend", "llama.flash_attn", "Flash attention: on / off / auto"),
-    ("llama.cpp backend", "llama.threads", "CPU threads (0 = auto)"),
-    ("llama.cpp backend", "llama.parallel", "Parallel request slots"),
-    ("llama.cpp backend", "llama.extra_args", "Extra llama-server args"),
-    ("llama.cpp backend", "llama.env", "Env for the llama backend, K=V,K=V"),
-    ("llama.cpp backend", "llama.git_ref", "llama.cpp branch/tag to build"),
-    ("Strata backend", "strata.dir", "Strata install dir (empty = ~/.local/share/lmdeck/strata); install or update: T on the Dashboard"),
-    ("Strata backend", "strata.git_ref", "Branch of the Strata checkout (vulkan-asahi = the Apple GPU port)"),
-    ("Strata backend", "strata.engine", "strata (the real engine) / mock (scripted test engine, no model or GPU: lists strata/mock)"),
-    ("Strata backend", "strata.vk_icd", "Vulkan driver for the engine (ICD json; empty = honeykrisp-strata v3)"),
-    ("Strata backend", "strata.extra_args", "Extra Strata server args"),
-    ("Strata backend", "strata.env", "Env for the Strata server and engine, K=V,K=V"),
-    ("System prompts", "strata.system_prompt", "System prompt for Strata models, in prompts/strata.md: Enter opens it in your editor"),
-    ("System prompts", "strata.system_prompt_mode", "Strata: prepend / replace / fallback"),
-    ("Downloads & storage", "models.hf_cache", "Hugging Face cache dir (empty = default)"),
-    ("Downloads & storage", "models.extra_dirs", "Extra dirs with loose .gguf files (comma separated)"),
-    ("Downloads & storage", "download.connections", "Parallel connections per large file"),
-    ("Downloads & storage", "download.parallel_files", "Files downloaded at once"),
-    ("Downloads & storage", "download.gguf_default_quant", "Quant used when a GGUF pull has no :tag"),
-    ("Downloads & storage", "download.gguf_mmproj", "Also fetch the vision projector (mmproj) for GGUF"),
-    ("Integration", "hooks.on_load", "Shell cmd before the first model loads (e.g. tuned-adm profile asahi-performance)"),
-    ("Integration", "hooks.on_idle", "Shell cmd after the last model unloads"),
-    ("Integration", "vscode.fallback", "VS Code Copilot fallback: auto (local model while Copilot quota is exhausted) / always / off"),
-    ("Integration", "vscode.model", "Model for the VS Code fallback (empty = automatic; must support tool calling)"),
-    ("Integration", "ui.editor", "Editor for prompts and the config (e.g. nvim, code); empty = $VISUAL / $EDITOR / nvim"),
-    ("Integration", "usage.omarchy_record", "Show lmdeck token usage in the Omarchy agents bar panel"),
+/// How a setting is edited in the TUI.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Text,
+    Number,
+    Bool,
+    Choice(&'static [&'static str]),
+    /// A GiB slider (←/→ in steps of 0.5).
+    Gib,
+    /// A prompt file, opened in the editor.
+    Prompt,
+}
+
+pub struct Setting {
+    pub section: &'static str,
+    pub key: &'static str,
+    pub kind: Kind,
+    pub help: &'static str,
+}
+
+const MODE: Kind = Kind::Choice(&["prepend", "replace", "fallback"]);
+
+/// Every setting, in the order the TUI shows them.
+pub const SETTINGS: &[Setting] = &[
+    Setting { section: "Server", key: "server.host", kind: Kind::Text, help: "Listen address: 127.0.0.1 = this machine, 0.0.0.0 = LAN" },
+    Setting { section: "Server", key: "server.port", kind: Kind::Number, help: "Port (11434 = Ollama's, so clients work unchanged)" },
+    Setting { section: "Server", key: "server.keep_alive", kind: Kind::Text, help: "Idle time before unloading: 5m, 1h, 0, -1 (forever)" },
+    Setting { section: "Server", key: "server.max_loaded", kind: Kind::Number, help: "Models resident at once" },
+    Setting { section: "Server", key: "server.load_timeout_secs", kind: Kind::Number, help: "Max seconds to load a model" },
+    Setting { section: "Server", key: "server.uclamp_boost", kind: Kind::Bool, help: "Run backends under uclampset -m 1024 (helps on power-saver)" },
+    Setting { section: "Memory", key: "server.mem_check", kind: Kind::Bool, help: "Refuse loads that would not fit in RAM" },
+    Setting { section: "Memory", key: "server.gpu_mem_check", kind: Kind::Bool, help: "Refuse GPU loads over the GPU memory budget (turning this off can freeze the machine)" },
+    Setting { section: "Memory", key: "server.mem_reserve_gib", kind: Kind::Gib, help: "RAM kept free for the desktop (GiB)" },
+    Setting { section: "Memory", key: "server.vm_reserve_gib", kind: Kind::Gib, help: "Extra RAM kept free while the muvm VM runs (GiB)" },
+    Setting { section: "Memory", key: "server.gpu_heap", kind: Kind::Gib, help: "GPU heap per model: auto (raise only when needed, per process) / stock (50% of RAM) / N GiB" },
+    Setting { section: "MLX", key: "mlx.command", kind: Kind::Text, help: "Command that starts the MLX server (choose the runtime in Backends)" },
+    Setting { section: "MLX", key: "mlx.max_context", kind: Kind::Number, help: "Context window advertised to clients for MLX models (tokens)" },
+    Setting { section: "MLX", key: "mlx.fast_path", kind: Kind::Bool, help: "Patch out mlx_lm.server's per-token GPU sync (~2x decode)" },
+    Setting { section: "MLX", key: "mlx.decode_attention", kind: Kind::Choice(&["composed", "fused"]), help: "Decode attention over long contexts: composed (faster on omarchy-mlx: 4.8 -> 8.5 tok/s at 12k on a 27B) / fused" },
+    Setting { section: "MLX", key: "mlx.prefix_checkpoints", kind: Kind::Bool, help: "Reuse the conversation between turns on hybrid models (agent follow-ups ~99 s -> ~13 s)" },
+    Setting { section: "MLX", key: "mlx.batching", kind: Kind::Bool, help: "Batched generator: only for concurrent requests (slower per stream)" },
+    Setting { section: "MLX", key: "mlx.prefill_step_size", kind: Kind::Number, help: "Prompt tokens per prefill step (smaller = less peak memory on long prompts)" },
+    Setting { section: "MLX", key: "mlx.kv_bits", kind: Kind::Choice(&["0", "8", "4"]), help: "MLX KV quantization: 0 = f16, 8 or 4 bits (probed; falls back to f16)" },
+    Setting { section: "MLX", key: "mlx.kv_group_size", kind: Kind::Choice(&["32", "64", "128"]), help: "MLX KV quantization group size (32 / 64 / 128)" },
+    Setting { section: "MLX", key: "mlx.quantized_kv_start", kind: Kind::Number, help: "MLX: quantize KV once the context passes N tokens" },
+    Setting { section: "MLX", key: "mlx.max_kv_size", kind: Kind::Number, help: "MLX rotating KV window in tokens (0 = unbounded)" },
+    Setting { section: "MLX", key: "mlx.prompt_cache_size", kind: Kind::Number, help: "MLX prompt caches kept between requests (0 = no reuse)" },
+    Setting { section: "MLX", key: "mlx.prompt_cache_gib", kind: Kind::Number, help: "Cap on MLX prompt cache memory in GiB (0 = auto: ¼ of the GPU heap)" },
+    Setting { section: "MLX", key: "mlx.cache_limit_gib", kind: Kind::Number, help: "Cap on MLX's free-buffer cache in GiB (0 = unlimited: long prompts then keep GPU memory until unload)" },
+    Setting { section: "MLX", key: "mlx.extra_args", kind: Kind::Text, help: "Extra mlx_lm.server args" },
+    Setting { section: "MLX", key: "mlx.env", kind: Kind::Text, help: "Env for the MLX backend, K=V,K=V (e.g. MLX_OMARCHY_GDN_RAW_REPEAT=0)" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.server_path", kind: Kind::Text, help: "llama-server binary (empty = lmdeck build, then PATH)" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.git_ref", kind: Kind::Text, help: "llama.cpp branch or tag that Backends builds" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.ctx_size", kind: Kind::Number, help: "GGUF context window (KV is allocated for all of it)" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.gpu_layers", kind: Kind::Number, help: "Layers offloaded to the GPU (999 = all)" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.auto_offload", kind: Kind::Bool, help: "GGUF too big for free memory: put only the layers that fit on the GPU" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.flash_attn", kind: Kind::Choice(&["auto", "on", "off"]), help: "Flash attention: on / off / auto" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.cache_type_k", kind: Kind::Choice(&["f16", "q8_0", "q4_0"]), help: "GGUF K cache type: f16 / q8_0 / q4_0 (q8_0 halves KV memory)" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.cache_type_v", kind: Kind::Choice(&["f16", "q8_0", "q4_0"]), help: "GGUF V cache type: f16 / q8_0 / q4_0 (needs flash attention)" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.cache_reuse", kind: Kind::Number, help: "GGUF: reuse cached prompt chunks ≥ N tokens (0 = off)" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.threads", kind: Kind::Number, help: "CPU threads (0 = auto)" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.parallel", kind: Kind::Number, help: "Parallel request slots" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.extra_args", kind: Kind::Text, help: "Extra llama-server args" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.env", kind: Kind::Text, help: "Env for the llama backend, K=V,K=V" },
+    Setting { section: "Strata", key: "strata.dir", kind: Kind::Text, help: "Strata install dir (empty = ~/.local/share/lmdeck/strata); install and update in Backends" },
+    Setting { section: "Strata", key: "strata.git_ref", kind: Kind::Text, help: "Branch of the Strata checkout (vulkan-asahi = the Apple GPU port)" },
+    Setting { section: "Strata", key: "strata.engine", kind: Kind::Choice(&["strata", "mock"]), help: "strata (the real engine) / mock (scripted test engine, no model or GPU: lists strata/mock)" },
+    Setting { section: "Strata", key: "strata.vk_icd", kind: Kind::Text, help: "Vulkan driver for the engine (ICD json; empty = honeykrisp-strata v3)" },
+    Setting { section: "Strata", key: "strata.extra_args", kind: Kind::Text, help: "Extra Strata server args" },
+    Setting { section: "Strata", key: "strata.env", kind: Kind::Text, help: "Env for the Strata server and engine, K=V,K=V" },
+    Setting { section: "System prompts", key: "mlx.system_prompt", kind: Kind::Prompt, help: "System prompt for MLX models (prompts/mlx.md, opens in your editor; {model} {backend} {date} expand). Per model: e in Models" },
+    Setting { section: "System prompts", key: "mlx.system_prompt_mode", kind: MODE, help: "MLX: prepend (before the client's) / replace (instead of it) / fallback (only when the client sends none)" },
+    Setting { section: "System prompts", key: "llama.system_prompt", kind: Kind::Prompt, help: "System prompt for GGUF models (prompts/llama.md, opens in your editor). Per model: e in Models" },
+    Setting { section: "System prompts", key: "llama.system_prompt_mode", kind: MODE, help: "GGUF: prepend / replace / fallback" },
+    Setting { section: "System prompts", key: "strata.system_prompt", kind: Kind::Prompt, help: "System prompt for Strata models (prompts/strata.md, opens in your editor)" },
+    Setting { section: "System prompts", key: "strata.system_prompt_mode", kind: MODE, help: "Strata: prepend / replace / fallback" },
+    Setting { section: "Coding agents", key: "server.local_prompt", kind: Kind::Choice(&["lean", "original"]), help: "Claude Code prompt for local models: lean (drop MCP instructions and Claude model notes) / original" },
+    Setting { section: "Coding agents", key: "server.local_tools", kind: Kind::Choice(&["lean", "groups", "core", "all"]), help: "Claude Code tools sent to local models: lean (no MCP, essential tools, short descriptions) / groups (lean + MCP on demand) / core (no MCP) / all" },
+    Setting { section: "Downloads", key: "models.hf_cache", kind: Kind::Text, help: "Hugging Face cache dir (empty = default)" },
+    Setting { section: "Downloads", key: "models.extra_dirs", kind: Kind::Text, help: "Extra dirs with loose .gguf files (comma separated)" },
+    Setting { section: "Downloads", key: "download.connections", kind: Kind::Number, help: "Parallel connections per large file" },
+    Setting { section: "Downloads", key: "download.parallel_files", kind: Kind::Number, help: "Files downloaded at once" },
+    Setting { section: "Downloads", key: "download.gguf_default_quant", kind: Kind::Text, help: "Quant used when a GGUF pull has no :tag" },
+    Setting { section: "Downloads", key: "download.gguf_mmproj", kind: Kind::Bool, help: "Also fetch the vision projector (mmproj) for GGUF" },
+    Setting { section: "Integration", key: "ui.editor", kind: Kind::Text, help: "Editor for prompts and the config (e.g. nvim, code); empty = $VISUAL / $EDITOR / nvim" },
+    Setting { section: "Integration", key: "hooks.on_load", kind: Kind::Text, help: "Shell cmd before the first model loads (e.g. tuned-adm profile asahi-performance)" },
+    Setting { section: "Integration", key: "hooks.on_idle", kind: Kind::Text, help: "Shell cmd after the last model unloads" },
+    Setting { section: "Integration", key: "vscode.fallback", kind: Kind::Choice(&["auto", "always", "off"]), help: "VS Code Copilot fallback: auto (local model while Copilot quota is exhausted) / always / off" },
+    Setting { section: "Integration", key: "vscode.model", kind: Kind::Text, help: "Model for the VS Code fallback (empty = automatic; must support tool calling)" },
+    Setting { section: "Integration", key: "usage.omarchy_record", kind: Kind::Bool, help: "Show lmdeck token usage in the Omarchy agents bar panel" },
 ];
 
 pub fn kv_join(m: &std::collections::BTreeMap<String, String>) -> String {
@@ -857,6 +880,17 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
 
 
 /// Settings whose change only takes effect when a backend is (re)started.
+/// When a change to `key` takes effect.
+pub fn applies(key: &str) -> &'static str {
+    if matches!(key, "server.host" | "server.port") {
+        "after a server restart"
+    } else if needs_reload(key) {
+        "on the next load (loaded models are marked for reload)"
+    } else {
+        "right away"
+    }
+}
+
 pub fn needs_reload(key: &str) -> bool {
     if key.ends_with(".system_prompt") || key.ends_with(".system_prompt_mode") || key.starts_with("ui.") {
         return false; // applied per request
@@ -886,5 +920,25 @@ mod tests {
         assert!(out.contains("ctx_size = 8192") && out.contains("# keep this"), "{out}");
         let back: super::Config = toml::from_str(&out).unwrap();
         assert_eq!(back.overrides["org/m"].ctx_size, Some(8192));
+    }
+}
+
+#[cfg(test)]
+mod real_file {
+    /// `cargo test edit_real_config -- --ignored --nocapture`: the diff an edit would make to
+    /// your config.toml (nothing is written).
+    #[test]
+    #[ignore]
+    fn edit_real_config() {
+        let text = std::fs::read_to_string(super::config_path()).unwrap();
+        let (out, _) = super::edit_text(&text, |c| { c.server.mem_reserve_gib += 0.5; Ok(()) }).unwrap();
+        let out = out.unwrap();
+        let (a, b): (Vec<_>, Vec<_>) = (text.lines().collect(), out.lines().collect());
+        println!("lines {} -> {}", a.len(), b.len());
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            if x != y {
+                println!("{i}: - {x}\n{i}: + {y}");
+            }
+        }
     }
 }

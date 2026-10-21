@@ -351,6 +351,16 @@ pub struct Versions {
     pub llama: Option<String>,
     pub llama_path: Option<String>,
     pub ane: bool,
+    /// The Strata checkout: "<sha> <date> <subject>", or None when not installed.
+    #[serde(default)]
+    pub strata_commit: Option<String>,
+    /// Files changed in the Strata checkout (an update refuses to run over them).
+    #[serde(default)]
+    pub strata_dirty: Vec<String>,
+    #[serde(default)]
+    pub strata_engine: bool,
+    #[serde(default)]
+    pub strata_driver: bool,
 }
 
 fn cmd_out(prog: &str, args: &[&str]) -> Option<String> {
@@ -431,6 +441,14 @@ pub fn versions_local(cfg: &Config) -> Versions {
         llama,
         llama_path: llama_path.map(|p| p.display().to_string()),
         ane: Path::new("/dev/accel/accel0").exists(),
+        strata_commit: cfg.strata.dir().join(".git").exists().then(|| {
+            cmd_out("git", &["-C", &cfg.strata.dir().display().to_string(), "log", "-1", "--format=%h %cs %s"]).unwrap_or_default()
+        }),
+        strata_dirty: cmd_out("git", &["-C", &cfg.strata.dir().display().to_string(), "status", "--porcelain", "--untracked-files=no"])
+            .map(|s| s.lines().map(|l| l.get(3..).unwrap_or(l).to_string()).collect())
+            .unwrap_or_default(),
+        strata_engine: cfg.strata.dir().join("build-vulkan/strata").exists(),
+        strata_driver: cfg.strata.vk_icd().exists(),
     }
 }
 
@@ -804,6 +822,10 @@ pub fn install_service() -> anyhow::Result<()> {
         anyhow::bail!("systemctl enable failed: {}", String::from_utf8_lossy(&o.stderr));
     }
     Ok(())
+}
+
+pub fn desktop_entry_installed() -> bool {
+    home().join(".local/share/applications/lmdeck.desktop").exists()
 }
 
 pub fn desktop_entry() -> anyhow::Result<PathBuf> {

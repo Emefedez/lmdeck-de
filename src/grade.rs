@@ -52,8 +52,6 @@ pub struct Row {
     /// "fits" | "tight" | "too big"
     pub fit: &'static str,
     pub score: f64,
-    /// 1 / active bytes per token: ranks speed when nothing is measured to calibrate tok/s.
-    speed_hint: Option<f64>,
 }
 
 impl Row {
@@ -117,7 +115,6 @@ fn row(cfg: &Config, m: &LocalModel, perf: Option<&Perf>, user: Option<f64>) -> 
         watts: perf.filter(|p| p.watts > 0.0).map(|p| (p.watts, Src::Measured)),
         fit: fit(cfg, m),
         score: 0.0,
-        speed_hint: None,
     }
 }
 
@@ -143,9 +140,14 @@ fn quant_factor(bits: f64) -> f64 {
     a.1 + (b.1 - a.1) * (bits - a.0) / (b.0 - a.0)
 }
 
-/// Speed and power for models lmdeck has not measured yet, from the ones it has:
-/// - decode is bound by the weights read per token, so tok/s scales with 1 / active bytes
-///   (calibrated as the median of tok/s x active bytes over measured MLX/GGUF models);
+/// Decode on this GPU is bound by the weights read per token plus a fixed cost per token:
+/// tok/s = 1 / (active bytes / bandwidth + overhead). The defaults fit the M1 Max runs in
+/// docs/RESULTS.md (0.6B 154, 4B 52, 27B 11-13 tok/s); measured models replace the bandwidth.
+const DEFAULT_GBS: f64 = 190.0;
+const OVERHEAD_S: f64 = 0.0047;
+
+/// Speed and power for models lmdeck has not measured yet:
+/// - tok/s from the model above, its bandwidth calibrated on the measured MLX/GGUF models;
 /// - system power while generating is about the same for every GPU-bound model, so the median
 ///   measured watts stand in.
 ///
@@ -153,24 +155,24 @@ fn quant_factor(bits: f64) -> f64 {
 fn fill_estimates(rows: &mut [Row], models: &[LocalModel]) {
     let active_bytes = |r: &Row, m: &LocalModel| -> Option<f64> {
         let (t, a) = (r.total_b?, r.active_b?);
-        (t > 0.0).then(|| m.size as f64 * (a / t).min(1.0))
+        (t > 0.0 && m.size > 0).then(|| m.size as f64 * (a / t).min(1.0))
     };
     let mut bw: Vec<f64> = rows
         .iter()
         .zip(models)
         .filter(|(r, _)| r.format != Format::Strata)
-        .filter_map(|(r, m)| Some(r.tps.filter(|t| t.1 == Src::Measured)?.0 * active_bytes(r, m)?))
+        .filter_map(|(r, m)| {
+            let per_token = 1.0 / r.tps.filter(|t| t.1 == Src::Measured)?.0 - OVERHEAD_S;
+            (per_token > 0.0).then(|| active_bytes(r, m).map(|b| b / per_token / 1e9)).flatten()
+        })
         .collect();
     let mut watts: Vec<f64> = rows.iter().filter_map(|r| r.watts.map(|w| w.0)).collect();
-    let bw = median(&mut bw);
+    let gbs = median(&mut bw).unwrap_or(DEFAULT_GBS);
     let watts = median(&mut watts);
     for (r, m) in rows.iter_mut().zip(models) {
-        if r.format != Format::Strata {
-            r.speed_hint = active_bytes(r, m).filter(|b| *b > 0.0).map(|b| 1.0 / b);
-        }
         if r.tps.is_none() && r.format != Format::Strata {
-            if let (Some(bw), Some(b)) = (bw, active_bytes(r, m)) {
-                r.tps = Some((bw / b, Src::Estimate));
+            if let Some(b) = active_bytes(r, m) {
+                r.tps = Some((1.0 / (b / (gbs * 1e9) + OVERHEAD_S), Src::Estimate));
             }
         }
         if r.watts.is_none() && r.tps.is_some() {
@@ -187,20 +189,13 @@ fn median(v: &mut [f64]) -> Option<f64> {
     Some(v[v.len() / 2])
 }
 
-/// Score = weighted geometric mean of each metric relative to the best row. A missing metric
-/// counts as half the best; rows that do not fit now go last.
+/// Score = weighted geometric mean of each metric relative to the best row. Speed counts with
+/// diminishing returns (ln(1 + tok/s / 5): past reading speed, more matters less). A missing
+/// metric counts as half the best; rows that do not fit now go last.
 fn rank(rows: &mut [Row], goal: usize) {
     let w = GOALS[goal].1;
     let best = |f: &dyn Fn(&Row) -> Option<f64>| rows.iter().filter_map(f).fold(0.0f64, f64::max);
-    // tok/s compare once an MLX/GGUF model is measured (the others are then estimated from it).
-    // Before that, MLX/GGUF speed ranks by the weights read per token, and Strata's measured
-    // tok/s has nothing on the same scale to compare with.
-    let calibrated = rows.iter().any(|r| r.format != Format::Strata && r.tps.is_some());
-    let speed = move |r: &Row| match (calibrated, r.format) {
-        (true, _) => r.tps.map(|t| t.0),
-        (false, Format::Strata) => None,
-        (false, _) => r.speed_hint,
-    };
+    let speed = |r: &Row| r.tps.map(|t| (1.0 + t.0 / 5.0).ln());
     let metrics: [&dyn Fn(&Row) -> Option<f64>; 3] = [
         &|r| r.intelligence.map(|i| i.0),
         &speed,
@@ -405,7 +400,6 @@ mod tests {
             watts: Some((30.0, Src::Measured)),
             fit,
             score: 0.0,
-            speed_hint: None,
         };
         let mut rows = vec![r("small", 20.0, 100.0, "fits"), r("big", 50.0, 10.0, "fits"), r("huge", 60.0, 5.0, "too big")];
         rank(&mut rows, 1); // smartest
