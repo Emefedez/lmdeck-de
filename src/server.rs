@@ -1308,6 +1308,165 @@ async fn groups_rounds(
     Ok(msg)
 }
 
+/// `groups` mode on an OpenAI chat request (VS Code Copilot): rounds against the backend, text
+/// streamed to the client as it comes, `tool_group` answered here, `call_tool` handed to the
+/// client as the real MCP tool call.
+async fn openai_groups(
+    a: App,
+    guard: InFlight,
+    body: Value,
+    groups: crate::toolgroups::Groups,
+    names: std::collections::HashMap<String, String>,
+    client_model: String,
+    stream: bool,
+) -> Resp {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let run = openai_rounds(a, guard, body, groups, names, client_model, stream.then(|| tx.clone()));
+    if !stream {
+        drop(tx);
+        return match run.await {
+            Ok(v) => Json(v).into_response(),
+            Err(m) => oai_err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", m),
+        };
+    }
+    tokio::spawn(async move {
+        if let Err(m) = run.await {
+            let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", json!({"error": {"message": m, "type": "server_error"}}))))).await;
+        }
+        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+    });
+    let mut r = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+    r.headers_mut().insert("content-type", HeaderValue::from_static("text/event-stream"));
+    r.headers_mut().insert("cache-control", HeaderValue::from_static("no-cache"));
+    r
+}
+
+async fn openai_rounds(
+    a: App,
+    guard: InFlight,
+    mut body: Value,
+    groups: crate::toolgroups::Groups,
+    names: std::collections::HashMap<String, String>,
+    model: String,
+    tx: Option<mpsc::Sender<Result<Bytes, std::io::Error>>>,
+) -> Result<Value, String> {
+    let t0 = Instant::now();
+    let id = format!("chatcmpl-lmdeck-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let chunk = |delta: Value, finish: Option<&str>| format!("data: {}\n\n", json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}));
+    let send = |s: String| {
+        let tx = tx.clone();
+        async move {
+            if let Some(tx) = tx {
+                let _ = tx.send(Ok(Bytes::from(s))).await;
+            }
+        }
+    };
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({"include_usage": true});
+    send(chunk(json!({"role": "assistant", "content": ""}), None)).await;
+    let (mut tin, mut tout) = (0u64, 0u64);
+    let mut first: Option<Instant> = None;
+    let mut text = String::new();
+    let mut final_calls: Vec<Value> = Vec::new();
+    for round in 0..5 {
+        let resp = a.mgr.http.post(format!("{}/v1/chat/completions", guard.0.base())).json(&body).send().await.map_err(|e| format!("backend unreachable: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("backend: {}", resp.text().await.unwrap_or_default()));
+        }
+        let mut round_text = String::new();
+        // index -> (id, name, arguments)
+        let mut calls: std::collections::BTreeMap<u64, (String, String, String)> = Default::default();
+        let mut s = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(Ok(bytes)) = s.next().await {
+            buf.extend_from_slice(&bytes);
+            while let Some(pos) = buf.iter().position(|&c| c == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line);
+                let Some(v) = line.trim().strip_prefix("data:").map(str::trim).filter(|d| *d != "[DONE]").and_then(|d| serde_json::from_str::<Value>(d).ok()) else { continue };
+                if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+                    tin = tin.max(u["prompt_tokens"].as_u64().unwrap_or(0));
+                    tout += u["completion_tokens"].as_u64().unwrap_or(0);
+                }
+                let d = &v["choices"][0]["delta"];
+                for key in ["reasoning_content", "content"] {
+                    if let Some(c) = d[key].as_str().filter(|c| !c.is_empty()) {
+                        first.get_or_insert_with(Instant::now);
+                        if key == "content" {
+                            round_text.push_str(c);
+                        }
+                        send(chunk(json!({key: c}), None)).await;
+                    }
+                }
+                for tc in d["tool_calls"].as_array().cloned().unwrap_or_default() {
+                    let e = calls.entry(tc["index"].as_u64().unwrap_or(0)).or_default();
+                    if let Some(i) = tc["id"].as_str() {
+                        e.0 = i.to_string();
+                    }
+                    if let Some(n) = tc["function"]["name"].as_str() {
+                        e.1.push_str(n);
+                    }
+                    if let Some(x) = tc["function"]["arguments"].as_str() {
+                        e.2.push_str(x);
+                    }
+                }
+            }
+        }
+        text.push_str(&round_text);
+        let calls: Vec<(String, String, String)> = calls.into_values().filter(|c| !c.1.is_empty()).collect();
+        let asks: Vec<(String, String)> = calls.iter().filter(|c| c.1 == "tool_group").map(|c| {
+            let g = serde_json::from_str::<Value>(&c.2).ok().and_then(|v| v["group"].as_str().map(String::from)).unwrap_or_default();
+            (c.0.clone(), g)
+        }).collect();
+        if !asks.is_empty() && round < 4 {
+            let tool_calls: Vec<Value> = asks.iter().map(|(id, g)| json!({"id": id, "type": "function", "function": {"name": "tool_group", "arguments": json!({"group": g}).to_string()}})).collect();
+            let msgs = body["messages"].as_array_mut().ok_or("no messages")?;
+            msgs.push(json!({"role": "assistant", "content": round_text, "tool_calls": tool_calls}));
+            for (id, g) in &asks {
+                msgs.push(json!({"role": "tool", "tool_call_id": id, "content": groups.segment(g)}));
+            }
+            sys::log(&format!("VS Code {}: tool_group {}", guard.0.name, asks.iter().map(|a| a.1.as_str()).collect::<Vec<_>>().join(", ")));
+            continue;
+        }
+        // The real tool calls for VS Code: call_tool(name, arguments) becomes the MCP tool itself.
+        for (i, (id, name, args)) in calls.into_iter().filter(|c| c.1 != "tool_group").enumerate() {
+            let (name, args) = if name == "call_tool" {
+                let v = serde_json::from_str::<Value>(&args).unwrap_or(json!({}));
+                let real = v["name"].as_str().unwrap_or("").to_string();
+                let real = names.get(&real).cloned().unwrap_or_else(|| {
+                    real.strip_prefix("mcp__").and_then(|r| r.split_once("__")).map(|(s, t)| format!("mcp_{s}_{t}")).unwrap_or(real.clone())
+                });
+                let a = v.get("arguments").filter(|a| a.is_object()).cloned().unwrap_or(json!({}));
+                (real, a.to_string())
+            } else {
+                (name, args)
+            };
+            final_calls.push(json!({"index": i, "id": if id.is_empty() { format!("call_{i}") } else { id }, "type": "function", "function": {"name": name, "arguments": args}}));
+        }
+        break;
+    }
+    if !final_calls.is_empty() {
+        send(chunk(json!({"tool_calls": final_calls}), None)).await;
+    }
+    let finish = if final_calls.is_empty() { "stop" } else { "tool_calls" };
+    send(chunk(json!({}), Some(finish))).await;
+    let usage = json!({"prompt_tokens": tin, "completion_tokens": tout, "total_tokens": tin + tout});
+    send(format!("data: {}\n\n", json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [], "usage": usage}))).await;
+    let secs = t0.elapsed().as_secs_f64();
+    sys::log(&format!("VS Code {}: {tin} in / {tout} out, finish={finish}, {secs:.1}s [groups]", guard.0.name));
+    let gen_secs = first.map(|f| f.elapsed().as_secs_f64()).unwrap_or(secs);
+    let ttft = first.map(|f| f.duration_since(t0).as_secs_f64()).unwrap_or(0.0);
+    USAGE.record(&guard.0.name, tin, tout, ttft, gen_secs, ttft);
+    drop(guard);
+    let calls: Vec<Value> = final_calls.iter().map(|c| json!({"id": c["id"], "type": "function", "function": c["function"]})).collect();
+    let mut message = json!({"role": "assistant", "content": text});
+    if !calls.is_empty() {
+        message["tool_calls"] = json!(calls);
+    }
+    Ok(json!({"id": id, "object": "chat.completion", "created": created, "model": model, "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": usage}))
+}
+
 // ---------- OpenAI ----------
 
 async fn v1_models(State(a): State<App>) -> Json<Value> {
@@ -1357,6 +1516,29 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
         if ua.contains("copilot") || ua.contains("vscode") {
             let est = estimate_tokens(&v);
             let mode = crate::anthropic::ToolMode::parse(&a.mgr.cfg().server.local_tools);
+            let has_mcp = v["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["function"]["name"].as_str().is_some_and(|n| n.starts_with("mcp_"))));
+            if mode == crate::anthropic::ToolMode::Groups && has_mcp {
+                // MCP tools on demand: tool_group (answered here) and call_tool (rewritten into
+                // the real MCP tool for VS Code), as for Claude Code.
+                let tools = v["tools"].as_array().cloned().unwrap_or_default();
+                let (groups, names, rest) = crate::toolgroups::from_openai(&tools);
+                v["tools"] = json!(rest);
+                let (n0, _) = (tools.len(), 0);
+                crate::anthropic::trim_openai_tools(&mut v, crate::anthropic::ToolMode::Lean);
+                if let Some(t) = v["tools"].as_array_mut() {
+                    t.extend(crate::toolgroups::meta_tools_openai(&groups));
+                }
+                sys::log(&format!("{}: VS Code request ~{est} -> ~{} tokens, tools {n0} -> {} (groups)", guard.0.name, estimate_tokens(&v), v["tools"].as_array().map(|t| t.len()).unwrap_or(0)));
+                crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut v);
+                if let Err((est, limit)) = context_check(&a.mgr.cfg(), &guard.0.model, &mut v) {
+                    sys::log(&format!("{}: refused a ~{est}-token prompt (window {limit})", guard.0.name));
+                    return (StatusCode::BAD_REQUEST, Json(json!({"error": {
+                        "message": format!("This model's maximum context length is {limit} tokens, but the request is about {est} tokens. {}", too_long_hint(&guard.0.name)),
+                        "type": "invalid_request_error", "param": "messages", "code": "context_length_exceeded"}}))).into_response();
+                }
+                let stream = v["stream"].as_bool().unwrap_or(false);
+                return openai_groups(a, guard, v, groups, names, name, stream).await;
+            }
             let (n0, n1) = crate::anthropic::trim_openai_tools(&mut v, mode);
             sys::log(&format!("{}: VS Code request ~{est} -> ~{} tokens, tools {n0} -> {n1} (server.local_tools = {})", guard.0.name, estimate_tokens(&v), a.mgr.cfg().server.local_tools));
         }

@@ -90,8 +90,10 @@ Every `/v1/messages` request logs the breakdown (system, messages, tools before 
 ### VS Code Copilot
 
 Copilot's chat requests (`/v1/chat/completions`, recognised by their user agent) get the same `server.local_tools`
-treatment: MCP tools (`mcp_<server>_<tool>`) are dropped unless the mode is `all`, and in `lean`/`groups` each tool
-description is cut to its first paragraph and each parameter doc to one line. The server log records the request's
+treatment: in `lean` and `core` MCP tools (`mcp_<server>_<tool>`) are dropped; in `groups` they are replaced by
+`tool_group` (answered by lmdeck from `~/.config/lmdeck/tool-groups/`) and `call_tool` (handed to VS Code as the real
+MCP tool call), with text streamed as it comes and only tool calls held to the end of the round. In `lean`/`groups`
+each tool description is cut to its first paragraph and each parameter doc to one line. The server log records the request's
 size before and after.
 
 ## Context guard

@@ -167,6 +167,34 @@ impl Groups {
     }
 }
 
+/// VS Code's tools (OpenAI form, MCP ones named `mcp_<server>_<tool>`): the MCP tools as groups,
+/// a map from the groups' names (`mcp__<server>__<tool>`) back to VS Code's, and the other tools.
+pub fn from_openai(tools: &[Value]) -> (Groups, std::collections::HashMap<String, String>, Vec<Value>) {
+    let mut mcp = Vec::new();
+    let mut names = std::collections::HashMap::new();
+    let mut rest = Vec::new();
+    for t in tools {
+        let name = t["function"]["name"].as_str().unwrap_or("");
+        match name.strip_prefix("mcp_").and_then(|r| r.split_once('_')) {
+            Some((server, tool)) if !server.is_empty() && !tool.is_empty() => {
+                let g = format!("mcp__{server}__{tool}");
+                mcp.push(json!({"name": g, "description": t["function"]["description"], "input_schema": t["function"]["parameters"]}));
+                names.insert(g, name.to_string());
+            }
+            _ => rest.push(t.clone()),
+        }
+    }
+    (Groups::sync(&mcp), names, rest)
+}
+
+/// The meta tools in OpenAI form.
+pub fn meta_tools_openai(g: &Groups) -> Vec<Value> {
+    g.meta_tools()
+        .into_iter()
+        .map(|t| json!({"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}))
+        .collect()
+}
+
 fn fxhash(s: &str) -> u64 {
     s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
@@ -202,6 +230,15 @@ mod tests {
         assert!(seg.contains("mcp__srv__trace_y(path: string): Does a thing"));
         assert!(!seg.contains("inspect_x0"));
         assert!(g.segment("nope").starts_with("No group"));
+    }
+
+    #[test]
+    fn vscode_mcp_tools_become_groups() {
+        let t = |n: &str| json!({"type": "function", "function": {"name": n, "description": "Does a thing.", "parameters": {"type": "object", "properties": {}}}});
+        let (_, names, rest) = from_openai(&[t("read_file"), t("mcp_zz-test-srv_open_binary")]);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(names["mcp__zz-test-srv__open_binary"], "mcp_zz-test-srv_open_binary");
+        let _ = std::fs::remove_file(dir().join("zz-test-srv.md"));
     }
 
     #[test]
