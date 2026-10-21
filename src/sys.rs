@@ -856,7 +856,7 @@ pub fn install_menu() -> anyhow::Result<PathBuf> {
     let launch = if which("omarchy-launch-or-focus-tui").is_some() { "omarchy-launch-or-focus-tui" } else { "omarchy-launch-tui" };
     let block = format!(
         r#"  // lmdeck-menu-start
-  "apps.lmdeck": {{"icon":"󰧑","label":"lmdeck","aliases":["lmdeck","llm","models","mlx","ollama","gguf"],"description":"Local models: MLX on the Apple GPU + GGUF, Ollama/OpenAI-compatible server","action":"{launch} {exe}"}},
+  "apps.lmdeck": {{"icon":"󰧑","label":"lmdeck","aliases":["lmdeck","llm","models","mlx","ollama","gguf","strata"],"description":"Local models on the Apple GPU: MLX, GGUF and Strata; Ollama/OpenAI-compatible server","action":"{launch} {exe}"}},
   "setup.lmdeck-server": {{"icon":"󰒋","label":"Local LLM Server","aliases":["llm-server","lmdeck-server"],"description":"Toggle the lmdeck model server (port 11434)","action":"{exe} service toggle","checked":"systemctl --user is-active --quiet lmdeck"}},
   // lmdeck-menu-end
 "#
