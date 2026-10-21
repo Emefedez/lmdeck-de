@@ -140,5 +140,5 @@ different prompts.
 ## What was not measured
 
 - GGUF through llama.cpp has no benchmark in this project.
-- Power draw per model: lmdeck records it from now on (see the grader), but no table exists yet.
+- Power draw per model: lmdeck can record it (`usage.perf = true`, off by default), but no table exists yet.
 - Any machine other than this M1 Max.

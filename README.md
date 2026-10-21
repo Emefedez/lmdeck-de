@@ -64,9 +64,10 @@ Nothing polls, and no model names are hardcoded:
   [models."mlx-community/Qwen3.8-27B-4bit"]
   intelligence = 34
   ```
-- **Speed**: decode tok/s measured by lmdeck as you use a model. Unmeasured models get an estimate from the
-  weights they read per token, calibrated on the ones you have measured.
-- **Power**: the SMC's total system power, sampled only while a request is being served, which gives J/token.
+- **Speed**: an estimate from the weights each model reads per token. With `usage.perf = true` (off by default,
+  performance first), lmdeck measures decode tok/s as you use a model and calibrates the estimate on it.
+- **Power**: with `usage.perf = true`, the SMC's total system power, sampled only while a request is being served,
+  which gives J/token. That costs one sensor read every 2 s during generation and about 10 KB of memory.
 - **Fit**: the server's planner answers, which is the same check a load runs. Without the server, a rough estimate
   stands in, and it is marked as one.
 

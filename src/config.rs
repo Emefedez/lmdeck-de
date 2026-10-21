@@ -244,11 +244,14 @@ pub struct UiCfg {
 pub struct UsageCfg {
     /// Publish token usage to the Omarchy agents bar panel.
     pub omarchy_record: bool,
+    /// Record each model's decode speed and system power while it generates (the grader's
+    /// measured numbers). Off by default: performance first.
+    pub perf: bool,
 }
 
 impl Default for UsageCfg {
     fn default() -> Self {
-        Self { omarchy_record: true }
+        Self { omarchy_record: true, perf: false }
     }
 }
 
@@ -662,6 +665,7 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "Integration", key: "vscode.fallback", kind: Kind::Choice(&["auto", "always", "off"]), help: "VS Code Copilot fallback: auto (local model while Copilot quota is exhausted) / always / off" },
     Setting { section: "Integration", key: "vscode.model", kind: Kind::Text, help: "Model for the VS Code fallback (empty = automatic; must support tool calling)" },
     Setting { section: "Integration", key: "usage.omarchy_record", kind: Kind::Bool, help: "Show lmdeck token usage in the Omarchy agents bar panel" },
+    Setting { section: "Integration", key: "usage.perf", kind: Kind::Bool, help: "Record each model's speed and system power while it generates, for the grader (off: the grader estimates them). Costs one sensor read every 2 s while a request runs and ~10 KB" },
 ];
 
 pub fn kv_join(m: &std::collections::BTreeMap<String, String>) -> String {
@@ -726,6 +730,7 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "hooks.on_load" => c.hooks.on_load.clone(),
         "hooks.on_idle" => c.hooks.on_idle.clone(),
         "usage.omarchy_record" => c.usage.omarchy_record.to_string(),
+        "usage.perf" => c.usage.perf.to_string(),
         "vscode.fallback" => c.vscode.fallback.clone(),
         "vscode.model" => c.vscode.model.clone(),
         "mlx.max_context" => c.mlx.max_context.to_string(),
@@ -840,6 +845,7 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "hooks.on_load" => c.hooks.on_load = v.into(),
         "hooks.on_idle" => c.hooks.on_idle = v.into(),
         "usage.omarchy_record" => c.usage.omarchy_record = boolean(v)?,
+        "usage.perf" => c.usage.perf = boolean(v)?,
         "vscode.fallback" => {
             if !["auto", "always", "off"].contains(&v) {
                 return Err("use auto, always or off".into());

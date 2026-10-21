@@ -68,7 +68,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             reaper.reap().await;
-            if reaper.busy() {
+            let perf = reaper.cfg().usage.perf;
+            if crate::usage::PERF.swap(perf, std::sync::atomic::Ordering::Relaxed) && !perf {
+                crate::usage::clear_power();
+            }
+            if perf && reaper.busy() {
                 crate::usage::sample_power();
             }
         }

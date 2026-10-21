@@ -36,8 +36,8 @@ safe). Its estimates are conservative but not guarantees, especially for models 
 - The context guard estimates prompt size at ~3.8 characters per token, so it can be off by ~10% either way.
 - Coding agents on local models get trimmed tools and prompts (`server.local_tools`, `server.local_prompt`). That is
   what makes them usable, but they are not the agent's full setup.
-- The grader's intelligence column is a size estimate unless you give it scores. Its speed is an estimate until a
-  model has been used. Power needs the SMC's "Total System Power" sensor (Apple laptops under Asahi) and counts the
+- The grader's intelligence column is a size estimate unless you give it scores. Speed and power are recorded only with `usage.perf = true` (off by
+  default); otherwise speed is an estimate and power is unknown. Power needs the SMC's "Total System Power" sensor (Apple laptops under Asahi) and counts the
   whole machine, display included.
 - The bar panel replaces Omarchy's stock Agents widget by forking its `Panel.qml`. After an Omarchy update, re-run
   `omarchy-plugin/m1-max.agents/sync-from-stock.py`.

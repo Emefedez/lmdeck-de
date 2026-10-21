@@ -153,8 +153,8 @@ models. The grade is computed when you ask, from:
 | Column | Source | Marked |
 |---|---|---|
 | Intel | `~/.config/lmdeck/grades.toml` if it has the model, else an estimate: 100 x (1 - loss) x ln(1 + eff) / ln(1001), with eff = total^0.7 x active^0.3 (parameters in billions, from config.json, the GGUF metadata or the name, e.g. `A3B`) and the quantization loss 1 - q(bits) (q = 1 at 4+ bits, 0.93 at 3, 0.85 at 2, 0.75 at 1.58) scaled by √(30 / eff) between 0.3 and 1, since big models lose less. Only the order is meant to be right: 125B-A6.6B > 27B dense > 35B-A3B > 4B > 0.6B, as public indexes rank the Qwen3.x models of those shapes | `*` yours, `~` estimate |
-| tok/s | measured: a moving average of decode speed over requests that generated 32+ tokens. Otherwise an estimate: 1 / (active bytes / bandwidth + 4.7 ms), with the bandwidth fitted to your measured MLX/GGUF models (190 GB/s until one is measured, which fits the M1 Max runs in RESULTS.md). Strata only gets measured numbers | `~` estimate |
-| W, J/tok | the SMC's Total System Power, sampled every 2 s only while a request is served, averaged over each generation. Unmeasured models get the median of the measured ones | `~` estimate |
+| tok/s | with `usage.perf = true` (off by default), measured: a moving average of decode speed over requests that generated 32+ tokens. Otherwise an estimate: 1 / (active bytes / bandwidth + 4.7 ms), with the bandwidth fitted to your measured MLX/GGUF models (190 GB/s until one is measured, which fits the M1 Max runs in RESULTS.md). Strata only gets measured numbers | `~` estimate |
+| W, J/tok | with `usage.perf = true`, the SMC's Total System Power, sampled every 2 s only while a request is served (one sysfs read; at most 600 samples, ~10 KB), averaged over each generation. Unmeasured models get the median of the measured ones | `~` estimate |
 | Fit | the server's planner (`/lmdeck/plan`, the check a load runs: exact weights, attention cache, GPU heap); a rough estimate only when the server is down | |
 
 Score = the weighted geometric mean of each metric relative to the best model in the list. Speed counts as

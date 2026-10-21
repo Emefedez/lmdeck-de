@@ -265,6 +265,9 @@ async fn async_main(cli: Cli) -> Result<()> {
                     r.joules().map(|j| format!("{j:.1}")).unwrap_or("?".into()), r.fit, r.score);
             }
             println!("~ estimated  * from grades.toml  (blank) measured on this machine{}", if v.rows.iter().any(|r| !r.planned) { "; fit is an estimate (server not running)" } else { "" });
+            if !cfg.usage.perf {
+                println!("speed and power recording is off (usage.perf = false): lmdeck only estimates them");
+            }
             Ok(())
         }
         Some(Cmd::Status) => {

@@ -107,8 +107,12 @@ fn seed_perf(d: &mut UsageData) {
     }
 }
 
+/// `usage.perf`: record speed and power per model. Off by default; the daemon sets it from the
+/// config on every housekeeping tick.
+pub static PERF: AtomicBool = AtomicBool::new(false);
+
 /// Power samples taken while a request is being served (the daemon's 2 s housekeeping tick,
-/// only when busy): (time, watts). Nothing is read while lmdeck is idle.
+/// only when busy and `usage.perf` is on): (time, watts). Nothing is read while lmdeck is idle.
 static POWER: Mutex<std::collections::VecDeque<(std::time::Instant, f64)>> = Mutex::new(std::collections::VecDeque::new());
 
 /// The SMC's "Total System Power" sensor (µW), found once.
@@ -129,6 +133,13 @@ fn power_sensor() -> Option<&'static PathBuf> {
         None
     })
     .as_ref()
+}
+
+/// `usage.perf` turned off: drop the samples.
+pub fn clear_power() {
+    let mut q = POWER.lock().unwrap();
+    q.clear();
+    q.shrink_to_fit();
 }
 
 pub fn sample_power() {
@@ -155,11 +166,7 @@ pub struct Usage {
 }
 
 pub static USAGE: LazyLock<Usage> = LazyLock::new(|| Usage {
-    data: Mutex::new({
-        let mut d: UsageData = std::fs::read(usage_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        seed_perf(&mut d);
-        d
-    }),
+    data: Mutex::new(std::fs::read(usage_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
     dirty: AtomicBool::new(false),
 });
 
@@ -180,7 +187,7 @@ impl Usage {
         let mut d = self.data.lock().unwrap();
         d.days.entry(crate::sys::local_date(0)).or_default().add(prompt, completion);
         d.models.entry(model.to_string()).or_default().add(prompt, completion);
-        if completion >= PERF_MIN_TOKENS && gen_secs > 0.0 {
+        if PERF.load(Ordering::Relaxed) && completion >= PERF_MIN_TOKENS && gen_secs > 0.0 {
             let p = d.perf.entry(model.to_string()).or_default();
             let a = if p.runs == 0 { 1.0 } else { 0.3 };
             let ema = |old: f64, new: f64| if old > 0.0 { old + a * (new - old) } else { new };
@@ -306,5 +313,22 @@ fn write_agents_record(d: &UsageData, cfg: &crate::config::Config) {
     let tmp = p.with_extension("json.tmp");
     if std::fs::write(&tmp, serde_json::to_vec_pretty(&rec).unwrap_or_default()).is_ok() {
         let _ = std::fs::rename(tmp, p);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn perf_is_recorded_only_when_enabled() {
+        let u = Usage { data: Mutex::new(UsageData::default()), dirty: AtomicBool::new(false) };
+        PERF.store(false, Ordering::Relaxed);
+        u.record("org/m", 100, 200, 1.0, 4.0, 1.0);
+        assert!(u.data.lock().unwrap().perf.is_empty(), "off: no perf record");
+        PERF.store(true, Ordering::Relaxed);
+        u.record("org/m", 100, 200, 1.0, 4.0, 1.0);
+        assert_eq!(u.data.lock().unwrap().perf["org/m"].gen_tps, 50.0);
+        PERF.store(false, Ordering::Relaxed);
     }
 }

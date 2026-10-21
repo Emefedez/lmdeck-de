@@ -344,7 +344,11 @@ impl Ui {
             }
         }
         l.push(Line::raw(""));
-        l.push(dim("Intel is estimated from size and bits; grades.toml can give real scores. Speed and power are measured as you use a model."));
+        l.push(dim(if self.cfg.usage.perf {
+            "Intel is estimated from size and bits; grades.toml can give real scores. Speed and power are measured as you use a model."
+        } else {
+            "Intel is estimated from size and bits; grades.toml can give real scores. Speed and power recording is off (Settings → usage.perf), so unmeasured numbers are estimates."
+        }));
         f.render_widget(Paragraph::new(l).wrap(Wrap { trim: false }).block(panel("Details")), area);
     }
 }

@@ -34,7 +34,7 @@ These are untested, so each one comes with the reason to expect it to help.
 
 ## lmdeck
 
-1. **A power table.** lmdeck now records system watts while generating. After some use, `lmdeck grade efficient`
+1. **A power table.** With `usage.perf = true`, lmdeck records system watts while generating. After some use, `lmdeck grade efficient`
    could print J/token per model as a measured table for RESULTS.md.
 2. **GGUF benchmarks.** llama.cpp on Honeykrisp has never been measured here against the same model in MLX.
 3. **Grader scores from model cards.** Some Hugging Face cards carry evaluation results (`model-index`). Reading
