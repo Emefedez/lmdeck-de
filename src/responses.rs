@@ -63,7 +63,7 @@ fn content_value(c: Option<&Value>) -> (String, Vec<Value>) {
 }
 
 /// Convert a Responses request. `prior` = the stored conversation of `previous_response_id`.
-pub fn to_openai(b: &Value, model_id: &str, prior: &[Value], mode: crate::anthropic::ToolMode) -> Result<Converted, String> {
+pub fn to_openai(b: &Value, model_id: &str, prior: &[Value], mode: crate::anthropic::ToolMode, rules: &crate::toolrules::Rules) -> Result<Converted, String> {
     let keep_mcp = mode == crate::anthropic::ToolMode::All;
     // Leading system/developer text (instructions first) becomes one system message: several
     // chat templates refuse a system message anywhere but first.
@@ -177,11 +177,20 @@ pub fn to_openai(b: &Value, model_id: &str, prior: &[Value], mode: crate::anthro
             "parameters": t.get("parameters").filter(|p| !p.is_null()).cloned().unwrap_or(json!({"type": "object", "properties": {}})),
         }})
     };
-    for t in b.get("tools").and_then(|t| t.as_array()).cloned().unwrap_or_default() {
-        let tname = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        let is_mcp = t.get("type").and_then(|x| x.as_str()) == Some("namespace") || tname.starts_with("mcp__");
-        if is_mcp && !keep_mcp {
-            dropped_tools.push(tname.to_string());
+    for mut t in b.get("tools").and_then(|t| t.as_array()).cloned().unwrap_or_default() {
+        let tname = t.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+        let is_ns = t.get("type").and_then(|x| x.as_str()) == Some("namespace");
+        if !keep_mcp && is_ns {
+            // Only the functions in server.tool_allow survive a namespace.
+            if let Some(inner) = t.get_mut("tools").and_then(|x| x.as_array_mut()) {
+                inner.retain(|i| rules.allows(&[&crate::toolrules::codex_canonical(&tname, i["name"].as_str().unwrap_or(""))]));
+            }
+            if t["tools"].as_array().is_none_or(|i| i.is_empty()) {
+                dropped_tools.push(tname);
+                continue;
+            }
+        } else if !keep_mcp && tname.starts_with("mcp__") && !rules.allows(&[&tname]) {
+            dropped_tools.push(tname);
             continue;
         }
         match t.get("type").and_then(|x| x.as_str()) {
@@ -604,7 +613,7 @@ mod tests {
             ],
             "tool_choice": "auto"
         });
-        let c = to_openai(&b, "backend-id", &[], crate::anthropic::ToolMode::All).unwrap();
+        let c = to_openai(&b, "backend-id", &[], crate::anthropic::ToolMode::All, &crate::toolrules::Rules::default()).unwrap();
         let m = c.body["messages"].as_array().unwrap();
         assert_eq!(m[0], json!({"role": "system", "content": "You are Codex.\n\nsandbox: workspace-write"}));
         assert_eq!(m[1]["role"], "user");
@@ -630,11 +639,11 @@ mod tests {
             {"type": "function", "name": "mcp__codex_apps__search_service"},
             {"type": "namespace", "name": "mcp__rea__", "tools": [{"type": "function", "name": "open_binary"}]},
         ]});
-        let c = to_openai(&b, "x", &[], crate::anthropic::ToolMode::Lean).unwrap();
+        let c = to_openai(&b, "x", &[], crate::anthropic::ToolMode::Lean, &crate::toolrules::Rules::default()).unwrap();
         let names: Vec<&str> = c.body["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
         assert_eq!(names, vec!["exec_command"]);
         assert_eq!(c.dropped_tools.len(), 2);
-        let c = to_openai(&b, "x", &[], crate::anthropic::ToolMode::All).unwrap();
+        let c = to_openai(&b, "x", &[], crate::anthropic::ToolMode::All, &crate::toolrules::Rules::default()).unwrap();
         assert_eq!(c.body["tools"].as_array().unwrap().len(), 3);
         assert_eq!(c.namespaces.get("open_binary").map(String::as_str), Some("mcp__rea__"));
     }
@@ -642,7 +651,7 @@ mod tests {
     #[test]
     fn stream_events_text_reasoning_and_tools() {
         let b = json!({"model": "m", "input": "hi", "tools": [{"type": "custom", "name": "apply_patch"}, {"type": "function", "name": "shell"}]});
-        let c = to_openai(&b, "x", &[], crate::anthropic::ToolMode::All).unwrap();
+        let c = to_openai(&b, "x", &[], crate::anthropic::ToolMode::All, &crate::toolrules::Rules::default()).unwrap();
         let mut st = RStream::new("m", &c);
         let s = feed_all(&mut st, &[
             json!({"choices": [{"delta": {"reasoning_content": "hmm"}}]}),
@@ -674,7 +683,7 @@ mod tests {
 
     #[test]
     fn length_finish_is_incomplete() {
-        let c = to_openai(&json!({"model": "m", "input": "hi", "max_output_tokens": 3}), "x", &[], crate::anthropic::ToolMode::All).unwrap();
+        let c = to_openai(&json!({"model": "m", "input": "hi", "max_output_tokens": 3}), "x", &[], crate::anthropic::ToolMode::All, &crate::toolrules::Rules::default()).unwrap();
         assert_eq!(c.body["max_tokens"], 3);
         let mut st = RStream::new("m", &c);
         let s = feed_all(&mut st, &[json!({"choices": [{"delta": {"content": "abc"}, "finish_reason": "length"}]})]);
@@ -687,7 +696,7 @@ mod tests {
     #[test]
     fn previous_response_history_comes_first() {
         let prior = vec![json!({"role": "user", "content": "first"}), json!({"role": "assistant", "content": "ok"})];
-        let c = to_openai(&json!({"model": "m", "instructions": "sys", "input": "second"}), "x", &prior, crate::anthropic::ToolMode::All).unwrap();
+        let c = to_openai(&json!({"model": "m", "instructions": "sys", "input": "second"}), "x", &prior, crate::anthropic::ToolMode::All, &crate::toolrules::Rules::default()).unwrap();
         let m = c.body["messages"].as_array().unwrap();
         assert_eq!(m.len(), 4);
         assert_eq!(m[0]["role"], "system");

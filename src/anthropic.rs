@@ -31,7 +31,7 @@ impl ToolMode {
 }
 
 /// Claude Code tools dropped in lean mode (orchestration, scheduling, notebooks, MCP plumbing).
-const LEAN_DROP: &[&str] = &[
+pub const LEAN_DROP: &[&str] = &[
     "Agent", "Task", "TaskOutput", "TaskStop", "NotebookEdit", "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
     "Skill", "SlashCommand", "ListMcpResourcesTool", "ReadMcpResourceTool", "CronCreate", "CronDelete", "CronList", "Monitor",
     "RemoteTrigger", "ScheduleWakeup", "PushNotification", "SendMessage", "ListAgents", "ToolSearch", "LSP", "SendFeedback",
@@ -60,15 +60,17 @@ pub fn lean_schema(v: &Value) -> Value {
     }
 }
 
-/// Tools after applying `mode`, still in Anthropic form.
-pub fn filter_tools(tools: &[Value], mode: ToolMode) -> Vec<Value> {
+/// Tools after applying `mode`, still in Anthropic form. `rules.allow` keeps tools the mode
+/// would drop (denied tools were removed earlier, in toolrules::anthropic).
+pub fn filter_tools(tools: &[Value], mode: ToolMode, rules: &crate::toolrules::Rules) -> Vec<Value> {
     tools.iter().filter(|t| t.get("input_schema").is_some()).filter_map(|t| {
         let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        if mode != ToolMode::All && name.starts_with("mcp__") {
+        let allowed = rules.allows(&[name]);
+        if mode != ToolMode::All && name.starts_with("mcp__") && !allowed {
             return None;
         }
         if matches!(mode, ToolMode::Lean | ToolMode::Groups) {
-            if LEAN_DROP.contains(&name) {
+            if LEAN_DROP.contains(&name) && !allowed {
                 return None;
             }
             let mut t = t.clone();
@@ -86,13 +88,17 @@ pub fn filter_tools(tools: &[Value], mode: ToolMode) -> Vec<Value> {
 /// (`mcp_<server>_<tool>`, VS Code's naming) dropped unless `all`; in lean/groups, descriptions cut
 /// to their first paragraph and parameter docs to one line. Schemas are untouched. Returns the
 /// number of tools before and after.
-pub fn trim_openai_tools(body: &mut Value, mode: ToolMode) -> (usize, usize) {
+pub fn trim_openai_tools(body: &mut Value, mode: ToolMode, rules: &crate::toolrules::Rules) -> (usize, usize) {
     let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) else { return (0, 0) };
     let before = tools.len();
     if mode == ToolMode::All {
         return (before, before);
     }
-    tools.retain(|t| !t["function"]["name"].as_str().unwrap_or("").starts_with("mcp_"));
+    tools.retain(|t| {
+        let n = t["function"]["name"].as_str().unwrap_or("");
+        let c = crate::toolrules::vscode_canonical(n);
+        !n.starts_with("mcp_") || rules.allows(&std::iter::once(n).chain(c.as_deref()).collect::<Vec<_>>())
+    });
     if matches!(mode, ToolMode::Lean | ToolMode::Groups) {
         for t in tools.iter_mut() {
             let f = &mut t["function"];
@@ -107,7 +113,7 @@ pub fn trim_openai_tools(body: &mut Value, mode: ToolMode) -> (usize, usize) {
     (before, tools.len())
 }
 
-pub fn to_openai(b: &Value, model_id: &str, mode: ToolMode) -> Value {
+pub fn to_openai(b: &Value, model_id: &str, mode: ToolMode, rules: &crate::toolrules::Rules) -> Value {
     let mut messages: Vec<Value> = Vec::new();
     match b.get("system") {
         Some(Value::String(s)) if !s.is_empty() => messages.push(json!({"role": "system", "content": s})),
@@ -209,7 +215,7 @@ pub fn to_openai(b: &Value, model_id: &str, mode: ToolMode) -> Value {
         }
     }
     if let Some(tools) = b.get("tools").and_then(|t| t.as_array()).filter(|t| !t.is_empty()) {
-        let t: Vec<Value> = filter_tools(tools, mode)
+        let t: Vec<Value> = filter_tools(tools, mode, rules)
             .iter()
             .map(|t| {
                 json!({"type": "function", "function": {
@@ -585,7 +591,7 @@ mod tests {
             "tools": [{"name": "get", "description": "d", "input_schema": {"type": "object"}}],
             "tool_choice": {"type": "any"}
         });
-        let o = to_openai(&b, "default_model", ToolMode::All);
+        let o = to_openai(&b, "default_model", ToolMode::All, &crate::toolrules::Rules::default());
         let m = o["messages"].as_array().unwrap();
         assert_eq!(m[0]["role"], "system");
         assert_eq!(m[2]["tool_calls"][0]["function"]["arguments"], "{\"city\":\"Madrid\"}");
@@ -671,12 +677,12 @@ mod mcp_tool_tests {
                 {"name": "mcp__rea__open_binary", "description": "d", "input_schema": {"type": "object"}}
             ]
         });
-        let core = super::to_openai(&b, "m", super::ToolMode::Core);
+        let core = super::to_openai(&b, "m", super::ToolMode::Core, &crate::toolrules::Rules::default());
         assert_eq!(core["tools"].as_array().unwrap().len(), 1);
         assert_eq!(core["tools"][0]["function"]["name"], "Bash");
-        assert_eq!(super::to_openai(&b, "m", super::ToolMode::All)["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(super::to_openai(&b, "m", super::ToolMode::All, &crate::toolrules::Rules::default())["tools"].as_array().unwrap().len(), 2);
         assert_eq!(super::prompt_breakdown(&b).4, 1);
-        let lean = super::to_openai(&b, "m", super::ToolMode::Lean);
+        let lean = super::to_openai(&b, "m", super::ToolMode::Lean, &crate::toolrules::Rules::default());
         assert_eq!(lean["tools"].as_array().unwrap().len(), 1);
     }
 
@@ -687,7 +693,7 @@ mod mcp_tool_tests {
             serde_json::json!({"name": "Bash", "description": long, "input_schema": {"type": "object", "properties": {"command": {"type": "string", "description": "x ".repeat(300)}}, "required": ["command"]}}),
             serde_json::json!({"name": "Agent", "description": "d", "input_schema": {"type": "object"}}),
         ];
-        let out = super::filter_tools(&tools, super::ToolMode::Lean);
+        let out = super::filter_tools(&tools, super::ToolMode::Lean, &crate::toolrules::Rules::default());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["description"], "Runs a command.");
         assert_eq!(out[0]["input_schema"]["required"][0], "command");
@@ -706,11 +712,11 @@ mod vscode_tests {
             {"type": "function", "function": {"name": "read_file", "description": long, "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "x ".repeat(300)}}}}},
             {"type": "function", "function": {"name": "mcp_rea_open_binary", "description": "MCP", "parameters": {}}},
         ]});
-        assert_eq!(trim_openai_tools(&mut body, ToolMode::Lean), (2, 1));
+        assert_eq!(trim_openai_tools(&mut body, ToolMode::Lean, &crate::toolrules::Rules::default()), (2, 1));
         assert_eq!(body["tools"][0]["function"]["description"], "Reads a file.");
         assert!(body["tools"][0]["function"]["parameters"]["properties"]["path"]["description"].as_str().unwrap().chars().count() <= 161);
         assert_eq!(body["tools"][0]["function"]["parameters"]["properties"]["path"]["type"], "string");
         let mut all = json!({"tools": [{"type": "function", "function": {"name": "mcp_x_y"}}]});
-        assert_eq!(trim_openai_tools(&mut all, ToolMode::All), (1, 1));
+        assert_eq!(trim_openai_tools(&mut all, ToolMode::All, &crate::toolrules::Rules::default()), (1, 1));
     }
 }

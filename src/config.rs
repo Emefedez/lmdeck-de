@@ -46,6 +46,11 @@ pub struct ServerCfg {
     /// "lean": drop Claude Code prompt sections a local model can't use (MCP server
     /// instructions, Claude model notes); in groups mode the MCP notes move into the groups.
     pub local_prompt: String,
+    /// Tool name globs always kept for local models, even when local_tools would drop them
+    /// (wins over tool_deny). See toolrules.rs.
+    pub tool_allow: Vec<String>,
+    /// Tool name globs never sent to local models (tool groups included).
+    pub tool_deny: Vec<String>,
     /// Skip the memory admission check entirely.
     pub mem_check: bool,
     /// Refuse GPU loads that exceed the GPU memory budget (Asahi gives the GPU
@@ -303,6 +308,8 @@ impl Default for ServerCfg {
             vm_reserve_gib: 2.0,
             local_tools: "lean".into(),
             local_prompt: "lean".into(),
+            tool_allow: Vec::new(),
+            tool_deny: Vec::new(),
             mem_check: true,
             gpu_mem_check: true,
             gpu_heap: "auto".into(),
@@ -652,6 +659,8 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "System prompts", key: "strata.system_prompt", kind: Kind::Prompt, help: "System prompt for Strata models (prompts/strata.md, opens in your editor)" },
     Setting { section: "System prompts", key: "strata.system_prompt_mode", kind: MODE, help: "Strata: prepend / replace / fallback" },
     Setting { section: "Coding agents", key: "server.local_prompt", kind: Kind::Choice(&["lean", "original"]), help: "Claude Code prompt for local models: lean (drop MCP instructions and Claude model notes) / original" },
+    Setting { section: "Coding agents", key: "server.tool_allow", kind: Kind::Text, help: "Tool globs always sent to local models, even if local_tools drops them (wins over deny), e.g. mcp__rea__demangle_swift" },
+    Setting { section: "Coding agents", key: "server.tool_deny", kind: Kind::Text, help: "Tool globs never sent to local models, e.g. mcp__rea__* WebSearch (lmdeck tools shows each tool's status)" },
     Setting { section: "Coding agents", key: "server.local_tools", kind: Kind::Choice(&["lean", "groups", "core", "all"]), help: "Claude Code tools sent to local models: lean (no MCP, essential tools, short descriptions) / groups (lean + MCP on demand) / core (no MCP) / all" },
     Setting { section: "Downloads", key: "models.hf_cache", kind: Kind::Text, help: "Hugging Face cache dir (empty = default)" },
     Setting { section: "Downloads", key: "models.extra_dirs", kind: Kind::Text, help: "Extra dirs with loose .gguf files (comma separated)" },
@@ -687,6 +696,8 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "server.load_timeout_secs" => c.server.load_timeout_secs.to_string(),
         "server.mem_check" => c.server.mem_check.to_string(),
         "server.local_tools" => c.server.local_tools.clone(),
+        "server.tool_allow" => c.server.tool_allow.join(" "),
+        "server.tool_deny" => c.server.tool_deny.join(" "),
         "server.local_prompt" => c.server.local_prompt.clone(),
         "server.gpu_mem_check" => c.server.gpu_mem_check.to_string(),
         "server.gpu_heap" => c.server.gpu_heap.clone(),
@@ -770,6 +781,8 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
             "lean" | "original" => c.server.local_prompt = v.into(),
             _ => return Err("lean or original".into()),
         },
+        "server.tool_allow" => c.server.tool_allow = words(v),
+        "server.tool_deny" => c.server.tool_deny = words(v),
         "server.local_tools" => match v {
             "lean" | "groups" | "core" | "all" => c.server.local_tools = v.into(),
             _ => return Err("lean, groups, core or all".into()),

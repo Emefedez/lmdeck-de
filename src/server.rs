@@ -843,6 +843,10 @@ async fn anthropic_count(AnyJson(b): AnyJson) -> Json<Value> {
 
 async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let t0 = Instant::now();
+    // Before the model is acquired, so `lmdeck tools scan` records the tool list without a load.
+    let rules = crate::toolrules::Rules::from_cfg(&a.mgr.cfg());
+    let mut b = b;
+    crate::toolrules::anthropic(&mut b, &rules);
     let Some(mut name) = model_field(&b) else { return anth_err(StatusCode::BAD_REQUEST, "invalid_request_error", "model is required") };
     // Claude Code makes background calls with claude-* names; serve them with
     // whatever local model is loaded rather than failing the session.
@@ -866,9 +870,8 @@ async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         }
     };
     let mode = crate::anthropic::ToolMode::parse(&a.mgr.cfg().server.local_tools);
-    // Last request as received, for inspecting what clients send (local file, overwritten).
+    // Last request as received (after tool_deny), for inspecting what clients send (local file, overwritten).
     let _ = std::fs::write(crate::config::log_dir().join("last-messages.json"), serde_json::to_vec_pretty(&b).unwrap_or_default());
-    let mut b = b;
     let mcp_notes = if a.mgr.cfg().server.local_prompt == "lean" && mode != crate::anthropic::ToolMode::All {
         crate::anthropic::lean_prompt(&mut b)
     } else {
@@ -876,7 +879,7 @@ async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     };
     let (sys_t, msg_t, tools_t, mcp_t, mcp_n) = crate::anthropic::prompt_breakdown(&b);
     let sent_tools: u64 = b.get("tools").and_then(|t| t.as_array())
-        .map(|t| crate::anthropic::filter_tools(t, mode).iter().map(|t| t.to_string().len() as u64 / 4).sum())
+        .map(|t| crate::anthropic::filter_tools(t, mode, &rules).iter().map(|t| t.to_string().len() as u64 / 4).sum())
         .unwrap_or(0);
     sys::log(&format!(
         "/v1/messages {}: ~{} tokens in, ~{} sent (system {sys_t}, messages {msg_t}, tools {tools_t} -> {sent_tools} [{mode:?}]; {mcp_n} MCP tools ~{mcp_t})",
@@ -884,7 +887,7 @@ async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         sys_t + msg_t + tools_t,
         sys_t + msg_t + sent_tools,
     ));
-    let mut body = crate::anthropic::to_openai(&b, guard.0.backend_model_id(), mode);
+    let mut body = crate::anthropic::to_openai(&b, guard.0.backend_model_id(), mode, &rules);
     crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut body);
     if let Err((est, limit)) = context_check(&a.mgr.cfg(), &guard.0.model, &mut body) {
         sys::log(&format!("/v1/messages {}: refused a ~{est}-token prompt (window {limit})", guard.0.name));
@@ -892,7 +895,12 @@ async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         return anth_err(StatusCode::BAD_REQUEST, "invalid_request_error", format!("prompt is too long: {est} tokens > {limit} maximum. {}", too_long_hint(&guard.0.name)));
     }
     let groups = (mode == crate::anthropic::ToolMode::Groups)
-        .then(|| crate::toolgroups::Groups::sync(b.get("tools").and_then(|t| t.as_array()).map(|t| t.as_slice()).unwrap_or(&[])).with_notes(mcp_notes))
+        .then(|| {
+            // Allowed MCP tools are sent directly, so they stay out of the groups.
+            let tools: Vec<Value> = b.get("tools").and_then(|t| t.as_array()).into_iter().flatten()
+                .filter(|t| !rules.allows(&[t["name"].as_str().unwrap_or("")])).cloned().collect();
+            crate::toolgroups::Groups::sync(&tools).with_notes(mcp_notes)
+        })
         .filter(|g| !g.is_empty());
     if let Some(g) = groups.as_ref() {
         let meta: Vec<Value> = g.meta_tools().iter().map(|t| json!({"type": "function", "function": {
@@ -1052,6 +1060,9 @@ fn oai_err(code: StatusCode, kind: &str, msg: impl std::fmt::Display) -> Resp {
 /// OpenAI Responses (Codex) over the backend's Chat Completions; see responses.rs.
 async fn openai_responses(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
     let t0 = Instant::now();
+    let rules = crate::toolrules::Rules::from_cfg(&a.mgr.cfg());
+    let mut b = b;
+    crate::toolrules::responses(&mut b, &rules);
     let Some(name) = model_field(&b) else { return oai_err(StatusCode::BAD_REQUEST, "invalid_request_error", "model is required") };
     let stream = b.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let prior = match b.get("previous_response_id").and_then(|p| p.as_str()) {
@@ -1070,7 +1081,7 @@ async fn openai_responses(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         }
     };
     let mode = crate::anthropic::ToolMode::parse(&a.mgr.cfg().server.local_tools);
-    let mut conv = match crate::responses::to_openai(&b, guard.0.backend_model_id(), &prior, mode) {
+    let mut conv = match crate::responses::to_openai(&b, guard.0.backend_model_id(), &prior, mode, &rules) {
         Ok(c) => c,
         Err(e) => return oai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
     };
@@ -1516,15 +1527,17 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
         if ua.contains("copilot") || ua.contains("vscode") {
             let est = estimate_tokens(&v);
             let mode = crate::anthropic::ToolMode::parse(&a.mgr.cfg().server.local_tools);
+            let rules = crate::toolrules::Rules::from_cfg(&a.mgr.cfg());
+            crate::toolrules::openai(&mut v, &rules);
             let has_mcp = v["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["function"]["name"].as_str().is_some_and(|n| n.starts_with("mcp_"))));
             if mode == crate::anthropic::ToolMode::Groups && has_mcp {
                 // MCP tools on demand: tool_group (answered here) and call_tool (rewritten into
                 // the real MCP tool for VS Code), as for Claude Code.
                 let tools = v["tools"].as_array().cloned().unwrap_or_default();
-                let (groups, names, rest) = crate::toolgroups::from_openai(&tools);
+                let (groups, names, rest) = crate::toolgroups::from_openai(&tools, &rules);
                 v["tools"] = json!(rest);
                 let (n0, _) = (tools.len(), 0);
-                crate::anthropic::trim_openai_tools(&mut v, crate::anthropic::ToolMode::Lean);
+                crate::anthropic::trim_openai_tools(&mut v, crate::anthropic::ToolMode::Lean, &rules);
                 if let Some(t) = v["tools"].as_array_mut() {
                     t.extend(crate::toolgroups::meta_tools_openai(&groups));
                 }
@@ -1539,7 +1552,7 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
                 let stream = v["stream"].as_bool().unwrap_or(false);
                 return openai_groups(a, guard, v, groups, names, name, stream).await;
             }
-            let (n0, n1) = crate::anthropic::trim_openai_tools(&mut v, mode);
+            let (n0, n1) = crate::anthropic::trim_openai_tools(&mut v, mode, &rules);
             sys::log(&format!("{}: VS Code request ~{est} -> ~{} tokens, tools {n0} -> {n1} (server.local_tools = {})", guard.0.name, estimate_tokens(&v), a.mgr.cfg().server.local_tools));
         }
         crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut v);

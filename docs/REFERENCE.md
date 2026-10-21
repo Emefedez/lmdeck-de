@@ -73,7 +73,11 @@ Claude Code sends every tool it knows, MCP tools included. With a few MCP server
 
 `server.local_prompt` (default `lean`) also trims Claude Code's prompt for local models: MCP server instructions go away (in `groups` mode they come with that server's group), so do the notes about Claude models, and the memory paragraph, which names a per-project path, moves out of the system prompt so all projects share one cached system prompt. Claude Code's prompt went from ~8.1k to ~4.5k tokens, and a new conversation in a new project from ~104 s to ~25 s on Qwen3.8-27B (~64 s the very first time a system prompt is seen).
 
-`server.local_tools`, `server.local_prompt` and `mlx.prefix_checkpoints` (on by default) are in Settings and in the bar panel under **Coding agents**.
+Per-tool rules go on top of the mode, for Claude Code, Codex and VS Code Copilot alike. `server.tool_deny` lists tool-name globs a local model never gets (tool groups included). `server.tool_allow` lists globs it always gets, even when the mode would drop them. An allowed MCP tool is then sent directly instead of through a group, and allow wins over deny. For example, `tool_deny = ["mcp__rea__*", "Workflow"]` with `tool_allow = ["mcp__rea__demangle_swift"]` keeps one rea tool. Names are Claude Code's (`Bash`, `mcp__<server>__<tool>`). VS Code's `mcp_<server>_<tool>` and Codex's namespaced tools are matched under that same `mcp__<server>__<tool>` form.
+
+`lmdeck tools` lists the tools each client last sent and what happens to each (`sent`, `sent (short)`, `group`, `dropped`, `denied`, `allowed`). The lists are kept in `~/.local/state/lmdeck/tools-seen.json`. `lmdeck tools allow|deny|default <glob>` edits the rules. `lmdeck tools scan` records Claude Code's list without loading a model: it sends Claude Code's first request to lmdeck with an unknown model name, so the request ends with a 404. `lmdeck config [key] [value]` reads or sets any setting. Both commands reload the running server.
+
+`server.local_tools`, `server.local_prompt`, `server.tool_allow`, `server.tool_deny` and `mlx.prefix_checkpoints` (on by default) are in Settings, and the first two are also in the bar panel under **Coding agents**.
 
 Every `/v1/messages` request logs the breakdown (system, messages, tools before and after) in `lmdeck.log`. In `groups` mode text and thinking stream as usual; only tool calls wait until the end of the round, so lmdeck can answer `tool_group` itself.
 

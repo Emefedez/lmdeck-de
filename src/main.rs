@@ -12,6 +12,7 @@ mod server;
 mod sys;
 mod sysprompt;
 mod toolgroups;
+mod toolrules;
 mod tui;
 mod usage;
 mod vscode;
@@ -103,6 +104,23 @@ enum Cmd {
     Desktop,
     /// VS Code / Copilot fallback status (the lmdeck VS Code extension applies it)
     Vscode,
+    /// Tools coding agents last sent and what reaches local models (server.local_tools,
+    /// tool_allow, tool_deny); `allow|deny|default <glob>` edits the lists
+    Tools {
+        /// allow | deny | default, or scan (record Claude Code's tool list without loading a model); omit to list
+        action: Option<String>,
+        /// Tool name or glob, e.g. mcp__rea__* (canonical names, see `lmdeck tools`)
+        pattern: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show settings, or one setting, or set it: `lmdeck config server.local_tools groups`
+    Config {
+        key: Option<String>,
+        value: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a coding agent on a local model (like `ollama launch`):
     /// claude | codex | opencode | t3 (registers a T3 Code provider, opens t1code)
     Launch {
@@ -354,6 +372,98 @@ async fn async_main(cli: Cli) -> Result<()> {
             match d.http().get(format!("{}/lmdeck/vscode", d.base)).send().await {
                 Ok(r) => println!("{}", serde_json::to_string_pretty(&r.json::<Value>().await?)?),
                 Err(_) => println!("daemon not running"),
+            }
+            Ok(())
+        }
+        Some(Cmd::Tools { action, pattern, json }) => {
+            if action.as_deref() == Some("scan") {
+                // Claude Code's first request carries its whole tool list; lmdeck records it before
+                // acquiring a model, and the unknown model name ends the run with a 404 (no load).
+                if !d.up().await {
+                    bail!("the lmdeck server is not running (lmdeck service start)");
+                }
+                let st = std::process::Command::new("claude")
+                    .args(["-p", "lmdeck tool scan", "--model", "lmdeck-tool-scan", "--no-session-persistence", "--max-turns", "1"])
+                    .env("ANTHROPIC_BASE_URL", &d.base)
+                    .env("ANTHROPIC_AUTH_TOKEN", "lmdeck")
+                    .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                if let Err(e) = st {
+                    bail!("could not run claude: {e}");
+                }
+                let n = toolrules::seen()["claude"]["tools"].as_array().map(|t| t.len()).unwrap_or(0);
+                println!("claude: {n} tools recorded");
+                return Ok(());
+            }
+            if let Some(action) = action {
+                let Some(pattern) = pattern else { bail!("usage: lmdeck tools allow|deny|default <glob>  (or lmdeck tools scan)") };
+                Config::edit(|c| toolrules::set(c, &pattern, &action)).map_err(anyhow::Error::msg)?;
+                if d.up().await {
+                    d.reload().await?;
+                }
+                println!("{pattern}: {action}");
+                return Ok(());
+            }
+            let cfg = Config::load()?;
+            let mode = anthropic::ToolMode::parse(&cfg.server.local_tools);
+            let rules = toolrules::Rules::from_cfg(&cfg);
+            let seen = toolrules::seen();
+            let mut out = serde_json::Map::new();
+            for (client, v) in seen.as_object().into_iter().flatten() {
+                let tools: Vec<Value> = v["tools"].as_array().into_iter().flatten().map(|t| {
+                    let name = t["name"].as_str().unwrap_or("");
+                    json!({"name": name, "tokens": t["tokens"], "status": toolrules::status(client, name, mode, &rules)})
+                }).collect();
+                out.insert(client.clone(), json!({"updated": v["updated"], "tools": tools}));
+            }
+            let all = json!({"local_tools": cfg.server.local_tools, "local_prompt": cfg.server.local_prompt,
+                             "tool_allow": cfg.server.tool_allow, "tool_deny": cfg.server.tool_deny, "clients": out});
+            if json {
+                println!("{}", serde_json::to_string_pretty(&all)?);
+                return Ok(());
+            }
+            println!("local_tools = {}   tool_allow = {:?}   tool_deny = {:?}", cfg.server.local_tools, cfg.server.tool_allow, cfg.server.tool_deny);
+            if out.is_empty() {
+                println!("No tool lists seen yet: they are recorded on the first request from Claude Code, Codex or VS Code.");
+            }
+            for (client, v) in &out {
+                let tools = v["tools"].as_array().cloned().unwrap_or_default();
+                let sent: u64 = tools.iter().filter(|t| matches!(t["status"].as_str(), Some("sent" | "sent (short)" | "allowed"))).map(|t| t["tokens"].as_u64().unwrap_or(0)).sum();
+                println!("\n{client}: {} tools, ~{sent} tokens of schemas sent directly", tools.len());
+                for t in tools {
+                    println!("  {:<13} {:<60} ~{}", t["status"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""), t["tokens"]);
+                }
+            }
+            Ok(())
+        }
+        Some(Cmd::Config { key, value, json }) => {
+            match (key, value) {
+                (Some(key), Some(value)) => {
+                    Config::edit(|c| config::set_setting(c, &key, &value).map_err(|e| format!("{key}: {e}"))).map_err(anyhow::Error::msg)?;
+                    if d.up().await {
+                        d.reload().await?;
+                    }
+                    println!("{key} = {value} (applies {})", config::applies(&key));
+                }
+                (key, None) => {
+                    let cfg = Config::load()?;
+                    let rows: Vec<Value> = config::SETTINGS.iter().filter(|s| key.as_deref().is_none_or(|k| s.key == k))
+                        .map(|s| json!({"key": s.key, "value": config::get_setting(&cfg, s.key), "help": s.help})).collect();
+                    if rows.is_empty() {
+                        bail!("unknown setting");
+                    }
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&rows)?);
+                    } else {
+                        for r in rows {
+                            println!("{} = {}", r["key"].as_str().unwrap_or(""), r["value"].as_str().unwrap_or(""));
+                        }
+                    }
+                }
+                (None, Some(_)) => unreachable!(),
             }
             Ok(())
         }
