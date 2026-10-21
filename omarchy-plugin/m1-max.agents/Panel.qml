@@ -6,6 +6,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "file:///usr/share/omarchy/shell/plugins/agents" as Stock
+import qs.Commons as Commons
 
 Panel {
   id: root
@@ -13,11 +14,11 @@ Panel {
   ipcTarget: "m1-max.agents"
   manageIpc: false
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
+  readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
-  readonly property color surface: Color.popups.background
-  readonly property color track: Style.selectedFillFor(foreground, Color.accent)
+  readonly property color surface: Commons.Color.popups.background
+  readonly property color track: Style.selectedFillFor(foreground, Commons.Color.accent)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   readonly property var providers: {
@@ -621,7 +622,7 @@ Panel {
       ? String(Qt.resolvedUrl("assets/"))
       : "file:///usr/share/omarchy/shell/plugins/agents/assets/"
     var candidates = []
-    if (colorLuminance(surfaceColor || Color.background) >= 0.5)
+    if (colorLuminance(surfaceColor || Commons.Color.background) >= 0.5)
       candidates.push(markDir + p.providerId + "-light.svg")
     candidates.push(markDir + p.providerId + ".svg")
     return candidates
@@ -719,7 +720,7 @@ Panel {
       width: Math.max(4, Math.round(parent.height * 0.16))
       height: width
       radius: width / 2
-      color: lmdeck.busy ? Color.accent : root.foreground
+      color: lmdeck.busy ? Commons.Color.accent : root.foreground
       anchors.right: parent.right
       anchors.top: parent.top
       anchors.rightMargin: Math.round(parent.width * 0.18)

@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import qs.Commons
 import qs.Ui
+import qs.Commons as Commons
 
 // Live lmdeck view inside the Agents panel, split into themed cards:
 // Server · Now · Downloads · KV cache · Memory & residency · Backend & network
@@ -10,10 +11,10 @@ Column {
   id: sec
 
   property var lm: null
-  property color foreground: Color.foreground
+  property color foreground: Commons.Color.foreground
   property color dim: Qt.darker(foreground, 1.55)
-  property color track: Style.selectedFillFor(foreground, Color.accent)
-  property color urgent: Color.urgent
+  property color track: Style.selectedFillFor(foreground, Commons.Color.accent)
+  property color urgent: Commons.Color.urgent
   property string fontFamily: Style.font.family
   readonly property bool searchFocused: searchField.activeFocus
 
@@ -45,7 +46,7 @@ Column {
   Card {
     title: "SERVER"
     badge: lm.pending ? (lm.up ? "stopping…" : "starting…") : (lm.up ? "on" : "off")
-    badgeColor: lm.up ? Color.accent : sec.dim
+    badgeColor: lm.up ? Commons.Color.accent : sec.dim
     hasSwitch: true
     switchOn: lm.up
     switchBusy: lm.pending
@@ -93,7 +94,7 @@ Column {
       width: parent.width
       textFormat: Text.PlainText
       text: lm.toast
-      color: Color.accent
+      color: Commons.Color.accent
       font.family: sec.fontFamily
       font.pixelSize: Style.font.caption
       wrapMode: Text.WordWrap
@@ -169,7 +170,7 @@ Column {
               : l.phase === "starting" ? "starting backend" : l.phase
           return "Loading " + name + " — " + detail + " · " + Math.round(l.elapsed_secs) + " s"
         }
-        color: Color.accent
+        color: Commons.Color.accent
         elide: Text.ElideMiddle
       }
       Bar { width: parent.width; value: parent.l ? parent.l.progress : 0 }
@@ -492,7 +493,7 @@ Column {
       text: !lm.vscode ? "" : (lm.vscode.quota_blocked ? "Copilot quota exhausted · " : "Copilot quota available · ")
         + (active ? "Fix/chat use " + active.split("/").pop() : "VS Code uses Copilot")
         + " · checked by the lmdeck VS Code extension (startup / focus)"
-      color: active ? Color.accent : sec.dim
+      color: active ? Commons.Color.accent : sec.dim
       wrapMode: Text.WordWrap
     }
   }
@@ -684,7 +685,7 @@ Column {
             width: parent.width
             text: !parent.v ? "" : parent.v.level === "unlikely" ? "✗ Likely won't run on the Apple GPU"
               : parent.v.level === "untested" ? "? Untested on omarchy-mlx" : "✓ Qualified on omarchy-mlx"
-            color: parent.v && parent.v.level === "unlikely" ? sec.urgent : parent.v && parent.v.level === "qualified" ? Color.accent : sec.foreground
+            color: parent.v && parent.v.level === "unlikely" ? sec.urgent : parent.v && parent.v.level === "qualified" ? Commons.Color.accent : sec.foreground
             font.bold: true
           }
           Caption {
