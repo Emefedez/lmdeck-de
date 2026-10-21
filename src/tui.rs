@@ -2314,6 +2314,12 @@ pub fn load_label(l: &Value) -> String {
     let name = l["model"].as_str().unwrap_or("").rsplit('/').next().unwrap_or("").to_string();
     let el = l["elapsed_secs"].as_f64().unwrap_or(0.0);
     let detail = match l["phase"].as_str().unwrap_or("") {
+        // Strata: the engine's own stage (and the share of the wait it is at)
+        "loading" if l["stage"].is_string() => format!(
+            "{} ({:.0}%)",
+            l["stage"].as_str().unwrap_or(""),
+            100.0 * l["progress"].as_f64().unwrap_or(0.0)
+        ),
         "loading" => format!(
             "weights {}/{}{}",
             human(l["loaded_bytes"].as_u64().unwrap_or(0)),

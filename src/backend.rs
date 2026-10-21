@@ -27,6 +27,11 @@ struct LoadInfo {
     log: Option<std::path::PathBuf>,
     /// Log length when this load began; warm-up progress is parsed after it.
     log_offset: u64,
+    /// Strata: the engine's own log (the run config's "log") and its length when this load began. Its lines
+    /// say which stage the engine is in; the GPU-memory growth does not (the model files are ~100 GB, the
+    /// engine holds ~10).
+    engine_log: Option<std::path::PathBuf>,
+    engine_log_offset: u64,
 }
 
 pub struct Running {
@@ -294,6 +299,8 @@ impl Manager {
             phase: "preparing",
             log: None,
             log_offset: 0,
+            engine_log: None,
+            engine_log_offset: 0,
         });
         EVENTS.bump();
         let res = self.load_locked(&m, ka).await;
@@ -691,9 +698,16 @@ impl Manager {
                     let exe = run["exe"].as_str().unwrap_or("");
                     if exe.is_empty() || !std::path::Path::new(exe).exists() {
                         bail!(
-                            "{}: the Strata engine for Apple GPUs under Linux is not built yet (the Vulkan port, {} branch {}); nothing was loaded",
-                            m.name, cfg.strata.repo, cfg.strata.git_ref
+                            "{}: the Strata engine is not built ({}): Dashboard → T (or `lmdeck strata install`) builds it; nothing was loaded",
+                            m.name, if exe.is_empty() { "the run config names no engine" } else { exe }
                         );
+                    }
+                    if let Some(l) = run["log"].as_str().filter(|l| !l.is_empty()) {
+                        let l = std::path::PathBuf::from(l);
+                        if let Some(li) = self.load_info.lock().unwrap().as_mut() {
+                            li.engine_log_offset = std::fs::metadata(&l).map(|m| m.len()).unwrap_or(0);
+                            li.engine_log = Some(l);
+                        }
                     }
                 }
                 let ready = crate::config::state_dir().join(format!("strata-{port}.ready.json"));
@@ -854,13 +868,28 @@ impl Manager {
             }
             if let Ok(resp) = self.http.get(&health).timeout(Duration::from_secs(2)).send().await {
                 if resp.status().is_success() {
-                    break;
+                    if r.model.format != Format::Strata {
+                        break;
+                    }
+                    // Strata's server answers /health while its engine is still starting; "loaded" turns true at
+                    // the engine's READY (dense weights read, the expert arena filled, the kernels compiled).
+                    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+                    if v["loaded"].as_bool() == Some(true) || v["loaded"].is_null() {
+                        break;
+                    }
+                    self.set_phase("loading");
+                    if let Some(fatal) = self.strata_fatal() {
+                        bail!("the Strata engine stopped while loading: {fatal}");
+                    }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
         self.set_phase("loading");
-        if r.model.format == Format::Mlx {
+        // Strata: READY comes before the decode window, the expert arena's fill and the kernels' compiles, which
+        // the first request pays; the warm-up below makes them part of the load
+        let strata_warm = r.model.format == Format::Strata && self.cfg().strata.engine != "mock";
+        if r.model.format == Format::Mlx || strata_warm {
             // mlx_lm.server answers /health before its generator thread has loaded the
             // weights. A 1-token request blocks until the model is loaded and also
             // compiles the Vulkan pipelines so the first real request is fast.
@@ -890,6 +919,11 @@ impl Manager {
                         if let Some(dead) = self.backend_thread_died(r) {
                             bail!("backend's generator thread crashed while loading: {dead}");
                         }
+                        if strata_warm {
+                            if let Some(fatal) = self.strata_fatal() {
+                                bail!("the Strata engine stopped while loading: {fatal}");
+                            }
+                        }
                         if Instant::now() > deadline {
                             bail!("timed out loading weights after {}s", timeout.as_secs());
                         }
@@ -898,6 +932,22 @@ impl Manager {
             }
         }
         Ok(())
+    }
+
+    /// Strata: a line of the engine's log (since this load began) that says it stopped.
+    fn strata_fatal(&self) -> Option<String> {
+        let li = self.load_info.lock().unwrap().clone()?;
+        let text = sys::read_since(li.engine_log.as_ref()?, li.engine_log_offset, 256 * 1024);
+        text.lines()
+            .find(|l| {
+                (l.starts_with("mtl(vulkan):") && !l.contains("timing"))
+                    || l.contains("no free slot")
+                    || l.contains("DRM_IOCTL")
+                    || l.starts_with("ERR ")
+                    || (l.starts_with("strata generate:") && (l.contains(" needs ") || l.contains("cannot")))
+                    || (l.starts_with("strata metal") && (l.contains("cannot") || l.contains("failed")))
+            })
+            .map(|l| l.chars().take(240).collect())
     }
 
     fn set_phase(&self, phase: &'static str) {
@@ -911,6 +961,22 @@ impl Manager {
     /// Warm-up: the backend's own "Prompt processing progress: a/b" lines.
     pub fn load_progress(&self) -> Option<serde_json::Value> {
         let li = self.load_info.lock().unwrap().clone()?;
+        if let Some(elog) = &li.engine_log {
+            // Strata: the engine's stage from its own log, not the GPU-memory growth
+            let text = sys::read_since(elog, li.engine_log_offset, 256 * 1024);
+            let (stage, frac) = strata_stage(&text);
+            return Some(serde_json::json!({
+                "model": li.model,
+                "phase": if li.phase == "preparing" { "preparing" } else { "loading" },
+                "stage": stage,
+                "progress": frac,
+                "loaded_bytes": 0,
+                "total_bytes": 0,
+                "elapsed_secs": li.started.elapsed().as_secs_f64(),
+                "eta_secs": serde_json::Value::Null,
+                "warmup": serde_json::Value::Null,
+            }));
+        }
         let loaded = sys::shmem().saturating_sub(li.shmem0).min(li.size);
         let frac = if li.size > 0 { loaded as f64 / li.size as f64 } else { 0.0 };
         let elapsed = li.started.elapsed().as_secs_f64();
@@ -1168,4 +1234,47 @@ fn free_port() -> Result<u16> {
 
 pub fn gib(b: u64) -> f64 {
     b as f64 / (1u64 << 30) as f64
+}
+
+/// Strata's load stages, from the engine's log lines (the last one reached wins), with the share of the wait
+/// each usually ends at (M1 Max, Q2_0 streamed: ~25 s to READY, most of it the arena fill).
+fn strata_stage(text: &str) -> (&'static str, f64) {
+    const STAGES: [(&str, &str, f64); 7] = [
+        ("weights loaded from", "starting the engine", 0.05),
+        ("session is up", "engine up, reading the dense weights", 0.15),
+        ("HC read in", "hyper-connection weights", 0.25),
+        ("dense tensors read", "dense weights in memory, opening the decode window", 0.35),
+        ("decode window on", "filling the expert arena from the SSD", 0.45),
+        ("expert arena ", "compiling the GPU kernels", 0.9),
+        ("resident footprint after the fill", "compiling the GPU kernels", 0.92),
+    ];
+    let mut best = ("starting the engine", 0.02);
+    for line in text.lines() {
+        for (key, stage, frac) in STAGES {
+            if line.contains(key) && frac > best.1 {
+                best = (stage, frac);
+            }
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod strata_stage_tests {
+    use super::strata_stage;
+
+    #[test]
+    fn stages_follow_the_engine_log() {
+        assert_eq!(strata_stage("").0, "starting the engine");
+        let log = "strata generate: 1416 MiB of weights loaded from /x/packs/q2_0 in 1.0 s\n\
+                   strata generate: session is up (engine 0.1.46-vulkan)\n\
+                   strata metal: HC read in Q8_0 (STRATA_HC_Q8=0: BF16): 290 matrices, 680 MB, made in 1426 ms\n\
+                   strata metal stream: 789 dense tensors read into memory (2.36 GB, 0.8 s; 290 left out)\n\
+                   strata metal: decode window on Apple M1 Max (G13C C0): /x.gguf streamed from the SSD (experts)\n";
+        let (stage, frac) = strata_stage(log);
+        assert_eq!(stage, "filling the expert arena from the SSD");
+        assert!((frac - 0.45).abs() < 1e-9);
+        let filled = format!("{log}strata metal stream: expert arena 8.00 GB, 5744 slots in 1 size classes\n");
+        assert_eq!(strata_stage(&filled).0, "compiling the GPU kernels");
+    }
 }
