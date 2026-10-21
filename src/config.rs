@@ -234,6 +234,9 @@ impl Default for VscodeCfg {
 pub struct UiCfg {
     /// Editor for prompts and the config file (e.g. "nvim", "code"); empty = $VISUAL, $EDITOR, nvim.
     pub editor: String,
+    /// Favourite models (full names): marked ★ and listed first in Models.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub favorites: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

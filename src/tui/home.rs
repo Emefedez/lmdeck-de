@@ -1,7 +1,7 @@
 //! Home: is the server up, what is loaded, how much memory is free, what is downloading.
 
 use super::popup::{Confirmed, Popup};
-use super::widgets::{all_downloads, active_downloads, compact, dim, dur, kv, load_label, panel, Act};
+use super::widgets::{all_downloads, active_downloads, compact, dim, dur, kv, load_label, panel, plural, Act};
 use super::{Action, Ui};
 use crate::{client, human, sys};
 use crossterm::event::KeyCode;
@@ -96,20 +96,31 @@ impl Ui {
 
     pub(super) fn draw_home(&mut self, f: &mut Frame, area: Rect) {
         let narrow = area.width < 100;
-        let (server, loaded, memory, usage, downloads) = if narrow {
-            let [s, l, m, u, d] = Layout::vertical([Constraint::Length(6), Constraint::Min(4), Constraint::Length(4), Constraint::Length(5), Constraint::Length(5)]).areas(area);
-            (s, l, m, u, d)
+        if narrow {
+            let tall = area.height >= 34;
+            let [s, l, m, b, u, d] = Layout::vertical([
+                Constraint::Length(8), Constraint::Min(4), Constraint::Length(8),
+                Constraint::Length(if tall { 6 } else { 0 }), Constraint::Length(5), Constraint::Length(4),
+            ]).areas(area);
+            self.draw_server(f, s);
+            self.draw_loaded(f, l);
+            self.draw_memory(f, m);
+            if tall {
+                self.draw_backends_summary(f, b);
+            }
+            self.draw_usage(f, u);
+            self.draw_downloads(f, d);
         } else {
-            let [left, right] = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
-            let [s, l] = Layout::vertical([Constraint::Length(7), Constraint::Min(4)]).areas(left);
-            let [m, u, d] = Layout::vertical([Constraint::Length(5), Constraint::Length(7), Constraint::Min(3)]).areas(right);
-            (s, l, m, u, d)
-        };
-        self.draw_server(f, server);
-        self.draw_loaded(f, loaded);
-        self.draw_memory(f, memory);
-        self.draw_usage(f, usage);
-        self.draw_downloads(f, downloads);
+            let [left, right] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
+            let [s, l, b] = Layout::vertical([Constraint::Length(8), Constraint::Min(4), Constraint::Length(6)]).areas(left);
+            let [m, u, d] = Layout::vertical([Constraint::Length(9), Constraint::Length(6), Constraint::Min(3)]).areas(right);
+            self.draw_server(f, s);
+            self.draw_loaded(f, l);
+            self.draw_backends_summary(f, b);
+            self.draw_memory(f, m);
+            self.draw_usage(f, u);
+            self.draw_downloads(f, d);
+        }
     }
 
     fn draw_server(&self, f: &mut Frame, area: Rect) {
@@ -132,6 +143,8 @@ impl Ui {
         };
         l.push(kv("Network", &lan));
         l.push(kv("At login", if sys::service_installed() { if sys::service_active() { "user service, running" } else { "user service, stopped" } } else { "no (i)" }));
+        let c = &self.cfg.server;
+        l.push(kv("Residency", &format!("unloads after {} idle, max {} loaded", c.keep_alive, c.max_loaded)));
         f.render_widget(Paragraph::new(l).block(panel("Server")), area);
     }
 
@@ -174,13 +187,54 @@ impl Ui {
 
     fn draw_memory(&self, f: &mut Frame, area: Rect) {
         let (total, avail) = sys::mem();
-        let block = panel("Memory");
+        let block = panel("Memory · f to free some");
         let inner = block.inner(area);
         f.render_widget(block, area);
         let [gauge, text] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
         let used = 1.0 - avail as f64 / total.max(1) as f64;
         f.render_widget(Gauge::default().ratio(used.clamp(0.0, 1.0)).gauge_style(Style::new().fg(if used > 0.85 { Color::Yellow } else { Color::Green }).bg(Color::Reset)).use_unicode(true).label(format!("{} free of {}", human(avail), human(total))), gauge);
-        f.render_widget(Paragraph::new(dim(format!("kept free for the desktop: {:.1} GiB · GPU heap: {}", self.cfg.server.mem_reserve_gib, self.cfg.server.gpu_heap))), text);
+        let c = &self.cfg.server;
+        let gib = |g: f64| (g * (1u64 << 30) as f64) as u64;
+        let vm = sys::muvm_rss();
+        let reserve = gib(c.mem_reserve_gib) + if vm.is_some() { gib(c.vm_reserve_gib) } else { 0 };
+        let stock = crate::compat::gpu_budget();
+        let heap = match c.gpu_heap.trim() {
+            "auto" | "" => format!("auto (stock {}, raised per model)", human(stock)),
+            "stock" => format!("stock {} (50% of RAM)", human(stock)),
+            n => format!("{n} GiB for every model"),
+        };
+        let mut l = vec![
+            kv("For models", &human(avail.saturating_sub(reserve))),
+            kv("Kept free", &format!("{:.1} GiB desktop {} {:.1} GiB VM{}", c.mem_reserve_gib, if vm.is_some() { "+" } else { "(+" }, c.vm_reserve_gib, if vm.is_some() { "" } else { " when it runs)" })),
+            kv("GPU heap", &heap),
+        ];
+        if let Some(rss) = vm {
+            l.push(kv("muvm VM", &format!("running, {}", human(rss))));
+        }
+        let loaded: u64 = self.running().iter().map(|r| r["rss"].as_u64().unwrap_or(0)).sum();
+        if loaded > 0 {
+            l.push(kv("Models use", &human(loaded)));
+        }
+        l.push(dim("Sliders: f here, or Settings → Memory"));
+        f.render_widget(Paragraph::new(l).wrap(ratatui::widgets::Wrap { trim: true }), text);
+    }
+
+    fn draw_backends_summary(&self, f: &mut Frame, area: Rect) {
+        let v = &self.versions;
+        let count = |fmt: crate::models::Format| self.models.iter().filter(|m| m.format == fmt).count();
+        let disk: u64 = self.models.iter().map(|m| m.size).sum();
+        let mlx = match v.mlx_selected.as_str() {
+            "Custom Installer" => format!("Custom {}", v.mlx_legacy.as_deref().unwrap_or("")),
+            "Omarchy package" => format!("package {}", v.mlx_pkg.as_deref().unwrap_or("")),
+            other => other.to_string(),
+        };
+        let l = vec![
+            kv("MLX", &format!("{mlx} · {}", plural(count(crate::models::Format::Mlx), "model"))),
+            kv("GGUF", &format!("{} · {}", if v.llama_path.is_some() { "llama.cpp ready" } else { "llama.cpp not built" }, plural(count(crate::models::Format::Gguf), "model"))),
+            kv("Strata", &format!("{} · {}", if v.strata_engine { "engine built" } else if v.strata_commit.is_some() { "engine not built" } else { "not installed" }, plural(count(crate::models::Format::Strata), "model"))),
+            kv("On disk", &human(disk)),
+        ];
+        f.render_widget(Paragraph::new(l).block(panel("Backends (4) · library")), area);
     }
 
     fn draw_usage(&self, f: &mut Frame, area: Rect) {

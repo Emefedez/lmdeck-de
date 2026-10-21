@@ -238,6 +238,18 @@ async fn async_main(cli: Cli) -> Result<()> {
         Some(Cmd::Grade { goal }) => {
             let ms = models::scan(&cfg);
             let mut v = grade::build(&cfg, &ms);
+            // The planner's decisions when the server runs (the same check a load does).
+            if d.up().await {
+                let mut plans = std::collections::HashMap::new();
+                for m in &ms {
+                    if let Ok(r) = d.http().get(format!("{}/lmdeck/plan?model={}", cfg.base_url(), m.name)).send().await {
+                        if let Ok(p) = r.json::<serde_json::Value>().await {
+                            plans.insert(m.name.clone(), p);
+                        }
+                    }
+                }
+                v.apply_plans(&plans);
+            }
             v.set_goal(grade::GOALS.iter().position(|g| g.0.eq_ignore_ascii_case(&goal)).unwrap_or(0));
             println!("{:<3} {:<48} {:<7} {:>12} {:>5} {:>6} {:>7} {:>5} {:>6} {:<8} {:>5}", "#", "model", "fmt", "params", "bits", "intel", "tok/s", "W", "J/tok", "fit", "score");
             let mark = |s: grade::Src| match s { grade::Src::Measured => " ", grade::Src::User => "*", grade::Src::Estimate => "~" };
@@ -252,7 +264,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     r.bits.map(|b| format!("{b:.1}")).unwrap_or("?".into()), opt(r.intelligence, 0), opt(r.tps, 1), opt(r.watts, 0),
                     r.joules().map(|j| format!("{j:.1}")).unwrap_or("?".into()), r.fit, r.score);
             }
-            println!("~ estimated  * from grades.toml  (blank) measured on this machine");
+            println!("~ estimated  * from grades.toml  (blank) measured on this machine{}", if v.rows.iter().any(|r| !r.planned) { "; fit is an estimate (server not running)" } else { "" });
             Ok(())
         }
         Some(Cmd::Status) => {

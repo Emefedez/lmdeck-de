@@ -45,9 +45,36 @@ impl Ui {
     /// The grader's view of the local models, built when first needed (not on every frame).
     pub(super) fn grade_view(&mut self) -> &mut grade::View {
         if self.grade.is_none() {
-            self.grade = Some(grade::build(&self.cfg, &self.models));
+            let mut g = grade::build(&self.cfg, &self.models);
+            g.apply_plans(&self.plans);
+            self.grade = Some(g);
+            self.request_plans();
         }
         self.grade.as_mut().unwrap()
+    }
+
+    /// Ask the server's planner whether each local model fits now (the check a load runs).
+    fn request_plans(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return; // drawn outside the TUI's runtime (tests)
+        }
+        let (d, tx, base) = (self.d.clone(), self.tx.clone(), self.cfg.base_url());
+        let names: Vec<String> = self.models.iter().map(|m| m.name.clone()).collect();
+        tokio::spawn(async move {
+            if !d.up().await {
+                return;
+            }
+            let mut out = std::collections::HashMap::new();
+            for n in names {
+                let url = format!("{base}/lmdeck/plan?model={n}");
+                if let Ok(r) = d.http().get(url).send().await {
+                    if let Ok(v) = r.json::<serde_json::Value>().await {
+                        out.insert(n, v);
+                    }
+                }
+            }
+            let _ = tx.send(super::Msg::Plans(out));
+        });
     }
 
     /// Indexes into `self.models` in display order.
@@ -64,7 +91,15 @@ impl Ui {
             Sort::Size => idx.sort_by(|&a, &b| self.models[b].size.cmp(&self.models[a].size)),
             Sort::Newest => idx.sort_by(|&a, &b| self.models[b].modified.cmp(&self.models[a].modified)),
         }
+        // Favourites first (the sort is stable); the recommendation keeps its own order.
+        if self.sort != Sort::Recommended {
+            idx.sort_by_key(|&i| !self.is_favorite(&self.models[i].name));
+        }
         idx
+    }
+
+    fn is_favorite(&self, name: &str) -> bool {
+        self.cfg.ui.favorites.iter().any(|f| f == name)
     }
 
     pub(super) fn selected_model(&self) -> Option<&LocalModel> {
@@ -84,6 +119,7 @@ impl Ui {
         vec![
             Act::new(KeyCode::Enter, if loaded { "Unload" } else { "Load" }).or(KeyCode::Char('l')).when(m.is_some(), none),
             Act::new(KeyCode::Char('c'), "Chat").when(m.is_some(), none),
+            Act::new(KeyCode::Char('f'), if m.is_some_and(|m| self.is_favorite(&m.name)) { "Unfavourite" } else { "Favourite" }).when(m.is_some(), none),
             Act::new(KeyCode::Char('e'), "Model settings").when(m.is_some(), none),
             Act::new(KeyCode::Char('m'), "Make room").when(m.is_some(), none).when(!fits, "it fits in free memory now"),
             Act::new(KeyCode::Char('d'), "Delete").or(KeyCode::Delete).when(m.is_some(), none).when(!loaded, "unload it first"),
@@ -114,6 +150,24 @@ impl Ui {
             KeyCode::Char('c') => {
                 let exe = sys::exe_path().display().to_string();
                 return Some(Action::Exec(format!("chat with {}", m.name), vec![exe, "run".into(), m.name]));
+            }
+            KeyCode::Char('f') => {
+                let fav = self.is_favorite(&m.name);
+                let name = m.name.clone();
+                if self.edit_config("favourites", |c| {
+                    c.ui.favorites.retain(|f| *f != name);
+                    if !fav {
+                        c.ui.favorites.push(name.clone());
+                    }
+                    Ok(())
+                }) {
+                    self.toast(format!("{} {}", m.name, if fav { "is no longer a favourite" } else { "is a favourite (★, listed first)" }));
+                    // Keep the same model selected after the list reorders.
+                    let order = self.models_order();
+                    if let Some(pos) = order.iter().position(|&i| self.models[i].name == m.name) {
+                        self.models_sel.select(Some(pos));
+                    }
+                }
             }
             KeyCode::Char('e') => self.popup = Some(Popup::ModelSettings(m.name, 0)),
             KeyCode::Char('m') => self.open_make_room(m.name),
@@ -219,7 +273,11 @@ impl Ui {
 
     /// Name plus compatibility marker and CPU tag.
     fn model_label(&self, m: &LocalModel, name: String) -> Line<'static> {
-        let mut spans = vec![Span::raw(name)];
+        let mut spans = vec![];
+        if self.is_favorite(&m.name) {
+            spans.push(Span::styled("★ ", Style::new().fg(Color::Yellow)));
+        }
+        spans.push(Span::raw(name));
         if m.format == Format::Mlx {
             let v = crate::compat::assess_mlx(&self.cfg, m.repo.as_deref().unwrap_or(&m.name), m.qmode.as_deref());
             let color = match v.level { "unlikely" => Color::Red, "untested" => Color::Yellow, _ => Color::Green };
@@ -248,9 +306,15 @@ impl Ui {
             None => m.params.clone(),
         };
         l.push(kv("Model", &format!("{} · {} · {}", m.format.as_str(), m.quant, params)));
-        let est = crate::compat::hardware_advice(&self.cfg, m.size, if m.format == Format::Gguf { "gguf" } else { "mlx" });
-        l.push(kv("Size", &if m.format == Format::Strata { format!("{} on disk; experts stream from the SSD", human(m.size)) } else { format!("{} on disk, ~{} in memory", human(m.size), human(est.estimated_bytes)) }));
-        l.push(kv("Fit now", g.map(|g| g.fit).unwrap_or("?")));
+        let plan = self.plans.get(&m.name);
+        let need = plan.and_then(|p| p["gpu_need"].as_u64()).unwrap_or_else(|| crate::compat::hardware_advice(&self.cfg, m.size, if m.format == Format::Gguf { "gguf" } else { "mlx" }).estimated_bytes);
+        l.push(kv("Size", &if m.format == Format::Strata { format!("{} on disk; needs {} in memory, experts stream from the SSD", human(m.size), human(need)) } else { format!("{} on disk, {}{} in memory", human(m.size), if plan.is_some() { "" } else { "~" }, human(need)) }));
+        let fit = match plan {
+            Some(p) if p["ok"].as_bool() == Some(true) => format!("fits ({} available to it)", human(p["ram_available"].as_u64().unwrap_or(0))),
+            Some(p) => p["error"].as_str().unwrap_or("does not fit").to_string(),
+            None => format!("{} (estimate; the server's planner decides when it runs)", g.map(|g| g.fit).unwrap_or("?")),
+        };
+        l.push(kv("Fit now", &fit));
         if let Some(g) = g {
             let est = |s: Src| if s == Src::Measured { "" } else if s == Src::User { " (yours)" } else { " (est.)" };
             let intel = g.intelligence.map(|(v, s)| format!("intel {v:.0}{}", est(s))).unwrap_or_else(|| "intel ?".into());

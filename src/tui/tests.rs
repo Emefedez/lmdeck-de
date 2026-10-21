@@ -229,6 +229,24 @@ fn settings_detail_pane_always_shows_the_selected_setting() {
 }
 
 #[test]
+fn memory_popup_shows_the_sliders_and_what_is_missing() {
+    let mut ui = ui();
+    ui.popup = Some(Popup::free_memory(Some(("org/m".into(), "org/m needs ~18.0 GiB on the GPU, but only 16.5 GiB can be given to it right now".into()))));
+    let text = draw(&mut ui, 120, 40);
+    assert!(text.contains("Desktop reserve") && text.contains("GPU heap"), "{text}");
+    assert!(text.contains("free about 1.5 GiB more"), "{text}");
+}
+
+#[test]
+fn home_shows_reserves_heap_and_residency() {
+    let mut ui = ui();
+    let text = draw(&mut ui, 140, 44);
+    for s in ["Kept free", "GPU heap", "For models", "Residency"] {
+        assert!(text.contains(s), "{s}");
+    }
+}
+
+#[test]
 fn tabs_and_rows_support_the_mouse() {
     let mut ui = ui();
     draw(&mut ui, 120, 36);

@@ -51,6 +51,8 @@ pub struct Row {
     pub watts: Option<(f64, Src)>,
     /// "fits" | "tight" | "too big"
     pub fit: &'static str,
+    /// The fit came from the server's planner (what a load would decide), not the local estimate.
+    pub planned: bool,
     pub score: f64,
 }
 
@@ -76,6 +78,19 @@ impl View {
         self.goal = g.min(GOALS.len() - 1);
         rank(&mut self.rows, self.goal);
         self.sel = 0;
+    }
+    /// Replace the local fit estimates with the planner's decisions (`/lmdeck/plan`): the same
+    /// check a load runs, with the exact weights and the GPU heap it would get.
+    pub fn apply_plans(&mut self, plans: &std::collections::HashMap<String, serde_json::Value>) {
+        for r in &mut self.rows {
+            if let Some(p) = plans.get(&r.name) {
+                r.fit = if p["ok"].as_bool() == Some(true) { "fits" } else { "too big" };
+                r.planned = true;
+            }
+        }
+        let sel = self.rows.get(self.sel).map(|r| r.name.clone());
+        rank(&mut self.rows, self.goal);
+        self.sel = sel.and_then(|n| self.rows.iter().position(|r| r.name == n)).unwrap_or(0);
     }
     pub fn next_goal(&mut self, d: i32) {
         let n = GOALS.len() as i32;
@@ -114,17 +129,22 @@ fn row(cfg: &Config, m: &LocalModel, perf: Option<&Perf>, user: Option<f64>) -> 
         tps: perf.filter(|p| p.gen_tps > 0.0).map(|p| (p.gen_tps, Src::Measured)),
         watts: perf.filter(|p| p.watts > 0.0).map(|p| (p.watts, Src::Measured)),
         fit: fit(cfg, m),
+        planned: false,
         score: 0.0,
     }
 }
 
-/// Size-based intelligence estimate, 0-100: the geometric mean of total and active parameters
-/// (a mixture of experts counts for less than its total), on a log scale (1000B = 100), lowered
-/// for quantizations under 4 bits per weight. It cannot tell model generations or training
-/// apart: put real scores in grades.toml for that.
+/// Size-based intelligence estimate, 0-100: effective parameters total^0.7 x active^0.3 (a
+/// mixture of experts counts for less than its total, but for more than its active part), on a
+/// log scale (1000B = 100), lowered for quantizations under 4 bits per weight, less so for big
+/// models (they lose less to quantization). It cannot tell model generations or training apart:
+/// put real scores in grades.toml for that. Checked only for ordering: it ranks a 125B-A6.6B MoE
+/// above a 27B dense model, that above a 35B-A3B MoE, then 4B, then 0.6B, the order public
+/// benchmark indexes give the Qwen3.x models of those shapes.
 pub fn size_estimate(total_b: f64, active_b: f64, bits: f64) -> f64 {
-    let eff = (total_b * active_b.min(total_b)).sqrt();
-    100.0 * quant_factor(bits) * (1.0 + eff).ln() / 1001f64.ln()
+    let eff = total_b.powf(0.7) * active_b.min(total_b).powf(0.3);
+    let loss = (1.0 - quant_factor(bits)) * (30.0 / eff.max(1e-3)).sqrt().clamp(0.3, 1.0);
+    100.0 * (1.0 - loss) * (1.0 + eff).ln() / 1001f64.ln()
 }
 
 fn quant_factor(bits: f64) -> f64 {
@@ -189,13 +209,13 @@ fn median(v: &mut [f64]) -> Option<f64> {
     Some(v[v.len() / 2])
 }
 
-/// Score = weighted geometric mean of each metric relative to the best row. Speed counts with
-/// diminishing returns (ln(1 + tok/s / 5): past reading speed, more matters less). A missing
-/// metric counts as half the best; rows that do not fit now go last.
+/// Score = weighted geometric mean of each metric relative to the best row. Speed counts as a
+/// utility that saturates, 1 - e^(-tok/s / 15): ~12 tok/s is half of it, and past ~30 tok/s more
+/// speed adds little. A missing metric counts as half the best; rows that do not fit go last.
 fn rank(rows: &mut [Row], goal: usize) {
     let w = GOALS[goal].1;
     let best = |f: &dyn Fn(&Row) -> Option<f64>| rows.iter().filter_map(f).fold(0.0f64, f64::max);
-    let speed = |r: &Row| r.tps.map(|t| (1.0 + t.0 / 5.0).ln());
+    let speed = |r: &Row| r.tps.map(|t| 1.0 - (-t.0 / 15.0).exp());
     let metrics: [&dyn Fn(&Row) -> Option<f64>; 3] = [
         &|r| r.intelligence.map(|i| i.0),
         &speed,
@@ -214,6 +234,7 @@ fn rank(rows: &mut [Row], goal: usize) {
     rows.sort_by(|a, b| order(a).cmp(&order(b)).then(b.score.total_cmp(&a.score)));
 }
 
+/// The local estimate, used until (or unless) the server's planner answers.
 fn fit(cfg: &Config, m: &LocalModel) -> &'static str {
     match m.format {
         Format::Strata => {
@@ -368,6 +389,9 @@ mod tests {
         assert!(size_estimate(27.0, 27.0, 2.0) < dense27);
         assert!(size_estimate(35.0, 3.0, 4.0) < size_estimate(35.0, 35.0, 4.0));
         assert!((0.0..=100.0).contains(&size_estimate(1000.0, 1000.0, 16.0)));
+        // Shapes of the Qwen3.x family: 125B-A6.6B (2-bit) > 27B > 35B-A3B > 4B > 0.6B.
+        let moe125 = size_estimate(125.0, 6.6, 2.0);
+        assert!(moe125 > dense27 && dense27 > size_estimate(35.0, 3.0, 4.0) && size_estimate(35.0, 3.0, 4.0) > dense4);
     }
 
     #[test]
@@ -399,6 +423,7 @@ mod tests {
             tps: Some((t, Src::Measured)),
             watts: Some((30.0, Src::Measured)),
             fit,
+            planned: false,
             score: 0.0,
         };
         let mut rows = vec![r("small", 20.0, 100.0, "fits"), r("big", 50.0, 10.0, "fits"), r("huge", 60.0, 5.0, "too big")];

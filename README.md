@@ -44,8 +44,8 @@ and `?` lists the keys of the screen you are on.
 
 | Screen | For |
 |---|---|
-| 1 Home | Server on/off, what is loaded, memory, the last request's speed, downloads |
-| 2 Models | Local models with fit, grade and details; load, chat, per-model settings, make room, delete |
+| 1 Home | Server on/off, what is loaded, memory (free, kept free, GPU heap, what models can use), backends, usage, downloads; `f` opens the memory manager (reserve and heap sliders, processes, make room) |
+| 2 Models | Local models with fit (the server's planner decides), grade and details; favourites (`f`, listed first), load, chat, per-model settings, make room, delete |
 | 3 Get models | The omarchy-mlx catalog and a Hugging Face search, with a memory estimate and fit for each variant |
 | 4 Backends | MLX, GGUF and Strata: state, and actions that show their plan and ask before they run |
 | 5 Settings | Every setting, with its description, default and when a change applies |
@@ -67,7 +67,8 @@ Nothing polls, and no model names are hardcoded:
 - **Speed**: decode tok/s measured by lmdeck as you use a model. Unmeasured models get an estimate from the
   weights they read per token, calibrated on the ones you have measured.
 - **Power**: the SMC's total system power, sampled only while a request is being served, which gives J/token.
-- **Fit**: does the model fit in free memory right now.
+- **Fit**: the server's planner answers, which is the same check a load runs. Without the server, a rough estimate
+  stands in, and it is marked as one.
 
 Details and the formula are in [docs/REFERENCE.md](docs/REFERENCE.md#model-grader).
 

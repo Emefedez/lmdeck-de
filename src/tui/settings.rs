@@ -168,7 +168,7 @@ impl Ui {
 }
 
 /// The next value of a GiB slider, or None at its end.
-fn gib_step(key: &str, cur: &str, dir: i32) -> Option<String> {
+pub(super) fn gib_step(key: &str, cur: &str, dir: i32) -> Option<String> {
     let step = 0.5 * dir as f64;
     match key {
         "server.mem_reserve_gib" => Some(format!("{:.1}", (cur.parse::<f64>().ok()? + step).clamp(0.5, 8.0))),

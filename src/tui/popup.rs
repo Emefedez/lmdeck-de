@@ -376,6 +376,19 @@ impl Ui {
                 return None;
             }
             KeyCode::Char('r') => groups = sys::proc_groups(uid, ctx.is_some()),
+            // The sliders: desktop reserve [ ], VM reserve { }, GPU heap - +
+            KeyCode::Char(ch @ ('[' | ']' | '{' | '}' | '-' | '+' | '=')) => {
+                let key = match ch {
+                    '[' | ']' => "server.mem_reserve_gib",
+                    '{' | '}' => "server.vm_reserve_gib",
+                    _ => "server.gpu_heap",
+                };
+                let dir = if matches!(ch, ']' | '}' | '+' | '=') { 1 } else { -1 };
+                let cur = crate::config::get_setting(&self.cfg, key);
+                if let Some(next) = super::settings::gib_step(key, &cur, dir) {
+                    self.edit_config(key, |c| set_setting(c, key, &next));
+                }
+            }
             KeyCode::Enter | KeyCode::Char('X') => {
                 if let Some(g) = groups.get(sel).cloned() {
                     if g.tweak.is_some_and(|(id, _)| id == "preset") {
@@ -625,7 +638,7 @@ impl Ui {
         let Some(Popup::Free { groups, sel, ctx }) = &self.popup else { return };
         let (total, avail) = sys::mem();
         let a = f.area();
-        let r = centered(a, a.width.saturating_sub(4).min(92), (groups.len() as u16 + 8).max(10));
+        let r = centered(a, a.width.saturating_sub(4).min(96), (groups.len() as u16 + 13).max(16));
         f.render_widget(Clear, r);
         let title = match ctx {
             Some((m, _)) => format!("Free memory for {m} · {} free of {}", fmt_gib(avail), fmt_gib(total)),
@@ -634,11 +647,29 @@ impl Ui {
         let block = panel(&title);
         let inner = block.inner(r);
         f.render_widget(block, r);
-        let headline = ctx.as_ref().map(|(_, why)| why.clone());
-        let [head, list, help] = Layout::vertical([Constraint::Length(if headline.is_some() { 2 } else { 0 }), Constraint::Min(1), Constraint::Length(2)]).areas(inner);
+        // "needs ~X GiB ... but only Y" from the planner: how much more to free.
+        let headline = ctx.as_ref().map(|(_, why)| {
+            let num = |key: &str| why.split(key).nth(1).and_then(|r| r.split_whitespace().next()).and_then(|v| v.trim_end_matches(',').parse::<f64>().ok());
+            match (num("needs ~"), num("but only ")) {
+                (Some(need), Some(cap)) => format!("Needs ~{need:.1} GiB, only {cap:.1} GiB available to it: free about {:.1} GiB more, then press l. ({why})", (need - cap).max(0.0)),
+                _ => why.clone(),
+            }
+        });
+        let bar = |v: f64, max: f64| {
+            let n = ((v / max) * 20.0).round().clamp(0.0, 20.0) as usize;
+            format!("{}{}", "█".repeat(n), "░".repeat(20 - n))
+        };
+        let c = &self.cfg.server;
+        let sliders = vec![
+            Line::from(vec![Span::styled("Desktop reserve ", Style::new().fg(Color::DarkGray)), Span::raw(format!("{} {:.1} GiB  ", bar(c.mem_reserve_gib, 8.0), c.mem_reserve_gib)), Span::styled("[ less  ] more", Style::new().fg(Color::Cyan))]),
+            Line::from(vec![Span::styled("VM reserve      ", Style::new().fg(Color::DarkGray)), Span::raw(format!("{} {:.1} GiB  ", bar(c.vm_reserve_gib, 8.0), c.vm_reserve_gib)), Span::styled("{ less  } more", Style::new().fg(Color::Cyan)), Span::styled("  (only while the VM runs)", Style::new().fg(Color::DarkGray))]),
+            Line::from(vec![Span::styled("GPU heap        ", Style::new().fg(Color::DarkGray)), Span::raw(format!("{}  ", c.gpu_heap)), Span::styled("- less  + more", Style::new().fg(Color::Cyan)), Span::styled("  (auto = raised per model as needed)", Style::new().fg(Color::DarkGray))]),
+        ];
+        let [head, slide, list, help] = Layout::vertical([Constraint::Length(if headline.is_some() { 3 } else { 0 }), Constraint::Length(4), Constraint::Min(1), Constraint::Length(2)]).areas(inner);
         if let Some(h) = headline {
             f.render_widget(Paragraph::new(h).fg(Color::Yellow).wrap(Wrap { trim: true }), head);
         }
+        f.render_widget(Paragraph::new(sliders), slide);
         let rows = list.height as usize;
         let start = sel.saturating_sub(rows.saturating_sub(1));
         let lines: Vec<Line> = groups.iter().enumerate().skip(start).take(rows).map(|(i, g)| {
@@ -658,7 +689,7 @@ impl Ui {
         }).collect();
         f.render_widget(Paragraph::new(lines), list);
         let hint = groups.get(*sel).and_then(|g| g.tweak.map(|(_, d)| d.to_string()).or(g.protected.map(|p| format!("protected: {p}")))).unwrap_or_default();
-        let keys = if ctx.is_some() { "Enter quit it / run it · X kill · p make room automatically · l try loading again · r refresh · Esc" } else { "Enter quit it (SIGTERM) · X kill (SIGKILL) · r refresh · Esc" };
+        let keys = if ctx.is_some() { "Enter quit it / run it · X kill · [ ] { } - + sliders · p make room automatically · l try loading again · r refresh · Esc" } else { "Enter quit it (SIGTERM) · X kill (SIGKILL) · [ ] { } - + sliders · r refresh · Esc" };
         f.render_widget(Paragraph::new(vec![Line::raw(hint), dim(keys)]).wrap(Wrap { trim: true }), help);
     }
 }

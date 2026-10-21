@@ -152,13 +152,13 @@ models. The grade is computed when you ask, from:
 
 | Column | Source | Marked |
 |---|---|---|
-| Intel | `~/.config/lmdeck/grades.toml` if it has the model, else an estimate: 100 x q(bits) x ln(1 + √(total x active)) / ln(1001), with parameters in billions from config.json, the GGUF metadata or the name (`A3B`), and q = 1 at 4+ bits, 0.93 at 3, 0.85 at 2, 0.75 at 1.58 | `*` yours, `~` estimate |
+| Intel | `~/.config/lmdeck/grades.toml` if it has the model, else an estimate: 100 x (1 - loss) x ln(1 + eff) / ln(1001), with eff = total^0.7 x active^0.3 (parameters in billions, from config.json, the GGUF metadata or the name, e.g. `A3B`) and the quantization loss 1 - q(bits) (q = 1 at 4+ bits, 0.93 at 3, 0.85 at 2, 0.75 at 1.58) scaled by √(30 / eff) between 0.3 and 1, since big models lose less. Only the order is meant to be right: 125B-A6.6B > 27B dense > 35B-A3B > 4B > 0.6B, as public indexes rank the Qwen3.x models of those shapes | `*` yours, `~` estimate |
 | tok/s | measured: a moving average of decode speed over requests that generated 32+ tokens. Otherwise an estimate: 1 / (active bytes / bandwidth + 4.7 ms), with the bandwidth fitted to your measured MLX/GGUF models (190 GB/s until one is measured, which fits the M1 Max runs in RESULTS.md). Strata only gets measured numbers | `~` estimate |
 | W, J/tok | the SMC's Total System Power, sampled every 2 s only while a request is served, averaged over each generation. Unmeasured models get the median of the measured ones | `~` estimate |
-| Fit | free memory now against the planner's estimate | |
+| Fit | the server's planner (`/lmdeck/plan`, the check a load runs: exact weights, attention cache, GPU heap); a rough estimate only when the server is down | |
 
 Score = the weighted geometric mean of each metric relative to the best model in the list. Speed counts as
-ln(1 + tok/s / 5), so past reading speed more speed matters less. A missing metric counts as half the best. Models
+1 - e^(-tok/s / 15): about 12 tok/s is half of it, and past ~30 tok/s more speed adds little. A missing metric counts as half the best. Models
 that do not fit right now go last. The weights for intelligence / speed / efficiency are: Balanced 0.5 / 0.3 /
 0.2, Smartest 0.8 / 0.2 / 0, Fastest 0.3 / 0.7 / 0, Efficient 0.4 / 0.1 / 0.5.
 

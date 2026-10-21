@@ -83,6 +83,8 @@ enum Msg {
     NeedMemory(String, String),
     /// Memory preset finished: load this model now.
     RetryLoad(String),
+    /// The planner's decision for each local model (`/lmdeck/plan`).
+    Plans(std::collections::HashMap<String, Value>),
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +126,8 @@ struct Ui {
     models_sel: TableState,
     sort: models::Sort,
     grade: Option<crate::grade::View>,
+    /// The planner's last decision per model; the grade's Fit and the detail pane use it.
+    plans: std::collections::HashMap<String, Value>,
     // Get models
     query: String,
     search_kind: usize,
@@ -277,6 +281,7 @@ impl Ui {
             models_sel: TableState::default().with_selected(Some(0)),
             sort: models::Sort::Recommended,
             grade: None,
+            plans: Default::default(),
             query: String::new(),
             search_kind: 0,
             search_budget: None,
@@ -419,13 +424,23 @@ impl Ui {
             }
             Msg::Resize => {}
             Msg::Status(s) => {
-                // Rescan models when a download finishes.
+                // Rescan models when a download finishes; re-plan when what is loaded changes.
                 let was = widgets::active_downloads(&self.status).len();
                 let now = widgets::active_downloads(&s).len();
+                let names = |s: &Option<Value>| s.as_ref().and_then(|s| s["running"].as_array().cloned()).unwrap_or_default().iter().filter_map(|r| r["name"].as_str().map(str::to_string)).collect::<Vec<_>>();
+                let reloaded = names(&self.status) != names(&s) || self.status.is_some() != s.is_some();
                 self.status = s;
                 if now < was {
                     self.rescan();
+                } else if reloaded {
+                    self.grade = None;
                 }
+            }
+            Msg::Plans(p) => {
+                if let Some(g) = &mut self.grade {
+                    g.apply_plans(&p);
+                }
+                self.plans = p;
             }
             Msg::Versions(v) => self.versions = *v,
             Msg::Search(generation, r) => self.search_done(generation, r),
