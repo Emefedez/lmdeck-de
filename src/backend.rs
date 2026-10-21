@@ -644,7 +644,7 @@ impl Manager {
             }
             Format::Gguf => {
                 let bin = cfg.llama_server().ok_or_else(|| {
-                    anyhow!("llama-server not found: build it from the lmdeck Dashboard (key b) or `lmdeck llama build`")
+                    anyhow!("llama-server not found: build it in lmdeck: Backends → Build llama.cpp, or `lmdeck llama build`")
                 })?;
                 let ctx = ov.ctx_size.unwrap_or(cfg.llama.ctx_size);
                 let mut a = vec![
@@ -694,7 +694,7 @@ impl Manager {
                 let dir = cfg.strata.dir();
                 let python = dir.join(".venv/bin/python");
                 if !python.exists() || !dir.join("serve/server.py").exists() {
-                    bail!("Strata is not installed: Dashboard → T (or `lmdeck strata install`) sets it up in {}", dir.display());
+                    bail!("Strata is not installed: Backends → Install Strata (or `lmdeck strata install`) sets it up in {}", dir.display());
                 }
                 let mock = cfg.strata.engine == "mock";
                 if !mock {
@@ -703,7 +703,7 @@ impl Manager {
                     let exe = run["exe"].as_str().unwrap_or("");
                     if exe.is_empty() || !std::path::Path::new(exe).exists() {
                         bail!(
-                            "{}: the Strata engine is not built ({}): Dashboard → T (or `lmdeck strata install`) builds it; nothing was loaded",
+                            "{}: the Strata engine is not built ({}): Backends → Update Strata (or `lmdeck strata install`) builds it; nothing was loaded",
                             m.name, if exe.is_empty() { "the run config names no engine" } else { exe }
                         );
                     }

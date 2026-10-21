@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 
 #[derive(Parser)]
-#[command(name = "lmdeck", version, about = "Local model deck for Omarchy: MLX on the Apple GPU + GGUF via llama.cpp, Ollama/OpenAI compatible")]
+#[command(name = "lmdeck", version, about = "Local models on Asahi Linux: MLX, GGUF and Strata on the Apple GPU; TUI + Ollama/OpenAI/Anthropic-compatible server")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,

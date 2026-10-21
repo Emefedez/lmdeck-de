@@ -1,5 +1,5 @@
 [package]
-description = "Local model deck for Omarchy: MLX on the Apple GPU + GGUF via llama.cpp, Ollama/OpenAI compatible"
+description = "Local models on Asahi Linux: MLX, GGUF (llama.cpp) and Strata on the Apple GPU; TUI + Ollama/OpenAI/Anthropic-compatible server"
 license = "MIT"
 name = "lmdeck"
 version = "0.1.0"
