@@ -12,7 +12,7 @@ wait comparable to the MLX models and a context large enough for real files: 32k
 | | Now | Why |
 |---|---|---|
 | Decode | 11-13 tok/s | experts streamed from the SSD, 8-12 GB arena |
-| Prompt reading | ~10 tok/s | prompts go through decode windows (`STRATA_METAL_PROMPT_GEMM=0`) |
+| Prompt reading | 14.7 tok/s off, 134.7 on (10,609 tokens, 2026-10-22) | prompts go through decode windows (`STRATA_METAL_PROMPT_GEMM=0`); the chunked path is measured, 9.2x, and stays off until the 10x target |
 | A Copilot Fix request | tens of thousands of tokens before trimming; ~33k refused at the 32k window | Copilot sends its system prompt, every tool (MCP included) and the file context |
 | Repeated requests | each one read from the start | the shared start (system prompt + tools) is not reused |
 | Context | 32k (the run config's `--max-context`) | never measured higher on Asahi |
@@ -30,29 +30,34 @@ causes: the speed of reading, what is re-read, and how much is sent.
    whether it counts the arena fill since start or real per-request reads. If it is per request, it is a bug to fix
    before anything else (it would cap prompt speed far below the SSD).
 
+**Resolved 2026-10-22:** it is per request. `generate.cpp` samples the process's `/proc` I/O since the previous
+request; the 10k-token decode-window run really read 1.33 TB, and the chunked path read 102 GB. No counter bug.
+
 Output: the real request sizes and the current costs, in docs/RESULTS.md.
 
 ## Part 1: the prompt path on (strata-asahi)
 
 The kernels are ported and pass parity (prompt, gdn_prompt, qsa_prompt, dense_mm, moe_mm). What remains:
 
-1. **First end-to-end run.** Steps in strata-asahi's `vulkan/README.md` ("Trying the prompt path"). Compare against
-   the decode-window path on the same prompt: prompt tok/s, first-token time, and the answer (greedy, should agree
-   for the first tokens; fp16 operands differ slightly from the window's).
-2. **Breakdown.** `STRATA_VK_TIMING=1`: GPU time per chunk against SSD time per chunk. Expected bound: one pass over
-   the layer's missing experts per chunk, ~26 GB at ~7 GB/s, about 4 s a 1024-row chunk, so a ceiling in the low
-   hundreds of tok/s (estimate, not measured).
-3. **Tune the chunk.** `STRATA_METAL_PROMPT_CHUNK` 1024 / 2048 / 4096: a longer chunk makes fewer passes over the
-   experts but its buffers come out of the expert arena (4.3 GB at 4096 on the Mac). Pick by prompt tok/s and by the
-   decode speed that remains.
-4. **GPU sharing.** A chunk is submitted part by part (per layer), so the desktop keeps the GPU between parts. Check
-   the longest single part while the desktop is in use; if a part holds the GPU too long, split it (per GEMM).
-5. **Defaults.** Once it is right: `setup_asahi.py` stops writing `STRATA_METAL_PROMPT_GEMM=0`; lmdeck gets a setting
-   `strata.prompt_path` (on / off, default on after validation) that sets the variable for the engine, so it can be
-   turned off without editing the run config.
+1. **First end-to-end run: done 2026-10-22.** 10,609 tokens on the live model, Q2_0, arena ~13.0 GB: 722.8 s
+   (14.7 tok/s) through decode windows, 78.7 s (134.7 tok/s) with the chunked path at 4096, 9.2x. The reasoning and
+   the 163-token greedy answer are identical; decode is unchanged (12.6 -> 12.5 tok/s). The results table is in
+   strata-asahi's `vulkan/RESULTS.md`, and RESULTS.md above.
+2. **Breakdown: partly done.** `STRATA_METAL_TRACE=1` (not `STRATA_VK_TIMING`) prints a time per chunk: 8.6-8.9 s a
+   1024-row chunk, 15.3 s a 2048-row chunk, and 6.9-7.2 s for the last 364 rows whatever the chunk size. The fixed
+   ~6-7 s a chunk is the pass over the layer's missed experts, close to the 4 s estimate; the marginal cost is
+   ~3-5 ms a row.
+3. **Tune the chunk: done for prompt speed.** 1024 / 2048 / 4096 on the 10k prompt: 109.0 / 123.8 / 134.7 tok/s
+   (7.4x / 8.4x / 9.2x); the chunk buffers take 1.60 / 2.55 / 4.46 GB of the arena. 2048 leaves ~10.4 GB of decode
+   cache, 4096 ~8.5 GB, so 2048 is the better balance on 32 GB and 4096 the fastest. The decode loss at 4096 was not
+   measured beyond the 163-token answer; the arena shrank accordingly.
+4. **GPU sharing.** A chunk is submitted part by part (per layer), so the desktop keeps the GPU between parts. The
+   longest single part while the desktop is in use was not timed.
+5. **Defaults.** `lmdeck` now has the `strata.prompt_path` setting and Settings slider (off/1024/2048/4096 with star ratings for speed, usability and noise & heat; defaults to `off` until 10x target / desktop sharing is validated); `setup_asahi.py` still writes `STRATA_METAL_PROMPT_GEMM=0`.
 
 Done when: a 10k-token prompt is read at least 10x faster than today with the same first answer tokens, and the
-desktop stays responsive during it.
+desktop stays responsive during it. Measured: 9.2x (134.7 vs 14.7 tok/s) with the same answer, so the speed target
+is not met yet.
 
 ## Part 2: reuse the shared start of each request (lmdeck + strata-asahi)
 

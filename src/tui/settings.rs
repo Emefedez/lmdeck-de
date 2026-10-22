@@ -25,13 +25,13 @@ impl Ui {
         let default = get_setting(&Config::default(), s.key);
         let enter = match s.kind {
             Kind::Bool => if value == "true" { "Turn off" } else { "Turn on" },
-            Kind::Choice(_) => "Next value",
+            Kind::Choice(_) | Kind::PromptChunk => "Next value",
             Kind::Prompt => "Open in your editor",
             _ => "Edit",
         };
         let mut acts = vec![
             Act::new(KeyCode::Enter, enter),
-            Act::new(KeyCode::Right, "Change").or(KeyCode::Left).hint("←/→").when(matches!(s.kind, Kind::Bool | Kind::Choice(_) | Kind::Gib), "only on/off, choices and GiB sliders change with ←/→; Enter edits"),
+            Act::new(KeyCode::Right, "Change").or(KeyCode::Left).hint("←/→").when(matches!(s.kind, Kind::Bool | Kind::Choice(_) | Kind::Gib | Kind::PromptChunk), "only on/off, choices and sliders change with ←/→; Enter edits"),
             Act::new(KeyCode::Char('r'), "Reset to default").when(value != default && s.kind != Kind::Prompt, "already the default"),
             Act::new(KeyCode::Char('o'), "Open config.toml"),
         ];
@@ -48,6 +48,11 @@ impl Ui {
         match key {
             KeyCode::Enter => match s.kind {
                 Kind::Bool | Kind::Choice(_) => self.step_setting(s.key, 1),
+                Kind::PromptChunk => {
+                    let cur = get_setting(&self.cfg, s.key);
+                    let next = crate::config::prompt_chunk_cycle(&cur);
+                    self.edit_config(s.key, |c| set_setting(c, s.key, next));
+                }
                 Kind::Prompt => return self.edit_backend_prompt(s.key),
                 _ => self.popup = Some(Popup::text(format!("{}: {}", s.key, s.help), get_setting(&self.cfg, s.key), Submit::Setting(s.key))),
             },
@@ -84,6 +89,7 @@ impl Ui {
                 Some(v) => v,
                 None => return,
             },
+            Kind::PromptChunk => crate::config::prompt_chunk_step(&cur, dir).to_string(),
             _ => return,
         };
         self.edit_config(key, |c| set_setting(c, key, &next));
@@ -138,7 +144,7 @@ impl Ui {
                     .exists()
                     .then(|| "file".to_string())
                     .unwrap_or_else(|| "none".into()),
-                Kind::Gib | Kind::Choice(_) | Kind::Bool => format!("◂ {value} ▸"),
+                Kind::Gib | Kind::Choice(_) | Kind::Bool | Kind::PromptChunk => format!("◂ {value} ▸"),
                 _ => value.clone(),
             };
             let changed = value != get_setting(&Config::default(), s.key);
@@ -166,9 +172,71 @@ impl Ui {
         l.push(kv("Default", if default.is_empty() { "(empty)" } else { &default }));
         if let Kind::Choice(opts) = s.kind {
             l.push(kv("Choices", &opts.join(" / ")));
+        } else if s.kind == Kind::PromptChunk {
+            l.push(kv("Choices", &crate::config::STRATA_PROMPT_CHUNKS.join(" / ")));
         }
         l.push(kv("Applies", applies(s.key)));
         l.push(Line::raw(""));
+
+        if s.key == "strata.prompt_path" {
+            let val = get_setting(&self.cfg, s.key);
+            let mut track = vec![Span::styled("Chunk slider:  ", Style::new().fg(Color::Cyan))];
+            for (i, &chunk) in crate::config::STRATA_PROMPT_CHUNKS.iter().enumerate() {
+                if i > 0 {
+                    track.push(Span::styled(" ── ", Style::new().fg(Color::DarkGray)));
+                }
+                if chunk == val {
+                    track.push(Span::styled(format!("▶ {chunk} ◀"), Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+                } else {
+                    track.push(Span::styled(format!("[{chunk}]"), Style::new().fg(Color::DarkGray)));
+                }
+            }
+            l.push(Line::from(track));
+            l.push(Line::raw(""));
+
+            if let Some(m) = crate::config::strata_prompt_metrics(&val) {
+                let make_stars = |stars: u8| -> (String, String) {
+                    ("★".repeat(stars as usize), "☆".repeat(5usize.saturating_sub(stars as usize)))
+                };
+
+                let (s_f, s_e) = make_stars(m.speed_stars());
+                let (u_f, u_e) = make_stars(m.usability_stars());
+                let (n_f, n_e) = make_stars(m.noise_heat_stars());
+
+                let speed_desc = format!("{:.1} tok/s ({:.1}x, {:.1} s)", m.tok_s, m.speedup, m.read_s);
+                let usability_desc = format!("{:.1} GB decode cache ({:.2} GB buffer)", m.decode_cache_gib, m.buffer_gib);
+                let noise_desc = match m.mode {
+                    "off" => "Cool & quiet (SSD streaming)",
+                    "1024" => "Light heat & fan",
+                    "2048" => "Balanced power & heat (best on 32 GB)",
+                    "4096" => "Higher power & fan (GPU matrix units saturated)",
+                    _ => "",
+                };
+
+                l.push(Line::from(vec![
+                    Span::styled("Speed:        ", Style::new().fg(Color::Cyan)),
+                    Span::styled(s_f, Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(s_e, Style::new().fg(Color::DarkGray)),
+                    Span::raw(format!("  {speed_desc}")),
+                ]));
+                l.push(Line::from(vec![
+                    Span::styled("Usability:    ", Style::new().fg(Color::Cyan)),
+                    Span::styled(u_f, Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(u_e, Style::new().fg(Color::DarkGray)),
+                    Span::raw(format!("  {usability_desc}")),
+                ]));
+                l.push(Line::from(vec![
+                    Span::styled("Noise & heat: ", Style::new().fg(Color::Cyan)),
+                    Span::styled(n_f, Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(n_e, Style::new().fg(Color::DarkGray)),
+                    Span::raw(format!("  {noise_desc}")),
+                ]));
+                l.push(Line::raw(""));
+                l.push(Span::styled(format!("Note: {}", m.note), Style::new().fg(Color::White)).into());
+                l.push(dim("Bench: 10,609-token prompt, Q2_0, ~13 GB arena on M1 Max."));
+                l.push(Line::raw(""));
+            }
+        }
         l.push(dim(format!("Saved to {}; only this key is rewritten.", super::widgets::tilde(&crate::config::config_path().display().to_string()))));
         f.render_widget(Paragraph::new(l).wrap(Wrap { trim: false }).block(panel("About this setting")), detail);
     }
@@ -204,5 +272,65 @@ mod tests {
         assert_eq!(super::gib_step("server.mem_reserve_gib", "1.5", 1).as_deref(), Some("2.0"));
         assert_eq!(super::gib_step("server.mem_reserve_gib", "0.5", -1).as_deref(), Some("0.5"));
         assert_eq!(super::gib_step("server.gpu_heap", "4.0", -1).as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn prompt_chunk_slider_steps_and_clamps() {
+        use crate::config::prompt_chunk_step;
+        assert_eq!(prompt_chunk_step("off", -1), "off");
+        assert_eq!(prompt_chunk_step("off", 1), "1024");
+        assert_eq!(prompt_chunk_step("1024", -1), "off");
+        assert_eq!(prompt_chunk_step("1024", 1), "2048");
+        assert_eq!(prompt_chunk_step("2048", -1), "1024");
+        assert_eq!(prompt_chunk_step("2048", 1), "4096");
+        assert_eq!(prompt_chunk_step("4096", -1), "2048");
+        assert_eq!(prompt_chunk_step("4096", 1), "4096");
+    }
+
+    #[test]
+    fn prompt_chunk_cycles() {
+        use crate::config::prompt_chunk_cycle;
+        assert_eq!(prompt_chunk_cycle("off"), "1024");
+        assert_eq!(prompt_chunk_cycle("1024"), "2048");
+        assert_eq!(prompt_chunk_cycle("2048"), "4096");
+        assert_eq!(prompt_chunk_cycle("4096"), "off");
+    }
+
+    #[test]
+    fn strata_prompt_stars_derived_from_bench() {
+        use crate::config::strata_prompt_metrics;
+        let off = strata_prompt_metrics("off").unwrap();
+        assert_eq!(off.speed_stars(), 1);
+        assert_eq!(off.usability_stars(), 5);
+        assert_eq!(off.noise_heat_stars(), 5);
+
+        let c1024 = strata_prompt_metrics("1024").unwrap();
+        assert_eq!(c1024.speed_stars(), 3);
+        assert_eq!(c1024.usability_stars(), 4);
+        assert_eq!(c1024.noise_heat_stars(), 4);
+
+        let c2048 = strata_prompt_metrics("2048").unwrap();
+        assert_eq!(c2048.speed_stars(), 4);
+        assert_eq!(c2048.usability_stars(), 3);
+        assert_eq!(c2048.noise_heat_stars(), 3);
+
+        let c4096 = strata_prompt_metrics("4096").unwrap();
+        assert_eq!(c4096.speed_stars(), 5);
+        assert_eq!(c4096.usability_stars(), 2);
+        assert_eq!(c4096.noise_heat_stars(), 2);
+    }
+
+    #[test]
+    fn strata_prompt_path_setting_roundtrip() {
+        use crate::config::{get_setting, needs_reload, set_setting, Config};
+        let mut cfg = Config::default();
+        assert_eq!(get_setting(&cfg, "strata.prompt_path"), "off");
+        assert!(needs_reload("strata.prompt_path"));
+
+        assert!(set_setting(&mut cfg, "strata.prompt_path", "2048").is_ok());
+        assert_eq!(get_setting(&cfg, "strata.prompt_path"), "2048");
+        assert_eq!(cfg.strata.prompt_path, "2048");
+
+        assert!(set_setting(&mut cfg, "strata.prompt_path", "invalid").is_err());
     }
 }

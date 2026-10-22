@@ -715,21 +715,36 @@ impl Manager {
                         }
                     }
                 }
-                // A context set in lmdeck (Models → e) replaces the run config's --max-context, in a
-                // copy of the run config: the file itself is not changed.
+                // A context set in lmdeck (Models → e) replaces the run config's --max-context, and
+                // strata.prompt_path configures the prompt path (off or chunk size), in a copy of
+                // the run config: the original run config file is not changed.
                 let mut run_config = m.path.clone();
-                if let Some(ctx) = cfg.overrides.get(&m.name).and_then(|o| o.ctx_size).filter(|c| *c > 0 && !mock) {
+                if !mock {
                     let mut run: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&m.path)?)?;
-                    if let Some(args) = run["args"].as_array_mut() {
-                        match args.iter().position(|a| a == "--max-context") {
-                            Some(i) if i + 1 < args.len() => args[i + 1] = serde_json::json!(ctx.to_string()),
-                            _ => args.extend([serde_json::json!("--max-context"), serde_json::json!(ctx.to_string())]),
+                    let mut modified = false;
+                    if let Some(ctx) = cfg.overrides.get(&m.name).and_then(|o| o.ctx_size).filter(|c| *c > 0) {
+                        if let Some(args) = run["args"].as_array_mut() {
+                            match args.iter().position(|a| a == "--max-context") {
+                                Some(i) if i + 1 < args.len() => args[i + 1] = serde_json::json!(ctx.to_string()),
+                                _ => args.extend([serde_json::json!("--max-context"), serde_json::json!(ctx.to_string())]),
+                            }
+                            modified = true;
+                            sys::log(&format!("{}: --max-context {ctx} (lmdeck override)", m.name));
                         }
                     }
-                    run_config = crate::config::state_dir().join(format!("strata-{port}.run.json"));
-                    std::fs::create_dir_all(crate::config::state_dir())?;
-                    std::fs::write(&run_config, serde_json::to_vec_pretty(&run)?)?;
-                    sys::log(&format!("{}: --max-context {ctx} (lmdeck override)", m.name));
+                    if !run["env"].is_object() {
+                        run["env"] = serde_json::json!({});
+                    }
+                    if let Some(env_obj) = run["env"].as_object_mut() {
+                        apply_strata_prompt_env(env_obj, &cfg.strata.prompt_path);
+                        modified = true;
+                        sys::log(&format!("{}: strata prompt_path {} (lmdeck override)", m.name, cfg.strata.prompt_path));
+                    }
+                    if modified {
+                        run_config = crate::config::state_dir().join(format!("strata-{port}.run.json"));
+                        std::fs::create_dir_all(crate::config::state_dir())?;
+                        std::fs::write(&run_config, serde_json::to_vec_pretty(&run)?)?;
+                    }
                 }
                 let ready = crate::config::state_dir().join(format!("strata-{port}.ready.json"));
                 std::fs::create_dir_all(crate::config::state_dir())?;
@@ -757,6 +772,13 @@ impl Manager {
                 let icd = cfg.strata.vk_icd();
                 if icd.exists() {
                     env.push(("VK_DRIVER_FILES".into(), icd.display().to_string()));
+                }
+                let path_val = cfg.strata.prompt_path.trim();
+                env.retain(|(k, _)| k != "STRATA_METAL_PROMPT_GEMM" && k != "STRATA_METAL_PROMPT_CHUNK");
+                if path_val.is_empty() || path_val == "off" {
+                    env.push(("STRATA_METAL_PROMPT_GEMM".into(), "0".into()));
+                } else {
+                    env.push(("STRATA_METAL_PROMPT_CHUNK".into(), path_val.to_string()));
                 }
                 if let Some(h) = heap {
                     // The arena the engine may fill with experts: the heap planned for it.
@@ -1295,9 +1317,41 @@ fn strata_stage(text: &str) -> (&'static str, f64) {
     best
 }
 
+pub(crate) fn apply_strata_prompt_env(env: &mut serde_json::Map<String, serde_json::Value>, prompt_path: &str) {
+    let path_val = prompt_path.trim();
+    if path_val.is_empty() || path_val == "off" {
+        env.insert("STRATA_METAL_PROMPT_GEMM".into(), serde_json::json!("0"));
+        env.remove("STRATA_METAL_PROMPT_CHUNK");
+    } else {
+        env.remove("STRATA_METAL_PROMPT_GEMM");
+        env.insert("STRATA_METAL_PROMPT_CHUNK".into(), serde_json::json!(path_val));
+    }
+}
+
 #[cfg(test)]
 mod strata_stage_tests {
-    use super::strata_stage;
+    use super::{apply_strata_prompt_env, strata_stage};
+
+    #[test]
+    fn strata_prompt_env_transformation() {
+        let mut env = serde_json::Map::new();
+        env.insert("STRATA_METAL_PROMPT_GEMM".into(), serde_json::json!("0"));
+
+        // Switch to chunk 2048: removes STRATA_METAL_PROMPT_GEMM, sets STRATA_METAL_PROMPT_CHUNK
+        apply_strata_prompt_env(&mut env, "2048");
+        assert!(!env.contains_key("STRATA_METAL_PROMPT_GEMM"));
+        assert_eq!(env.get("STRATA_METAL_PROMPT_CHUNK").and_then(|v| v.as_str()), Some("2048"));
+
+        // Switch to chunk 4096
+        apply_strata_prompt_env(&mut env, "4096");
+        assert!(!env.contains_key("STRATA_METAL_PROMPT_GEMM"));
+        assert_eq!(env.get("STRATA_METAL_PROMPT_CHUNK").and_then(|v| v.as_str()), Some("4096"));
+
+        // Switch back to off
+        apply_strata_prompt_env(&mut env, "off");
+        assert_eq!(env.get("STRATA_METAL_PROMPT_GEMM").and_then(|v| v.as_str()), Some("0"));
+        assert!(!env.contains_key("STRATA_METAL_PROMPT_CHUNK"));
+    }
 
     #[test]
     fn stages_follow_the_engine_log() {

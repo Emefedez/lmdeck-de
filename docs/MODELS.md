@@ -9,8 +9,10 @@ a fixed list. This page says how it checks, and which models have actually been 
   plus runtime overhead) and whether it fits now: fits, tight (needs a raised GPU heap and the free memory for it),
   or too big.
 - **MLX compatibility markers**: ✓ qualified by the omarchy-mlx project on this backend (its catalog, shown under
-  Get models), ? untested, ✗ will not run. lmdeck probes which quantization modes the installed runtime can run on
-  the GPU, and gives a ✗ with a recommended alternative where one is known.
+  Get models), ? untested, ✗ will not run. A checkpoint that is not a standalone chat model (a speculative draft
+  such as DFlash/MTP, a classifier) or whose `model_type` has no implementation in the installed `mlx_lm` is marked
+  ✗ unsupported in search and Models, with the reason in the details pane. lmdeck probes which quantization modes the
+  installed runtime can run on the GPU, and gives a ✗ with a recommended alternative where one is known.
 - **Models** grades what you have downloaded (see the README's grader section).
 
 ## By backend
@@ -33,6 +35,6 @@ to do so (use **Make room** first).
 | mlx-community/Qwen3-4B-Instruct-2507-4bit | MLX | ran, including Claude Code through `/v1/messages` |
 | mlx-community/Qwen3.5-4B-MLX-4bit | MLX | ~52 tok/s; Codex through `/v1/responses` |
 | mlx-community/Qwen3.8-27B-4bit | MLX | 11-13 tok/s; Claude Code with tool groups |
-| strata/q2_0 (Qwen3.8-Flash-Next, Q2_0) | Strata | 12.9-13.3 tok/s on prose, 9.5-11.5 on code |
+| strata/q2_0 (Qwen3.8-Flash-Next, Q2_0) | Strata | 12.9-13.3 tok/s on prose, 9.5-11.5 on code; prompts 14.7 tok/s (134.7 on a 10k prompt with the prompt path on) |
 
 Speeds and their conditions are in [RESULTS.md](RESULTS.md).

@@ -4,11 +4,10 @@ These are untested, so each one comes with the reason to expect it to help.
 
 ## Strata on Vulkan
 
-1. **Turn on the prompt path.** Every prompt-chunk kernel is ported and passes its parity test (`dense_mm`, `moe_mm`,
-   `prompt`, `gdn_prompt`, `qsa_prompt`; 4.2 TFLOP/s dense, expert GEMMs' ceiling 274 tok/s). What is left is one
-   end-to-end run with `STRATA_METAL_PROMPT_GEMM` unset, to time it and check its answers against the decode-window
-   path (steps in strata-asahi's `vulkan/README.md`). Prompts are read at ~10 tok/s until then, so this is the largest
-   gap to macOS (186 tok/s there) and what makes Strata usable from editors.
+1. **Push the prompt path past 10x.** It is measured now: 134.7 tok/s on a 10k-token prompt against 14.7 through
+   decode windows (9.2x, identical answer; RESULTS.md). What is left for lmdeck's 10x target is a cheaper per-chunk
+   pass over the arena's missed experts or an 8192-row chunk (about 8.9 GB of arena, so less decode cache), plus the
+   desktop-sharing check. The path is off by default until then.
 2. **Overlap weight loads with arithmetic in the GEMV.** The dense GEMV's time is the sum of its loads and its
    math (163 GB/s, with the weight path alone at 322). Fetching the next unit before decoding the current one
    should move it towards ~230 GB/s.

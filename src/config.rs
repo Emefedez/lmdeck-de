@@ -176,6 +176,10 @@ pub struct StrataCfg {
     pub vk_icd: String,
     /// How the system prompt in prompts/strata.md combines with the client's.
     pub system_prompt_mode: String,
+    /// Prompt path and chunk: "off" = decode windows, or 1024/2048/4096 rows on the GPU's
+    /// matrix units. Measured on a 10,609-token prompt (2026-10-22): 14.7 / 109.0 / 123.8 /
+    /// 134.7 tok/s; the chunk buffers take 0 / 1.60 / 2.55 / 4.46 GB of the arena.
+    pub prompt_path: String,
     pub extra_args: Vec<String>,
     pub env: BTreeMap<String, String>,
 }
@@ -189,6 +193,7 @@ impl Default for StrataCfg {
             engine: "strata".into(),
             vk_icd: String::new(),
             system_prompt_mode: "prepend".into(),
+            prompt_path: "off".into(),
             extra_args: vec![],
             env: BTreeMap::new(),
         }
@@ -591,8 +596,126 @@ pub enum Kind {
     Choice(&'static [&'static str]),
     /// A GiB slider (←/→ in steps of 0.5).
     Gib,
+    /// Strata chunked prompt slider (off / 1024 / 2048 / 4096).
+    PromptChunk,
     /// A prompt file, opened in the editor.
     Prompt,
+}
+
+pub const STRATA_PROMPT_CHUNKS: &[&str] = &["off", "1024", "2048", "4096"];
+
+pub fn prompt_chunk_step(cur: &str, dir: i32) -> &'static str {
+    let idx = STRATA_PROMPT_CHUNKS.iter().position(|&c| c == cur).unwrap_or(0);
+    let next = (idx as i32 + dir).clamp(0, (STRATA_PROMPT_CHUNKS.len() - 1) as i32) as usize;
+    STRATA_PROMPT_CHUNKS[next]
+}
+
+pub fn prompt_chunk_cycle(cur: &str) -> &'static str {
+    let idx = STRATA_PROMPT_CHUNKS.iter().position(|&c| c == cur).unwrap_or(0);
+    STRATA_PROMPT_CHUNKS[(idx + 1) % STRATA_PROMPT_CHUNKS.len()]
+}
+
+/// Benchmark measurements from a 10,609-token prompt (engine count, Q2_0, arena ~13.0 GB, greedy, 163 tokens)
+/// on Apple M1 Max 32 GB, Asahi Linux.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrataPromptMetrics {
+    pub mode: &'static str,
+    pub read_s: f64,
+    pub tok_s: f64,
+    pub speedup: f64,
+    pub buffer_gib: f64,
+    pub decode_cache_gib: f64,
+    pub note: &'static str,
+}
+
+impl StrataPromptMetrics {
+    /// Speed star rating derived from prompt reading tok/s.
+    pub fn speed_stars(&self) -> u8 {
+        if self.tok_s >= 130.0 {
+            5
+        } else if self.tok_s >= 120.0 {
+            4
+        } else if self.tok_s >= 50.0 {
+            3
+        } else if self.tok_s >= 25.0 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Usability / performance rating derived from decode cache left in arena.
+    pub fn usability_stars(&self) -> u8 {
+        if self.decode_cache_gib >= 12.5 {
+            5
+        } else if self.decode_cache_gib >= 11.0 {
+            4
+        } else if self.decode_cache_gib >= 10.0 {
+            3
+        } else if self.decode_cache_gib >= 8.0 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Noise & heat star rating (5 = quietest & coolest; matrix unit load causes heat).
+    pub fn noise_heat_stars(&self) -> u8 {
+        if self.buffer_gib <= 0.05 {
+            5
+        } else if self.buffer_gib <= 2.0 {
+            4
+        } else if self.buffer_gib <= 3.0 {
+            3
+        } else if self.buffer_gib <= 5.0 {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+pub const STRATA_PROMPT_BENCHMARKS: &[StrataPromptMetrics] = &[
+    StrataPromptMetrics {
+        mode: "off",
+        read_s: 722.8,
+        tok_s: 14.7,
+        speedup: 1.0,
+        buffer_gib: 0.0,
+        decode_cache_gib: 13.0,
+        note: "Decode windows (baseline): quiet & cool, leaves 13.0 GB decode cache",
+    },
+    StrataPromptMetrics {
+        mode: "1024",
+        read_s: 97.3,
+        tok_s: 109.0,
+        speedup: 7.4,
+        buffer_gib: 1.60,
+        decode_cache_gib: 11.4,
+        note: "7.4x prompt speedup with low 1.60 GB chunk buffer overhead",
+    },
+    StrataPromptMetrics {
+        mode: "2048",
+        read_s: 85.7,
+        tok_s: 123.8,
+        speedup: 8.4,
+        buffer_gib: 2.55,
+        decode_cache_gib: 10.4,
+        note: "Best balance on 32 GB: 8.4x speedup, 10.4 GB decode cache left",
+    },
+    StrataPromptMetrics {
+        mode: "4096",
+        read_s: 78.7,
+        tok_s: 134.7,
+        speedup: 9.2,
+        buffer_gib: 4.46,
+        decode_cache_gib: 8.5,
+        note: "Fastest prompt read (9.2x), but chunk buffers take 4.46 GB of arena",
+    },
+];
+
+pub fn strata_prompt_metrics(mode: &str) -> Option<StrataPromptMetrics> {
+    STRATA_PROMPT_BENCHMARKS.iter().find(|b| b.mode == mode).copied()
 }
 
 pub struct Setting {
@@ -652,6 +775,7 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "Strata", key: "strata.vk_icd", kind: Kind::Text, help: "Vulkan driver for the engine (ICD json; empty = honeykrisp-strata v3)" },
     Setting { section: "Strata", key: "strata.extra_args", kind: Kind::Text, help: "Extra Strata server args" },
     Setting { section: "Strata", key: "strata.env", kind: Kind::Text, help: "Env for the Strata server and engine, K=V,K=V" },
+    Setting { section: "Strata", key: "strata.prompt_path", kind: Kind::PromptChunk, help: "Strata prompt path: off (decode windows) / 1024 / 2048 / 4096 (GPU chunked path; 2048 best on 32 GB)" },
     Setting { section: "System prompts", key: "mlx.system_prompt", kind: Kind::Prompt, help: "System prompt for MLX models (prompts/mlx.md, opens in your editor; {model} {backend} {date} expand). Per model: e in Models" },
     Setting { section: "System prompts", key: "mlx.system_prompt_mode", kind: MODE, help: "MLX: prepend (before the client's) / replace (instead of it) / fallback (only when the client sends none)" },
     Setting { section: "System prompts", key: "llama.system_prompt", kind: Kind::Prompt, help: "System prompt for GGUF models (prompts/llama.md, opens in your editor). Per model: e in Models" },
@@ -755,6 +879,7 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "strata.vk_icd" => c.strata.vk_icd.clone(),
         "strata.extra_args" => c.strata.extra_args.join(" "),
         "strata.env" => kv_join(&c.strata.env),
+        "strata.prompt_path" => c.strata.prompt_path.clone(),
         "strata.system_prompt" => crate::sysprompt::to_line(&crate::sysprompt::backend_text(crate::models::Format::Strata)),
         "strata.system_prompt_mode" => c.strata.system_prompt_mode.clone(),
         "llama.system_prompt_mode" => c.llama.system_prompt_mode.clone(),
@@ -882,6 +1007,10 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "strata.vk_icd" => c.strata.vk_icd = v.into(),
         "strata.extra_args" => c.strata.extra_args = words(v),
         "strata.env" => c.strata.env = kv_parse(v),
+        "strata.prompt_path" => match v {
+            "off" | "1024" | "2048" | "4096" => c.strata.prompt_path = v.into(),
+            _ => return Err("use off, 1024, 2048 or 4096".into()),
+        },
         "strata.system_prompt" => crate::sysprompt::set_backend_text(crate::models::Format::Strata, &crate::sysprompt::from_line(v)).map_err(|e| e.to_string())?,
         "strata.system_prompt_mode" => {
             if !crate::sysprompt::MODES.contains(&v) {
@@ -919,7 +1048,7 @@ pub fn needs_reload(key: &str) -> bool {
     }
     key.starts_with("mlx.")
         || (key.starts_with("llama.") && key != "llama.git_ref")
-        || matches!(key, "strata.engine" | "strata.vk_icd" | "strata.extra_args" | "strata.env")
+        || matches!(key, "strata.engine" | "strata.vk_icd" | "strata.extra_args" | "strata.env" | "strata.prompt_path")
         || key == "server.uclamp_boost"
 }
 

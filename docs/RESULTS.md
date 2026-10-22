@@ -124,14 +124,27 @@ and commands are in strata-asahi's
 
 - Expert arena size, story prompt, no MTP: 4 GB → 8.56 tok/s (hit rate 0.71, 283 MB a token from the SSD); 8 GB →
   10.49 tok/s (0.84, 201 MB); polling the handshake fence every 4096 spins instead of every spin → 11.63 tok/s.
-- Prompts are read through decode windows at ~10 tok/s (7.3 before the SPIR-V cache). The code prompt's time to
-  first token went 22.9 → 15.8 s.
+- Prompts are read through decode windows by default: 14.7 tok/s on a 10,609-token prompt, so 722.8 s before decoding
+  started. The code prompt's time to first token went 22.9 → 15.8 s with the SPIR-V cache.
+- The ported prompt path, measured 2026-10-22 on the live model (only `STRATA_METAL_PROMPT_GEMM` removed from the
+  run config, `STRATA_METAL_PROMPT_CHUNK` set per row; arena ~13.0 GB, same prompt and greedy answer):
+
+  | `STRATA_METAL_PROMPT_CHUNK` | Prompt read | tok/s | Speedup | Arena held by the chunk buffers |
+  |---|---|---|---|---|
+  | off (decode windows) | 722.8 s | 14.7 | 1.0x | - |
+  | 1024 | 97.3 s | 109.0 | 7.4x | 1.60 GB |
+  | 2048 | 85.7 s | 123.8 | 8.4x | 2.55 GB |
+  | 4096 | 78.7 s | 134.7 | 9.2x | 4.46 GB |
+
+  The reasoning and the 163-token answer were identical to the decode-window run; decode was unchanged (12.6 →
+  12.5 tok/s). The plan's 10x target was not reached. 2048 leaves about 10.4 GB of arena for decode, 4096 about
+  8.5 GB, so 2048 is the better balance on 32 GB. The path stays off by default.
 - Loading through lmdeck: 13.9 s with a 13.8 GB arena. Free memory stayed above 7.96 GB.
 - Where a 1-token window's time goes: 39.5 ms of GPU between the 48 per-layer handshakes, 22-25 ms of host turns
   (SSD reads), 3.1 ms tail. Of the GPU time, the experts take 11 ms, the hyper-connection reads ~8 ms and the LM head
   2.8 ms.
-- Prompt kernels (not wired into the engine yet): the dense GEMM reaches 4.2 TFLOP/s; the expert GEMM sets a
-  ceiling of 274 tok/s for prompt reading.
+- Prompt kernels: every port passes its parity test (the dense GEMM reaches 4.2 TFLOP/s; the expert GEMM sets a
+  ceiling of 274 tok/s), and the chunked path is measured end to end (the table above).
 - The dense GEMV (Q2_0, 16384 x 16384, one token) reaches 163 GB/s, while its weight reads alone reach 322 GB/s.
 
 Upstream's number for a 32 GB Mac under macOS is 7.9 tok/s decode and 186 tok/s prompt (docs/MAC.md), measured with

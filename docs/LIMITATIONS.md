@@ -14,8 +14,9 @@ safe). Its estimates are conservative but not guarantees, especially for models 
 
 ## Strata
 
-- Prompts are read at ~10 tok/s until the ported prompt kernels are switched on (they pass parity; the end-to-end
-  run is pending). A 2,000-token prompt takes over 3 minutes.
+- Prompts are read through decode windows by default, at 14.7 tok/s on a 10,609-token prompt (a 2,000-token prompt
+  takes about 2.3 minutes). The ported prompt path is measured (9.2x at 10k, same answer) but stays off: it is short
+  of the 10x target and needs `STRATA_METAL_PROMPT_GEMM` removed by hand. With it on, 123.8 tok/s at chunk 2048.
 - Only the Q2_0 pack has been run on Asahi. Vision input is untested.
 - **Do not suspend the machine during a Strata run.** Suspending while the engine held the GPU crashed the GPU
   firmware, and a reboot was needed. The default mode now frees the GPU between parts of a window, but suspend has
