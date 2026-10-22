@@ -48,6 +48,7 @@ pub(super) enum Field {
     Prompt,
     PromptMode,
     GpuLayers,
+    PromptPath,
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +85,7 @@ fn model_fields(format: Format) -> Vec<Field> {
     }
     if format == Format::Strata {
         f.retain(|f| !matches!(f, Field::Device));
+        f.push(Field::PromptPath);
     }
     f
 }
@@ -273,6 +275,15 @@ impl Ui {
             KeyCode::Esc | KeyCode::Char('q') => {}
             KeyCode::Down | KeyCode::Char('j') => keep(self, (sel + 1).min(fields.len() - 1)),
             KeyCode::Up | KeyCode::Char('k') => keep(self, sel.saturating_sub(1)),
+            KeyCode::Left | KeyCode::Right => {
+                if field == Field::PromptPath {
+                    let cur = crate::config::get_setting(&self.cfg, "strata.prompt_path");
+                    let dir = if k.code == KeyCode::Right { 1 } else { -1 };
+                    let next = crate::config::prompt_chunk_step(&cur, dir);
+                    self.edit_config("strata.prompt_path", |c| crate::config::set_setting(c, "strata.prompt_path", next));
+                }
+                keep(self, sel);
+            }
             KeyCode::Char('x') => {
                 // Back to the default for this field.
                 match field {
@@ -282,6 +293,9 @@ impl Ui {
                             return None;
                         }
                     }
+                    Field::PromptPath => {
+                        self.edit_config("strata.prompt_path", |c| crate::config::set_setting(c, "strata.prompt_path", "off"));
+                    }
                     f => {
                         self.edit_override(&name, |o| {
                             match f {
@@ -290,7 +304,7 @@ impl Ui {
                                 Field::KeepAlive => o.keep_alive = None,
                                 Field::PromptMode => o.system_prompt_mode = None,
                                 Field::GpuLayers => o.gpu_layers = None,
-                                Field::Prompt => {}
+                                Field::Prompt | Field::PromptPath => {}
                             }
                             Ok(())
                         });
@@ -299,6 +313,12 @@ impl Ui {
                 keep(self, sel);
             }
             KeyCode::Enter | KeyCode::Char(' ') => match field {
+                Field::PromptPath => {
+                    let cur = crate::config::get_setting(&self.cfg, "strata.prompt_path");
+                    let next = crate::config::prompt_chunk_cycle(&cur);
+                    self.edit_config("strata.prompt_path", |c| crate::config::set_setting(c, "strata.prompt_path", next));
+                    keep(self, sel);
+                }
                 Field::Context | Field::KeepAlive | Field::GpuLayers => {
                     let o = self.cfg.overrides.get(&name);
                     let cur = match field {
@@ -596,6 +616,7 @@ impl Ui {
                 },
                 Field::PromptMode => o.and_then(|o| o.system_prompt_mode.clone()).unwrap_or_else(|| "the backend's".into()),
                 Field::GpuLayers => o.and_then(|o| o.gpu_layers).map(|n| n.to_string()).unwrap_or_else(|| "auto (all that fit)".into()),
+                Field::PromptPath => format!("◂ {} ▸", crate::config::get_setting(&self.cfg, "strata.prompt_path")),
             }
         };
         let label = |fl: Field| match fl {
@@ -605,12 +626,62 @@ impl Ui {
             Field::Prompt => "System prompt",
             Field::PromptMode => "Prompt mode",
             Field::GpuLayers => "GPU layers",
+            Field::PromptPath => "Prompt path",
         };
         let mut l: Vec<Line> = fields.iter().enumerate().map(|(i, fl)| {
             let st = if i == sel { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
             Line::from(vec![Span::styled(format!(" {:<14}", label(*fl)), st.fg(Color::Cyan)), Span::styled(format!(" {} ", value(*fl)), st)])
         }).collect();
         l.push(Line::raw(""));
+
+        if fields[sel.min(fields.len() - 1)] == Field::PromptPath {
+            let cur = crate::config::get_setting(&self.cfg, "strata.prompt_path");
+            let mut track = vec![Span::styled(" Chunk: ", Style::new().fg(Color::Cyan))];
+            for (i, &chunk) in crate::config::STRATA_PROMPT_CHUNKS.iter().enumerate() {
+                if i > 0 {
+                    track.push(Span::styled("──", Style::new().fg(Color::DarkGray)));
+                }
+                if chunk == cur {
+                    track.push(Span::styled(format!("▶ {chunk} ◀"), Style::new().fg(Color::Yellow).bold()));
+                } else {
+                    track.push(Span::styled(format!("[{chunk}]"), Style::new().fg(Color::DarkGray)));
+                }
+            }
+            l.push(Line::from(track));
+            if let Some(m) = crate::config::strata_prompt_metrics(&cur) {
+                let make_stars = |stars: u8| -> (String, String) {
+                    ("★".repeat(stars as usize), "☆".repeat(5usize.saturating_sub(stars as usize)))
+                };
+                let (s_f, s_e) = make_stars(m.speed_stars());
+                let (u_f, u_e) = make_stars(m.usability_stars());
+                let (n_f, n_e) = make_stars(m.noise_heat_stars());
+                l.push(Line::from(vec![
+                    Span::styled(" Speed:        ", Style::new().fg(Color::Cyan)),
+                    Span::styled(s_f, Style::new().fg(Color::Yellow).bold()),
+                    Span::styled(s_e, Style::new().fg(Color::DarkGray)),
+                    Span::raw(format!("  {:.1} tok/s ({:.1}x)", m.tok_s, m.speedup)),
+                ]));
+                l.push(Line::from(vec![
+                    Span::styled(" Usability:    ", Style::new().fg(Color::Cyan)),
+                    Span::styled(u_f, Style::new().fg(Color::Yellow).bold()),
+                    Span::styled(u_e, Style::new().fg(Color::DarkGray)),
+                    Span::raw(format!("  {:.1} GB decode cache ({:.2} GB buffer)", m.decode_cache_gib, m.buffer_gib)),
+                ]));
+                l.push(Line::from(vec![
+                    Span::styled(" Noise & heat: ", Style::new().fg(Color::Cyan)),
+                    Span::styled(n_f, Style::new().fg(Color::Yellow).bold()),
+                    Span::styled(n_e, Style::new().fg(Color::DarkGray)),
+                    Span::raw(format!("  {}", match m.mode {
+                        "off" => "Cool & quiet",
+                        "1024" => "Light heat & fan",
+                        "2048" => "Balanced power & heat",
+                        _ => "Higher power & fan",
+                    })),
+                ]));
+            }
+            l.push(Line::raw(""));
+        }
+
         let help = match fields[sel.min(fields.len() - 1)] {
             Field::Context => "Tokens this model gets. Larger needs more memory for the attention cache.",
             Field::Device => "The CPU is a last resort for models with ops the Apple GPU backend lacks.",
@@ -618,6 +689,7 @@ impl Ui {
             Field::Prompt => "Enter opens prompts/models/<model>.md in your editor; x goes back to the backend's prompt.",
             Field::PromptMode => "prepend (before the client's), replace (instead of it), fallback (only when the client sends none).",
             Field::GpuLayers => "GGUF layers on the GPU; the rest run on the CPU. auto = as many as fit.",
+            Field::PromptPath => "←/→ or Enter: off (decode windows) / 1024 / 2048 / 4096 (GPU chunked path).",
         };
         l.push(dim(help));
         l.push(dim("↑↓ select · Enter change · x back to the default · Esc close. Applies on the next load."));
