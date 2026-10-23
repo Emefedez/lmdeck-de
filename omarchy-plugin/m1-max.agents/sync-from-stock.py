@@ -51,13 +51,14 @@ sub('readonly property var providers: usage.enabledProviders',
   property bool pickerExpanded: false
   readonly property bool pickerOpen: pickerExpanded || providers.length === 0
   // Agents Omarchy ships no mark for; ours live in assets/ with -light twins.
-  readonly property var forkMarks: ["antigravity", "copilot"]
+  readonly property var forkMarks: ["antigravity", "copilot", "opencode"]
   readonly property var knownProviders: [
     { id: "claude", name: "Claude" },
     { id: "codex", name: "Codex" },
     { id: "copilot", name: "Copilot" },
     { id: "antigravity", name: "Antigravity" },
     { id: "fireworks", name: "Fireworks" },
+    { id: "opencode", name: "opencode" },
     { id: "lmdeck", name: "lmdeck" }
   ]
 
@@ -179,9 +180,9 @@ sub('readonly property var providers: usage.enabledProviders',
     onLoaded: root.applyPrefs(text())
   }
 
-  // Agents Omarchy ships no collector for (Antigravity, Copilot) come from
+  // Agents Omarchy ships no collector for (Antigravity, Copilot, opencode) come from
   // collectors/agents-extra, which writes into the same usage directory.
-  readonly property var extraAgents: ["antigravity", "copilot"]
+  readonly property var extraAgents: ["antigravity", "copilot", "opencode"]
   property var _extraQueued: null
   function collectExtra(kind, ids) {
     if (extraCollect.running) {
@@ -246,12 +247,16 @@ sub('readonly property var providers: usage.enabledProviders',
     var codex = Quickshell.env("CODEX_HOME") || (homeDir + "/.codex")
     var copilot = Quickshell.env("COPILOT_HOME") || (homeDir + "/.copilot")
     var antigravity = Quickshell.env("ANTIGRAVITY_CLI_HOME") || (homeDir + "/.gemini/antigravity-cli")
+    var dataHome = Quickshell.env("XDG_DATA_HOME") || (homeDir + "/.local/share")
+    var opencode = dataHome + "/opencode"
     return [
       { id: "claude", path: claude + "/history.jsonl" },
       { id: "codex", path: codex + "/history.jsonl" },
       { id: "copilot", path: copilot + "/session-state" },
       { id: "antigravity", path: antigravity + "/history.jsonl" },
-      { id: "antigravity", path: antigravity + "/conversations" }
+      { id: "antigravity", path: antigravity + "/conversations" },
+      { id: "opencode", path: opencode + "/opencode.db" },
+      { id: "opencode", path: opencode + "/opencode.db-wal" }
     ]
   }
 
@@ -614,7 +619,7 @@ sub('''    text: "󱚣"
       width: Math.max(4, Math.round(parent.height * 0.16))
       height: width
       radius: width / 2
-      color: lmdeck.busy ? Color.accent : root.foreground
+      color: lmdeck.busy ? Commons.Color.accent : root.foreground
       anchors.right: parent.right
       anchors.top: parent.top
       anchors.rightMargin: Math.round(parent.width * 0.18)
@@ -644,6 +649,95 @@ sub('''          // ---------- Status ----------''', '''          LmdeckSection 
           }
 
           // ---------- Status ----------''')
+
+# Recent-work section for collectors that can name their sessions (opencode).
+sub("""          // ---------- Usage ----------
+          PanelSeparator {
+            visible: usageSection.visible
+            foreground: root.foreground
+          }
+""", """          // ---------- Recent work ----------
+          PanelSeparator {
+            visible: recentSection.visible
+            foreground: root.foreground
+          }
+
+          Column {
+            id: recentSection
+            visible: !!root.provider && (root.provider.recentSessions || []).length > 0
+            width: parent.width
+            spacing: Style.spacing.md
+
+            readonly property var sessions: root.provider ? (root.provider.recentSessions || []) : []
+
+            function ago(ts) {
+              var secs = Math.max(0, (root.nowMs - Number(ts || 0)) / 1000)
+              if (secs < 60) return "just now"
+              var mins = Math.floor(secs / 60)
+              if (mins < 60) return mins + "m ago"
+              var hours = Math.floor(mins / 60)
+              if (hours < 24) return hours + "h ago"
+              return Math.floor(hours / 24) + "d ago"
+            }
+            function where(path) {
+              var text = String(path || "")
+              var home = String(Quickshell.env("HOME") || "")
+              if (home !== "" && text.indexOf(home) === 0) text = "~" + text.slice(home.length)
+              var parts = text.split("/")
+              return parts.length > 2 ? "…/" + parts.slice(-2).join("/") : text
+            }
+            function meta(session) {
+              var bits = []
+              if (session.directory) bits.push(where(session.directory))
+              if (session.tokens) bits.push(usage.formatTokenCount(Number(session.tokens)) + " tokens")
+              if (session.updatedAt) bits.push(ago(session.updatedAt))
+              return bits.join(" · ")
+            }
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "RECENT WORK"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Repeater {
+              model: recentSection.sessions
+
+              Column {
+                required property var modelData
+                width: recentSection.width
+                spacing: Style.space(2)
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: String(modelData.title || "")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: recentSection.meta(modelData)
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+            }
+          }
+
+          // ---------- Usage ----------
+          PanelSeparator {
+            visible: usageSection.visible
+            foreground: root.foreground
+          }
+""")
 
 # Usage.qml: the stock data layer minus its start-up and every-15-minutes
 # rescan; the panel's triggers decide when collectors run.

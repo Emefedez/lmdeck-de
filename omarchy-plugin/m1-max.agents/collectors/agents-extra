@@ -20,15 +20,18 @@ import fcntl
 import json
 import os
 import pathlib
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 
 HOME = pathlib.Path.home()
 STATE = pathlib.Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state")
 CONFIG = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
 CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache")
+DATA = pathlib.Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
 USAGE_DIR = STATE / "omarchy/agents/usage"
 PREFS = CONFIG / "omarchy/agents/providers.json"
 CACHE_DIR = CACHE / "omarchy/agents"
@@ -123,6 +126,69 @@ class Tally:
         return rec
 
 
+# ---------------------------------------------------------------- opencode
+
+def opencode_db():
+    return DATA / "opencode/opencode.db"
+
+
+def collect_opencode(limits_only, force=False):
+    existing = read_json(USAGE_DIR / "opencode.json", None)
+    if limits_only and existing:
+        return existing
+    db_path = opencode_db()
+    if not db_path.exists():
+        return None
+    tally = Tally()
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=2)
+    except sqlite3.Error:
+        return None
+    try:
+        db.execute("PRAGMA query_only = 1")
+        for ts, data in db.execute("select time_created, data from message"):
+            try:
+                msg = json.loads(data)
+            except ValueError:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            day = local_date(int(ts) / 1000)
+            role = msg.get("role")
+            if role == "user":
+                tally.prompt(day)
+            elif role == "assistant":
+                tokens = msg.get("tokens") or {}
+                cache = tokens.get("cache") or {}
+                inp = int(tokens.get("input") or 0)
+                out = int(tokens.get("output") or 0) + int(tokens.get("reasoning") or 0)
+                cr = int(cache.get("read") or 0)
+                cw = int(cache.get("write") or 0)
+                if inp or out or cr or cw:
+                    tally.tokens(day, str(msg.get("modelID") or "unknown"), inp, out, cr, cw)
+        for (ts,) in db.execute("select time_created from session"):
+            tally.session(local_date(int(ts) / 1000))
+        recent = []
+        rows = db.execute(
+            "select title, directory, time_updated, "
+            "coalesce(tokens_input,0)+coalesce(tokens_output,0)+"
+            "coalesce(tokens_reasoning,0)+coalesce(tokens_cache_read,0)+"
+            "coalesce(tokens_cache_write,0) "
+            "from session where parent_id is null "
+            "order by time_updated desc limit 3")
+        for title, directory, updated, tokens in rows:
+            recent.append({"title": str(title or "Untitled session"),
+                           "directory": str(directory or ""),
+                           "updatedAt": int(updated or 0),
+                           "tokens": int(tokens or 0)})
+    except sqlite3.Error:
+        return None
+    finally:
+        db.close()
+    return tally.record("opencode", "OpenCode", tierLabel="Local stats",
+                        recentSessions=recent)
+
+
 # ------------------------------------------------------------------ copilot
 
 def copilot_home():
@@ -155,7 +221,15 @@ def copilot_quota():
     return {"limits": limits, "tierLabel": tier}
 
 
-def collect_copilot(limits_only):
+def collect_copilot(limits_only, force=False):
+    existing = read_json(USAGE_DIR / "copilot.json", None)
+    if limits_only and existing:
+        quota = copilot_quota()
+        old_limits = existing.get("limits") or []
+        if quota and (quota.get("limits") or []) != old_limits:
+            existing.update(quota)
+            existing["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        return existing
     home = copilot_home()
     sessions = home / "session-state"
     if not sessions.is_dir():
@@ -281,9 +355,67 @@ def antigravity_conversation(path):
     return {"start": stamps[0] if stamps else os.path.getmtime(path), "gens": out}
 
 
-def collect_antigravity(limits_only):
+def antigravity_bin():
+    for name in ("antigravity", "agy"):
+        path = shutil.which(name)
+        if path:
+            return path
+    path = HOME / ".local/share/mise/installs/antigravity-cli/latest/antigravity"
+    return str(path) if path.exists() else None
+
+
+def antigravity_quota(force=False, fetch=False):
+    cache_path = CACHE_DIR / "antigravity-quota.json"
+    cache = read_json(cache_path, {})
+    limits = cache.get("limits") or []
+    age = time.time() - float(cache.get("at") or 0)
+    if not force and (age < 600 or not fetch):
+        return limits
+    exe = antigravity_bin()
+    if not exe:
+        return limits
+    try:
+        out = subprocess.run([exe, "-p", "/usage", "--output-format", "json"],
+                             capture_output=True, text=True, timeout=45)
+        report = json.loads(out.stdout)
+        groups = ((report.get("command") or {}).get("data") or {}).get("groups") or []
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        groups = []
+    parsed = []
+    short_names = {"Gemini Models": "Gemini", "Claude and GPT models": "Claude/GPT",
+                   "Gemini 4 Argon": "Argon"}
+    for group in groups:
+        group_name = str(group.get("name") or "Antigravity")
+        short = short_names.get(group_name, group_name)
+        for bucket in group.get("buckets") or []:
+            remaining = bucket.get("remaining_fraction")
+            if remaining is None:
+                continue
+            window = str(bucket.get("window") or "")
+            title = short + (" weekly" if window == "weekly" else
+                             " 5-hour" if window == "5h" else
+                             " " + str(bucket.get("name") or "limit"))
+            parsed.append({"label": group_name + " · " + str(bucket.get("name") or ""),
+                           "title": title,
+                           "percent": max(0.0, min(1.0, 1.0 - float(remaining))),
+                           "resetsAt": str(bucket.get("reset_time") or "")})
+    if parsed:
+        limits = parsed
+    write_atomic(cache_path, json.dumps({"at": time.time(), "limits": limits}))
+    return limits
+
+
+def collect_antigravity(limits_only, force=False):
     root = pathlib.Path(os.environ.get("ANTIGRAVITY_CLI_HOME") or HOME / ".gemini/antigravity-cli")
     convs = root / "conversations"
+    existing = read_json(USAGE_DIR / "antigravity.json", None)
+    limits = antigravity_quota(force=force, fetch=limits_only or force
+                               or not (CACHE_DIR / "antigravity-quota.json").exists())
+    if limits_only and existing:
+        if limits and limits != (existing.get("limits") or []):
+            existing["limits"] = limits
+            existing["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        return existing
     if not convs.is_dir():
         return None
     cache_path = CACHE_DIR / "antigravity-scan.json"
@@ -305,7 +437,8 @@ def collect_antigravity(limits_only):
         tally.session(local_date(conv["start"]))
         for ts, model, inp, outp, cr in conv["gens"]:
             tally.tokens(local_date(ts), model, inp, outp, cr, 0)
-    write_atomic(cache_path, json.dumps(fresh))
+    if fresh != cache:
+        write_atomic(cache_path, json.dumps(fresh))
     try:
         with (root / "history.jsonl").open(errors="replace") as f:
             for line in f:
@@ -319,10 +452,14 @@ def collect_antigravity(limits_only):
     except OSError:
         pass
     model = read_json(root / "settings.json", {}).get("model", "")
-    return tally.record("antigravity", "Antigravity", tierLabel=model or "Local stats")
+    if not limits and existing:
+        limits = existing.get("limits") or []
+    return tally.record("antigravity", "Antigravity", tierLabel=model or "Local stats",
+                        limits=limits)
 
 
-COLLECTORS = {"antigravity": collect_antigravity, "copilot": collect_copilot}
+COLLECTORS = {"antigravity": collect_antigravity, "copilot": collect_copilot,
+              "opencode": collect_opencode}
 
 
 def cmd_collect(args):
@@ -340,13 +477,20 @@ def cmd_collect(args):
         if agent in excluded or (only and agent not in only):
             continue
         try:
-            rec = fn("--limits-only" in args)
+            rec = fn("--limits-only" in args, "--force" in args)
         except Exception as e:  # one broken agent must not take the others down
             print("agents-extra: %s collector failed: %s" % (agent, e), file=sys.stderr)
             status = 1
             continue
         if rec:
-            write_atomic(USAGE_DIR / (agent + ".json"), json.dumps(rec) + "\n")
+            path = USAGE_DIR / (agent + ".json")
+            data = json.dumps(rec) + "\n"
+            try:
+                old = path.read_text()
+            except OSError:
+                old = None
+            if data != old:
+                write_atomic(path, data)
     return status
 
 
