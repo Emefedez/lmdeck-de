@@ -28,6 +28,14 @@ Each entry says what was tried, what happened, and what was done instead. The nu
 - **Benchmark loops with long unique prompts**: 7k-token prompts, each one different, filled RAM with prompt caches
   and checkpoints. Keep such loops short, or lower `mlx.prompt_cache_size`.
 
+## GGUF / Prism ternary
+
+- **Porting upstream llama.cpp PR #29077** (Prism's hadamard folding): it implements the rotation on the **CPU
+  backend only** (16 files, about +737 lines) and was closed unmerged. Measured here on the 27B PQ2_0 file it decodes
+  at roughly 0.4 tok/s, against 6.8 tok/s on Vulkan. lmdeck instead builds `PrismML-Eng/llama.cpp` (branch `prism`,
+  GPU shaders) as a second binary and routes only the files that need it there. The fork measured the same as stock
+  on an ordinary Q2_K GGUF, so keeping both costs nothing but disk.
+
 ## The Strata Vulkan port
 
 - **16-byte weight loads**: an early probe suggested the GEMV needed them. The probe measured the wrong thing. A

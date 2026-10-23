@@ -95,6 +95,10 @@ Details and the formula are in [docs/REFERENCE.md](docs/REFERENCE.md#model-grade
 - [PLAN-strata-in-editors.md](docs/PLAN-strata-in-editors.md): the plan to make Strata fast in VS Code and coding agents
 - [WORKING-PATH-strata-in-editors.md](docs/WORKING-PATH-strata-in-editors.md): the adopted order for it, easiest first,
   with the request sizes that make the editor chat slow
+- [TERNARY-PRISM.md](docs/TERNARY-PRISM.md): Prism's PQ2_0/PTQ1_0 ternary GGUFs, the second llama.cpp build, and how
+  lmdeck picks it per model
+- [SESSION-2026-10-23.md](docs/SESSION-2026-10-23.md): what changed in the panel, the editors and the GGUF path on
+  that day, with the numbers
 - [REFERENCE.md](docs/REFERENCE.md): the server's APIs, coding agents, system prompts, memory planning, settings,
   files
 

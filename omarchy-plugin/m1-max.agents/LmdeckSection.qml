@@ -605,6 +605,9 @@ Column {
           anchors.right: parent.right
           anchors.rightMargin: Style.space(6)
           anchors.verticalCenter: parent.verticalCenter
+          width: Math.min(implicitWidth, Math.round(modelRow.width * 0.45))
+          elide: Text.ElideRight
+          horizontalAlignment: Text.AlignRight
           text: (modelData.engine === "prism" ? "prism · " : "")
             + modelData.format + " · " + modelData.quant + " · " + lm.bytes(modelData.size)
           color: sec.dim

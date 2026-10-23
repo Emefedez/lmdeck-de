@@ -20,7 +20,7 @@ a fixed list. This page says how it checks, and which models have actually been 
 | Backend | Runs | Does not run |
 |---|---|---|
 | MLX (omarchy-mlx 0.7.28 package) | MLX safetensors with affine quantization (4/8-bit `mlx-community` repos), dense or hybrid (Qwen3.5/3.6/3.8 attention + linear layers), mixture of experts | nvfp4, mxfp4 and mxfp8 quantization (no GPU kernels); models with ops the backend lacks (lmdeck offers the CPU, much slower) |
-| GGUF (llama.cpp, Vulkan) | What llama.cpp supports. Partial GPU offload when a model does not fit whole (`llama.auto_offload`) | Prism's PQ2_0/PTQ1_0 ternary types on the stock build (see below) |
+| GGUF (llama.cpp, Vulkan) | What llama.cpp supports. Partial GPU offload when a model does not fit whole (`llama.auto_offload`) | Prism's PQ2_0/PTQ1_0 ternary types on the stock build - lmdeck runs those on a second, Prism build (see below) |
 | Strata (strata-asahi) | Qwen3.8-Flash-Next packs set up by Strata's setup (`strata-<model>.json`) | Any other model: Strata runs this one model family |
 
 The most memory a model can have depends on what else runs. On this 32 GB machine, with the desktop running,
@@ -45,16 +45,29 @@ these two types ([#29058](https://github.com/ggml-org/llama.cpp/issues/29058) is
 
 lmdeck reads every GGUF header before you load it. A file whose highest tensor type is above what the installed
 build knows, or that carries `prism.hadamard.*`, is marked ✗ with the reason in Models, and `lmdeck ls` prints it
-under "Cannot load:":
+under "Cannot load:", unless a Prism build is configured:
 
 ```
 Cannot load:
   huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF:...-Ternary-Bonsai-PQ2_0: Prism rotated ternary
-  (custom ggml type 142, file type 141): needs a Prism-capable llama.cpp - set llama.repo =
-  https://github.com/PrismML-Eng/llama.cpp and llama.git_ref = prism, then build it
+  (custom ggml type 142, file type 141): needs the Prism build - point llama.prism_path at it
+  (docs/TERNARY-PRISM.md), or set llama.repo = https://github.com/PrismML-Eng/llama.cpp and
+  llama.git_ref = prism and rebuild
 ```
 
-To run those files, build the fork instead of upstream (it tracks mainline, so ordinary GGUFs keep working):
+Those files run on a **second llama.cpp**, the Prism fork, and only those files do. Build it once and point
+`llama.prism_path` at it (Settings, section GGUF, or `lmdeck config llama.prism_path <path>`); the full
+recipe is in [TERNARY-PRISM.md](TERNARY-PRISM.md). The stock build keeps everything else, so no ordinary GGUF
+changes behaviour - the fork measured the same as stock on a Q2_K file.
+
+The choice is automatic and visible: Models shows a cyan `prism` next to a file that will use it (red
+`needs Prism build` if none is configured) and an **Engine** line in Details; the model settings popup (`e`) has an
+**Engine** field to force `stock` or `prism`; the bar panel prefixes the meta line with `prism ·`. lmdeck launches
+the fork exactly like its own build, so the Honeykrisp changes (per-process `HK_SYSMEM` heap, `-fa auto`, `-np 1`,
+`--jinja`, cache reuse) still apply. `GET /lmdeck/models` returns `needs_prism`, `engine` and `engine_choice`.
+
+Alternatively build *only* the fork as lmdeck's managed llama.cpp (it tracks mainline, so ordinary GGUFs keep
+working), knowing that every future `lmdeck llama update` follows the fork:
 
 ```
 lmdeck config llama.repo https://github.com/PrismML-Eng/llama.cpp
@@ -62,18 +75,11 @@ lmdeck config llama.git_ref prism
 lmdeck llama build          # Vulkan; the daemon picks it up on restart
 ```
 
-Or keep the stock build and point at an existing Prism build; lmdeck launches it exactly like its own, so the
-Honeykrisp changes (per-process `HK_SYSMEM` heap, `-fa auto`, `-np 1`, `--jinja`, cache reuse) still apply:
-
-```
-lmdeck config llama.server_path ~/.local/share/lmdeck/llama-prism/bin/llama-server
-```
-
 The fork's Vulkan backend has FWHT (Hadamard) pipelines and PQ2_0/PTQ1_0 matmuls, so the transform runs on the GPU.
-Verified here with `PrismML-Eng/llama.cpp` at `73bfe6c` (branch `prism`, 2026-10-19): the Huihui PQ2_0 file loads in
-about 5 s, all 130 tensors go to Vulkan (2 graph splits) and the answers are coherent. Speed is 6.8 tok/s decode and
-37 tok/s prompt on a 519-token request - slower than the 4-bit MLX version of the same model (11-13 tok/s) but at half
-the memory (7.2 GB).
+Verified here with `PrismML-Eng/llama.cpp` at `73bfe6c` (branch `prism`, 2026-10-19): the Huihui PQ2_0 file loads
+automatically in about 5 s, all 130 tensors go to Vulkan (2 graph splits) and the answers are coherent. Speed is
+6.8 tok/s decode and 37 tok/s prompt on a 519-token request - slower than the 4-bit MLX version of the same model
+(11-13 tok/s) but at half the memory (7.2 GB).
 
 ## Run on this machine
 

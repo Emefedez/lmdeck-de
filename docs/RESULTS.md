@@ -150,8 +150,27 @@ and commands are in strata-asahi's
 Upstream's number for a 32 GB Mac under macOS is 7.9 tok/s decode and 186 tok/s prompt (docs/MAC.md), measured with
 different prompts.
 
+## GGUF (llama.cpp, Vulkan) and Prism ternary
+
+Measured 2026-10-23 through lmdeck's own launcher (Vulkan, `-ngl 999`, `-fa auto`, `-np 1`, `--jinja`,
+`--cache-reuse 256`, one stream, greedy). `Prism` is `PrismML-Eng/llama.cpp` at `73bfe6c` (branch `prism`);
+`stock` is mainline `c35b667`.
+
+| Model | Build | Prompt | Decode | Load |
+|---|---|---|---|---|
+| Huihui Qwen3.8-27B Ternary-Bonsai-PQ2_0, 7.2 GB | Prism | 37.3 tok/s (519-token prompt) | 6.8 tok/s | 5.6 s |
+| Qwen3.8-27B-OBLITERATED Q2_K, 10.1 GB | Prism | 13.3 tok/s (short prompt) | 4.9 tok/s | |
+| the same Q2_K file, same flags | stock | 13.5 tok/s (short prompt) | 4.9 tok/s | 6.8 s |
+
+The Q2_K prompt figures come from a ~30-token prompt, so fixed startup cost dominates them; the A/B matters for
+"no regression from running the fork", which it shows (within noise on prompt and decode). The Huihui file loads in
+about 5 s with all 130 tensors on Vulkan0 and 2 graph splits; the answers are coherent (`17*23` -> 391). The
+hadamard-folded ternary file is a memory saving - 7.2 GB of weights against 15.0 GB for 4-bit MLX, at roughly half
+the decode speed of that model (11-13 tok/s) - not a speed win. Details, setup and the design are in
+[TERNARY-PRISM.md](TERNARY-PRISM.md).
+
 ## What was not measured
 
-- GGUF through llama.cpp has no benchmark in this project.
+- GGUF beyond the Prism A/B above (a single short prompt each): no prompt-length or long-context sweep yet.
 - Power draw per model: lmdeck can record it (`usage.perf = true`, off by default), but no table exists yet.
 - Any machine other than this M1 Max.

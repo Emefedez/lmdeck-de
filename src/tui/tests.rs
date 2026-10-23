@@ -239,6 +239,49 @@ async fn tool_model_settings_cycle_with_arrow_keys() {
 }
 
 #[test]
+fn ternary_gguf_shows_the_prism_marker_and_engine_field() {
+    let mut ui = ui();
+    ui.tab = Tab::Models;
+    ui.cfg.llama.server_path = "/usr/bin/false".into();
+    ui.cfg.llama.prism_path = "/usr/bin/true".into();
+    ui.models = vec![LocalModel {
+        name: "org/ternary".into(),
+        format: Format::Gguf,
+        tools: true,
+        size: 7 << 30,
+        repo: None,
+        path: Default::default(),
+        files: vec![],
+        quant: "PQ2_0".into(),
+        qmode: None,
+        arch: "qwen35".into(),
+        unsupported: None,
+        needs_prism: true,
+        params: "27B".into(),
+        ctx_len: Some(32768),
+        mmproj: None,
+        modified: std::time::SystemTime::UNIX_EPOCH,
+        thinking: false,
+        vision: false,
+    }];
+    ui.models_sel.select(Some(0));
+    let text = draw(&mut ui, 140, 40);
+    assert!(text.contains("prism"), "{text}");
+    assert!(text.contains("Engine"), "details pane must say which build runs it");
+    // The settings popup: Engine is the 7th GGUF field (Context, Device, KeepAlive, Prompt, PromptMode, GPU layers, Engine).
+    ui.popup = Some(Popup::ModelSettings("org/ternary".into(), 6));
+    let text = draw(&mut ui, 140, 40);
+    assert!(text.contains("auto (Prism)"), "{text}");
+    // Without a Prism build the same file auto-selects stock and the list says it cannot load.
+    ui.cfg.llama.prism_path.clear();
+    let text = draw(&mut ui, 140, 40);
+    assert!(text.contains("auto (stock)"), "{text}");
+    ui.popup = None;
+    let text = draw(&mut ui, 140, 40);
+    assert!(text.contains("needs Prism build"), "{text}");
+}
+
+#[test]
 fn opened_repo_obeys_format_and_budget_filters() {
     let mut ui = ui();
     ui.tab = Tab::Discover;

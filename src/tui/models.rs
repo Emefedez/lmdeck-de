@@ -413,8 +413,12 @@ impl Ui {
         if m.needs_prism {
             let e = if self.cfg.runs_prism(m, o) {
                 "Prism build (ternary PQ2_0/PTQ1_0; ~7 tok/s here, not a fast daily driver)".to_string()
-            } else if self.cfg.prism_server().is_some() {
-                "stock build (forced here; this file needs the Prism build to load)".to_string()
+            } else if let Some(p) = self.cfg.prism_server() {
+                if p.exists() {
+                    "stock build (forced here; this file needs the Prism build to load)".to_string()
+                } else {
+                    format!("Prism build missing: llama.prism_path is {} but there is no binary there", p.display())
+                }
             } else {
                 "needs the Prism build: set llama.prism_path (docs/TERNARY-PRISM.md)".to_string()
             };

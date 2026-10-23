@@ -192,7 +192,8 @@ intelligence = 34
 - **Memory**: a unified-memory meter, the last request's tok/s, prefill and TTFT, and today's token totals.
 - **Downloads**: live progress, a Cancel button for each active download, and clear. Cancelled downloads keep partial files; downloading the same variant resumes.
 - **Cache & memory**: keep-alive, max models, MLX prompt cache, GGUF context, GGUF KV cache type (f16/q8_0/q4_0), KV reuse, MLX fast path, memory check, and local/LAN listen.
-- **Models**: every local model; click one to load or unload it.
+- **Strata**: prompt path (off / 1024 / 2048 / 4096) with its measured speed, decode-cache and heat ratings, plus Reload when the setting changed; writes `strata.prompt_path` (see [WORKING-PATH-strata-in-editors.md](WORKING-PATH-strata-in-editors.md)).
+- **Models**: every local model; click one to load or unload it. A ternary GGUF that runs on the Prism build is prefixed `prism ·`; one that needs it but has no build configured shows `✗ prism build` (see [TERNARY-PRISM.md](TERNARY-PRISM.md)).
 - **Hugging Face**: search MLX or GGUF by name, multiple words, repo ID or Hugging Face URL; sort by relevance, popularity, likes or latest update. Expand a repo for variants, estimated memory, fit with current free RAM, and a recommended variant. Click one to download.
 
 Usage records are also written to `~/.local/state/omarchy/agents/usage/lmdeck.json`, so "tokens by day/model" works in the panel (and in the stock widget, if you keep it).

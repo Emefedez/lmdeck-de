@@ -644,7 +644,7 @@ impl Ui {
                     Some("prism") => "Prism build".into(),
                     Some("stock") => "stock build".into(),
                     _ => {
-                        let auto_prism = m.map(|m| m.needs_prism).unwrap_or(false) && self.cfg.prism_server().is_some();
+                        let auto_prism = m.map(|m| m.needs_prism).unwrap_or(false) && self.cfg.prism_ready().is_some();
                         if auto_prism { "auto (Prism)".into() } else { "auto (stock)".into() }
                     }
                 },

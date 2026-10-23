@@ -482,6 +482,11 @@ impl Config {
         (!p.is_empty()).then(|| expand(p))
     }
 
+    /// The Prism build, when its configured path actually exists.
+    pub fn prism_ready(&self) -> Option<PathBuf> {
+        self.prism_server().filter(|p| p.exists())
+    }
+
     /// The llama-server that should run `m`: an explicit per-model choice first, then the Prism
     /// build for files that need it, then the normal build.
     pub fn llama_server_for(&self, m: &crate::models::LocalModel, ov: Option<&ModelOverride>) -> Option<PathBuf> {
@@ -495,7 +500,7 @@ impl Config {
 
     /// True when `m` would actually run on the Prism build.
     pub fn runs_prism(&self, m: &crate::models::LocalModel, ov: Option<&ModelOverride>) -> bool {
-        match (self.llama_server_for(m, ov), self.prism_server()) {
+        match (self.llama_server_for(m, ov), self.prism_ready()) {
             (Some(a), Some(b)) => a == b,
             _ => false,
         }
@@ -1137,6 +1142,49 @@ mod tests {
         assert!(out.contains("ctx_size = 8192") && out.contains("# keep this"), "{out}");
         let back: super::Config = toml::from_str(&out).unwrap();
         assert_eq!(back.overrides["org/m"].ctx_size, Some(8192));
+    }
+
+    #[test]
+    fn engine_routing_prefers_the_prism_build_only_when_needed() {
+        let model = |needs_prism| crate::models::LocalModel {
+            name: "m".into(),
+            format: crate::models::Format::Gguf,
+            tools: true,
+            size: 1,
+            repo: None,
+            path: Default::default(),
+            files: vec![],
+            quant: "Q2_K".into(),
+            qmode: None,
+            arch: String::new(),
+            unsupported: None,
+            needs_prism,
+            params: String::new(),
+            ctx_len: None,
+            mmproj: None,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            thinking: false,
+            vision: false,
+        };
+        let mut cfg = super::Config::default();
+        cfg.llama.server_path = "/usr/bin/true".into();
+        cfg.llama.prism_path = "/usr/bin/false".into();
+        let stock = cfg.llama_server().unwrap();
+        let prism = cfg.prism_server().unwrap();
+        assert_eq!(cfg.llama_server_for(&model(false), None), Some(stock.clone()));
+        assert!(!cfg.runs_prism(&model(false), None));
+        assert_eq!(cfg.llama_server_for(&model(true), None), Some(prism));
+        assert!(cfg.runs_prism(&model(true), None), "auto routes a ternary header to the Prism build");
+        let mut ov = super::ModelOverride::default();
+        ov.engine = Some("stock".into());
+        assert_eq!(cfg.llama_server_for(&model(true), Some(&ov)), Some(stock.clone()), "an explicit choice wins");
+        assert!(!cfg.runs_prism(&model(true), Some(&ov)));
+        ov.engine = Some("prism".into());
+        assert!(cfg.runs_prism(&model(false), Some(&ov)));
+        // No Prism build configured: everything falls back to the normal one.
+        cfg.llama.prism_path.clear();
+        assert!(cfg.prism_server().is_none());
+        assert!(!cfg.runs_prism(&model(true), None));
     }
 }
 

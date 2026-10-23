@@ -410,14 +410,14 @@ fn is_split_incomplete(parts: &[PathBuf]) -> bool {
     false
 }
 
-/// Extract a quant tag like Q4_K_M, IQ3_XXS, UD-Q4_K_XL, F16, BF16, MXFP4 from a gguf name.
+/// Extract a quant tag like Q4_K_M, IQ3_XXS, UD-Q4_K_XL, F16, BF16, MXFP4, PQ2_0, PTQ1_0 from a gguf name.
 pub fn quant_tag(name: &str) -> String {
     let stem = name.trim_end_matches(".gguf");
     let parts: Vec<&str> = stem.split(['-', '.']).collect();
     for (i, p) in parts.iter().enumerate().rev() {
         let u = p.to_uppercase();
-        let is_q = (u.starts_with('Q') || u.starts_with("IQ") || u.starts_with("TQ"))
-            && u.chars().nth(if u.starts_with('Q') { 1 } else { 2 }).map(|c| c.is_ascii_digit()).unwrap_or(false);
+        let is_q = (u.starts_with('Q') || u.starts_with("IQ") || u.starts_with("TQ") || u.starts_with("PQ") || u.starts_with("PTQ"))
+            && u.chars().nth(if u.starts_with("PTQ") { 3 } else if u.starts_with('Q') { 1 } else { 2 }).map(|c| c.is_ascii_digit()).unwrap_or(false);
         let is_f = matches!(u.as_str(), "F16" | "BF16" | "F32" | "FP16" | "FP8" | "MXFP4" | "NVFP4");
         if is_q || is_f {
             if i > 0 && parts[i - 1].eq_ignore_ascii_case("UD") {
@@ -487,13 +487,18 @@ pub fn gguf_unsupported(m: &GgufMeta) -> Option<String> {
 /// True when the installed llama.cpp was built from the Prism fork: its `ggml.h` defines
 /// `GGML_TYPE_PQ2_0 = 142` (and PTQ1_0 = 143). Upstream's `GGML_TYPE_COUNT` stays at 43.
 pub fn llama_supports_prism() -> bool {
+    // A configured Prism binary is taken at its word (the source tree may not be kept). This part is
+    // not cached, so setting llama.prism_path takes effect on the next scan instead of a restart.
+    if crate::config::Config::load().map(|c| c.prism_ready().is_some()).unwrap_or(false) {
+        return true;
+    }
+    // Otherwise read the header once: the managed build, then `llama.server_path`'s tree
+    // (bin/llama-server next to src/).
     static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ONCE.get_or_init(|| {
         let mut headers = vec![crate::config::llama_dir().join("src/ggml/include/ggml.h")];
-        // llama.server_path / llama.prism_path may point at someone else's build
-        // (bin/llama-server next to src/).
         if let Ok(cfg) = crate::config::Config::load() {
-            for bin in [cfg.llama_server(), cfg.prism_server()].into_iter().flatten() {
+            if let Some(bin) = cfg.llama_server() {
                 if let Some(root) = bin.parent().and_then(|p| p.parent()) {
                     headers.push(root.join("src/ggml/include/ggml.h"));
                 }
@@ -519,8 +524,9 @@ pub fn gguf_unsupported_with(m: &GgufMeta, prism_ok: bool) -> Option<String> {
             None => "a custom ggml type".into(),
         };
         return Some(format!(
-            "Prism rotated ternary ({ty}, file type {file_type}): needs a Prism-capable llama.cpp - set \
-             llama.repo = https://github.com/PrismML-Eng/llama.cpp and llama.git_ref = prism, then build it \
+            "Prism rotated ternary ({ty}, file type {file_type}): needs the Prism build - point \
+             llama.prism_path at it (docs/TERNARY-PRISM.md), or set llama.repo = \
+             https://github.com/PrismML-Eng/llama.cpp and llama.git_ref = prism and rebuild \
              (upstream llama.cpp knows types 0-{KNOWN_GGML_TYPES})"
         ));
     }
@@ -771,6 +777,8 @@ mod tests {
         assert_eq!(quant_tag("gemma-3-12b-it-UD-Q4_K_XL.gguf"), "UD-Q4_K_XL");
         assert_eq!(quant_tag("model.IQ3_XXS.gguf"), "IQ3_XXS");
         assert_eq!(quant_tag("llama-bf16.gguf"), "BF16");
+        assert_eq!(quant_tag("Huihui-Qwen3.8-27B-abliterated-Ternary-Bonsai-PQ2_0.gguf"), "PQ2_0");
+        assert_eq!(quant_tag("model-PTQ1_0.gguf"), "PTQ1_0");
         assert_eq!(quant_tag("weird.gguf"), "weird");
     }
 
@@ -833,6 +841,7 @@ mod tests {
         let why = gguf_unsupported_with(&m, false).expect("flagged");
         assert!(why.contains("Prism") && why.contains("142"), "{why}");
         assert!(gguf_unsupported_with(&m, true).is_none(), "a Prism build reads it");
+        assert!(needs_prism(&m), "auto routing must pick the Prism build");
     }
 
     #[test]
@@ -842,6 +851,7 @@ mod tests {
         assert_eq!(m.max_type, Some(35));
         assert!(!m.prism);
         assert!(gguf_unsupported_with(&m, false).is_none());
+        assert!(!needs_prism(&m));
     }
 
     #[test]
@@ -849,6 +859,7 @@ mod tests {
         let m = meta_of(synthetic_gguf(141, 142, false), "custom");
         let why = gguf_unsupported_with(&m, false).expect("flagged");
         assert!(why.contains("142") && why.contains("llama.cpp"), "{why}");
+        assert!(needs_prism(&m), "a custom type in Prism's range wants the Prism build");
     }
 
     #[test]
