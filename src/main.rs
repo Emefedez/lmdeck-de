@@ -176,8 +176,18 @@ async fn async_main(cli: Cli) -> Result<()> {
         Some(Cmd::Ls) => {
             let ms = models::scan(&cfg);
             println!("{:<58} {:<5} {:<11} {:<8} {:>9}", "NAME", "FMT", "QUANT", "PARAMS", "SIZE");
+            let mut unsupported = Vec::new();
             for m in ms {
                 println!("{:<58} {:<5} {:<11} {:<8} {:>9}", m.name, m.format.as_str(), m.quant, m.params, human(m.size));
+                if let Some(why) = &m.unsupported {
+                    unsupported.push(format!("  {}: {why}", m.name));
+                }
+            }
+            if !unsupported.is_empty() {
+                println!("\nCannot load:");
+                for line in unsupported {
+                    println!("{line}");
+                }
             }
             Ok(())
         }

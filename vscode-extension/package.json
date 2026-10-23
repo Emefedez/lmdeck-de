@@ -52,6 +52,21 @@
         "command": "lmdeck.useCopilot",
         "title": "Always use Copilot (fallback off)",
         "category": "lmdeck"
+      },
+      {
+        "command": "lmdeck.setInlineModel",
+        "title": "Choose model for Copilot inline chat (Fix)...",
+        "category": "lmdeck"
+      },
+      {
+        "command": "lmdeck.setChatModel",
+        "title": "Choose model for Copilot chat...",
+        "category": "lmdeck"
+      },
+      {
+        "command": "lmdeck.toggleCollectUserData",
+        "title": "Toggle background user data collection (opt-in)",
+        "category": "lmdeck"
       }
     ],
     "configuration": {
@@ -62,10 +77,25 @@
           "default": "http://127.0.0.1:11434",
           "description": "Where the lmdeck server listens."
         },
+        "lmdeck.collectUserData": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt-in: allow background processes to check Copilot quota state and share editor agent usage/state with lmdeck. Disabled by default."
+        },
         "lmdeck.autoCheck": {
           "type": "boolean",
           "default": true,
-          "description": "Check the Copilot quota when VS Code starts and when its window regains focus (at most once per interval below). Nothing polls in the background. When off, checks happen only through the lmdeck menu."
+          "description": "Check the Copilot quota when VS Code starts and when its window regains focus (requires background user data collection to be opted in). When off, checks happen only through the lmdeck menu."
+        },
+        "lmdeck.inlineModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model for Copilot inline chat (Fix). Empty = use lmdeck's configured default."
+        },
+        "lmdeck.chatModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model for Copilot chat. Empty = use lmdeck's configured default."
         },
         "lmdeck.focusCheckMinutes": {
           "type": "number",

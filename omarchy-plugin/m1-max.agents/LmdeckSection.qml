@@ -5,8 +5,8 @@ import qs.Ui
 import qs.Commons as Commons
 
 // Live lmdeck view inside the Agents panel, split into themed cards:
-// Server · Now · Downloads · KV cache · Memory & residency · Backend & network
-// · Models · Hugging Face.
+// Server · Now · Downloads · KV cache · Strata · Coding agents ·
+// Memory & residency · Backend & network · Models · Hugging Face.
 Column {
   id: sec
 
@@ -25,6 +25,18 @@ Column {
 
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
   function setting(key) { return lm && lm.quick ? String(lm.quick[key] || "") : "" }
+  // Strata prompt-path presets, from config.rs STRATA_PROMPT_BENCHMARKS (10,609-token prompt, Q2_0,
+  // arena ~13.0 GB, M1 Max 32 GB). The stars are the ones the TUI's model settings popup shows.
+  function promptMetrics(mode) {
+    var t = {
+      "off":  { tok: 14.7,  speedup: 1.0, cache: 13.0, buffer: 0.0,  heat: "Cool & quiet",           speed: 1, use: 5, noise: 5 },
+      "1024": { tok: 109.0, speedup: 7.4, cache: 11.4, buffer: 1.60, heat: "Light heat & fan",      speed: 3, use: 4, noise: 4 },
+      "2048": { tok: 123.8, speedup: 8.4, cache: 10.4, buffer: 2.55, heat: "Balanced power & heat", speed: 4, use: 3, noise: 3 },
+      "4096": { tok: 134.7, speedup: 9.2, cache: 8.5,  buffer: 4.46, heat: "Higher power & fan",    speed: 5, use: 2, noise: 2 }
+    }
+    return t[mode] || null
+  }
+  function stars(n) { return "★★★★★".substring(0, n) + "☆☆☆☆☆".substring(0, 5 - n) }
   function isLoaded(name) {
     for (var i = 0; i < lm.running.length; i++) if (lm.running[i].name === name) return true
     return false
@@ -399,6 +411,40 @@ Column {
     }
   }
 
+  // ======================= Strata =======================
+  Card {
+    visible: lm.up
+    title: "STRATA"
+
+    Caption {
+      width: parent.width
+      text: "Qwen3.8-Flash-Next Q2_0: 125B MoE, experts streamed from the SSD (Vulkan)"
+      color: sec.dim
+      wrapMode: Text.WordWrap
+    }
+    SettingRow {
+      label: "Prompt path"
+      key: "strata.prompt_path"
+      info: "How the engine reads a prompt. off: through decode windows, 14.7 tok/s on a 10.6k-token prompt, so a ~20k-token Copilot chat request waits over 20 minutes. 1024 / 2048 / 4096: the GPU chunked path, 7.4x / 8.4x / 9.2x faster, holding 1.6 / 2.6 / 4.5 GB of the expert arena while a prompt runs. 2048 is the balance on 32 GB (10.4 GB of decode cache left); 4096 is fastest but hotter and leaves 8.5 GB. Applies on the next model load."
+      options: [{ value: "off", label: "off" }, { value: "1024", label: "1024" }, { value: "2048", label: "2048" }, { value: "4096", label: "4096" }]
+    }
+    Caption {
+      width: parent.width
+      readonly property var m: sec.promptMetrics(sec.setting("strata.prompt_path"))
+      visible: !!m
+      text: !m ? "" : "Speed " + sec.stars(m.speed) + "  " + m.tok.toFixed(1) + " tok/s (" + m.speedup.toFixed(1) + "x)"
+        + "\nUsability " + sec.stars(m.use) + "  " + m.cache.toFixed(1) + " GB decode cache · " + m.buffer.toFixed(2) + " GB chunk buffers"
+        + "\nHeat " + sec.stars(m.noise) + "  " + m.heat
+      color: sec.dim
+      wrapMode: Text.WordWrap
+    }
+    SmallButton {
+      visible: sec.anyStale
+      text: "Reload loaded model to apply"
+      onClicked: lm.reload("")
+    }
+  }
+
   // ======================= Coding agents =======================
   Card {
     visible: lm.up
@@ -486,12 +532,20 @@ Column {
       options: [{ value: "auto", label: "auto", tooltip: "Use a local model for chat and inline Fix while Copilot's quota is exhausted" },
                 { value: "always", label: "always" }, { value: "off", label: "off" }]
     }
+    ModelPickerRow {
+      label: "Fix (inline) model"
+      key: "vscode.inline_model"
+    }
+    ModelPickerRow {
+      label: "Chat model"
+      key: "vscode.chat_model"
+    }
     Caption {
       width: parent.width
       visible: !!lm.vscode && lm.vscode.installed
       readonly property string active: lm.status && lm.status.vscode_active ? lm.status.vscode_active : ""
       text: !lm.vscode ? "" : (lm.vscode.quota_blocked ? "Copilot quota exhausted · " : "Copilot quota available · ")
-        + (active ? "Fix/chat use " + active.split("/").pop() : "VS Code uses Copilot")
+        + (active ? (active.indexOf("(") >= 0 ? active : "Fix/chat use " + active.split("/").pop()) : "VS Code uses Copilot")
         + " · checked by the lmdeck VS Code extension (startup / focus)"
       color: active ? Commons.Color.accent : sec.dim
       wrapMode: Text.WordWrap
@@ -861,6 +915,72 @@ Column {
       radius: height / 2
       width: parent.width * Math.max(0, Math.min(1, parent.value))
       color: parent.alarming ? sec.urgent : sec.foreground
+    }
+  }
+
+  component ModelPickerRow: Item {
+    id: pickerRow
+    property string label: ""
+    property string key: ""
+    property string fallbackKey: "vscode.model"
+
+    readonly property var toolModels: {
+      var list = [""]
+      if (lm && lm.models) {
+        for (var i = 0; i < lm.models.length; i++) {
+          if (lm.models[i].tools) list.push(lm.models[i].name)
+        }
+      }
+      return list
+    }
+    readonly property string currentVal: sec.setting(key)
+    readonly property int currentIndex: {
+      var idx = toolModels.indexOf(currentVal)
+      return idx >= 0 ? idx : 0
+    }
+    function step(dir) {
+      if (toolModels.length <= 1) return
+      var nextIdx = (currentIndex + dir + toolModels.length) % toolModels.length
+      lm.setSetting(key, toolModels[nextIdx])
+    }
+
+    width: parent ? parent.width : 0
+    implicitHeight: Math.max(lbl.implicitHeight, ctrlRow.implicitHeight)
+
+    Caption {
+      id: lbl
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      text: pickerRow.label
+      color: sec.foreground
+    }
+
+    Row {
+      id: ctrlRow
+      anchors.right: parent.right
+      spacing: 4
+
+      SmallButton {
+        text: "◀"
+        enabled: pickerRow.toolModels.length > 1
+        onClicked: pickerRow.step(-1)
+      }
+
+      Caption {
+        anchors.verticalCenter: parent.verticalCenter
+        text: {
+          if (pickerRow.currentVal !== "") return pickerRow.currentVal.split("/").pop()
+          var fb = sec.setting(pickerRow.fallbackKey)
+          return fb !== "" ? "(" + fb.split("/").pop() + ")" : "(auto)"
+        }
+        color: pickerRow.currentVal !== "" ? Commons.Color.accent : sec.dim
+      }
+
+      SmallButton {
+        text: "▶"
+        enabled: pickerRow.toolModels.length > 1
+        onClicked: pickerRow.step(1)
+      }
     }
   }
 

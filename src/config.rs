@@ -51,6 +51,8 @@ pub struct ServerCfg {
     pub tool_allow: Vec<String>,
     /// Tool name globs never sent to local models (tool groups included).
     pub tool_deny: Vec<String>,
+    /// Globs of tools dropped for VS Code / Copilot in lean / groups mode (empty = default set).
+    pub copilot_drop: Vec<String>,
     /// Skip the memory admission check entirely.
     pub mem_check: bool,
     /// Refuse GPU loads that exceed the GPU memory budget (Asahi gives the GPU
@@ -231,11 +233,20 @@ pub struct VscodeCfg {
     /// Model for the fallback (empty = loaded model if it calls tools, else
     /// the smallest local tool-calling model).
     pub model: String,
+    /// Model for VS Code inline chat / Fix (empty = vscode.model).
+    pub inline_model: String,
+    /// Model for VS Code chat (empty = vscode.model).
+    pub chat_model: String,
 }
 
 impl Default for VscodeCfg {
     fn default() -> Self {
-        Self { fallback: "auto".into(), model: String::new() }
+        Self {
+            fallback: "auto".into(),
+            model: String::new(),
+            inline_model: String::new(),
+            chat_model: String::new(),
+        }
     }
 }
 
@@ -315,6 +326,7 @@ impl Default for ServerCfg {
             local_prompt: "lean".into(),
             tool_allow: Vec::new(),
             tool_deny: Vec::new(),
+            copilot_drop: Vec::new(),
             mem_check: true,
             gpu_mem_check: true,
             gpu_heap: "auto".into(),
@@ -600,6 +612,8 @@ pub enum Kind {
     PromptChunk,
     /// A prompt file, opened in the editor.
     Prompt,
+    /// A local model with tool calling (←/→ steps through them).
+    ToolModel,
 }
 
 pub const STRATA_PROMPT_CHUNKS: &[&str] = &["off", "1024", "2048", "4096"];
@@ -783,6 +797,7 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "System prompts", key: "strata.system_prompt", kind: Kind::Prompt, help: "System prompt for Strata models (prompts/strata.md, opens in your editor)" },
     Setting { section: "System prompts", key: "strata.system_prompt_mode", kind: MODE, help: "Strata: prepend / replace / fallback" },
     Setting { section: "Coding agents", key: "server.local_prompt", kind: Kind::Choice(&["lean", "original"]), help: "Claude Code prompt for local models: lean (drop MCP instructions and Claude model notes) / original" },
+    Setting { section: "Coding agents", key: "server.copilot_drop", kind: Kind::Text, help: "Tool globs dropped for VS Code / Copilot in lean mode (empty = default set; tool_allow wins)" },
     Setting { section: "Coding agents", key: "server.tool_allow", kind: Kind::Text, help: "Tool globs always sent to local models, even if local_tools drops them (wins over deny), e.g. mcp__rea__demangle_swift" },
     Setting { section: "Coding agents", key: "server.tool_deny", kind: Kind::Text, help: "Tool globs never sent to local models, e.g. mcp__rea__* WebSearch (lmdeck tools shows each tool's status)" },
     Setting { section: "Coding agents", key: "server.local_tools", kind: Kind::Choice(&["lean", "groups", "core", "all"]), help: "Claude Code tools sent to local models: lean (no MCP, essential tools, short descriptions) / groups (lean + MCP on demand) / core (no MCP) / all" },
@@ -796,7 +811,9 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "Integration", key: "hooks.on_load", kind: Kind::Text, help: "Shell cmd before the first model loads (e.g. tuned-adm profile asahi-performance)" },
     Setting { section: "Integration", key: "hooks.on_idle", kind: Kind::Text, help: "Shell cmd after the last model unloads" },
     Setting { section: "Integration", key: "vscode.fallback", kind: Kind::Choice(&["auto", "always", "off"]), help: "VS Code Copilot fallback: auto (local model while Copilot quota is exhausted) / always / off" },
-    Setting { section: "Integration", key: "vscode.model", kind: Kind::Text, help: "Model for the VS Code fallback (empty = automatic; must support tool calling)" },
+    Setting { section: "Integration", key: "vscode.model", kind: Kind::ToolModel, help: "Model for the VS Code fallback (empty = automatic; must support tool calling)" },
+    Setting { section: "Integration", key: "vscode.inline_model", kind: Kind::ToolModel, help: "Model for VS Code inline chat / Fix (empty = vscode.model)" },
+    Setting { section: "Integration", key: "vscode.chat_model", kind: Kind::ToolModel, help: "Model for VS Code chat (empty = vscode.model)" },
     Setting { section: "Integration", key: "usage.omarchy_record", kind: Kind::Bool, help: "Show lmdeck token usage in the Omarchy agents bar panel" },
     Setting { section: "Integration", key: "usage.perf", kind: Kind::Bool, help: "Record each model's speed and system power while it generates, for the grader (off: the grader estimates them). Costs one sensor read every 2 s while a request runs and ~10 KB" },
 ];
@@ -822,6 +839,7 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "server.local_tools" => c.server.local_tools.clone(),
         "server.tool_allow" => c.server.tool_allow.join(" "),
         "server.tool_deny" => c.server.tool_deny.join(" "),
+        "server.copilot_drop" => c.server.copilot_drop.join(" "),
         "server.local_prompt" => c.server.local_prompt.clone(),
         "server.gpu_mem_check" => c.server.gpu_mem_check.to_string(),
         "server.gpu_heap" => c.server.gpu_heap.clone(),
@@ -868,6 +886,8 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "usage.perf" => c.usage.perf.to_string(),
         "vscode.fallback" => c.vscode.fallback.clone(),
         "vscode.model" => c.vscode.model.clone(),
+        "vscode.inline_model" => c.vscode.inline_model.clone(),
+        "vscode.chat_model" => c.vscode.chat_model.clone(),
         "mlx.max_context" => c.mlx.max_context.to_string(),
         "mlx.system_prompt" => crate::sysprompt::to_line(&crate::sysprompt::backend_text(crate::models::Format::Mlx)),
         "mlx.system_prompt_mode" => c.mlx.system_prompt_mode.clone(),
@@ -908,6 +928,7 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         },
         "server.tool_allow" => c.server.tool_allow = words(v),
         "server.tool_deny" => c.server.tool_deny = words(v),
+        "server.copilot_drop" => c.server.copilot_drop = words(v),
         "server.local_tools" => match v {
             "lean" | "groups" | "core" | "all" => c.server.local_tools = v.into(),
             _ => return Err("lean, groups, core or all".into()),
@@ -991,6 +1012,8 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
             c.vscode.fallback = v.into()
         }
         "vscode.model" => c.vscode.model = v.into(),
+        "vscode.inline_model" => c.vscode.inline_model = v.into(),
+        "vscode.chat_model" => c.vscode.chat_model = v.into(),
         "mlx.max_context" => c.mlx.max_context = (num(v)? as u32).clamp(2048, 1 << 20),
         // Written to prompts/<backend>.md right away (the bar panel edits them as one line).
         "mlx.system_prompt" | "llama.system_prompt" => {

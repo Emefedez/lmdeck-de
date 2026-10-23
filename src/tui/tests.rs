@@ -1,5 +1,7 @@
 use super::popup::Popup;
 use super::*;
+use crate::config::{get_setting, SETTINGS};
+use crate::models::Format;
 use ratatui::backend::TestBackend;
 
 fn ui() -> Ui {
@@ -177,6 +179,61 @@ fn unsupported_checkpoints_are_marked_in_search_and_detail() {
     let text = draw(&mut ui, 160, 40);
     assert!(text.contains("not loadable by the MLX runtime"), "repo detail must say why");
     assert!(ui.repo_choices().iter().all(|(_, label, _)| !label.contains("recommended")), "must not recommend an unsupported MLX variant");
+}
+
+#[tokio::test]
+async fn tool_model_settings_cycle_with_arrow_keys() {
+    let mut ui = ui();
+    ui.tab = Tab::Settings;
+    ui.models = vec![
+        LocalModel {
+            name: "model-a".into(),
+            format: Format::Mlx,
+            tools: true,
+            size: 2 << 30,
+            repo: None,
+            path: Default::default(),
+            files: vec![],
+            quant: String::new(),
+            qmode: None,
+            arch: String::new(),
+            unsupported: None,
+            params: String::new(),
+            ctx_len: None,
+            mmproj: None,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            thinking: false,
+            vision: false,
+        },
+        LocalModel {
+            name: "no-tools".into(),
+            format: Format::Mlx,
+            tools: false,
+            size: 1 << 30,
+            repo: None,
+            path: Default::default(),
+            files: vec![],
+            quant: String::new(),
+            qmode: None,
+            arch: String::new(),
+            unsupported: None,
+            params: String::new(),
+            ctx_len: None,
+            mmproj: None,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            thinking: false,
+            vision: false,
+        },
+    ];
+    let idx = SETTINGS.iter().position(|s| s.key == "vscode.inline_model").unwrap();
+    ui.settings_sel.select(Some(idx));
+    assert_eq!(get_setting(&ui.cfg, "vscode.inline_model"), "");
+    ui.settings_act(KeyCode::Right);
+    assert_eq!(get_setting(&ui.cfg, "vscode.inline_model"), "model-a");
+    ui.settings_act(KeyCode::Right);
+    assert_eq!(get_setting(&ui.cfg, "vscode.inline_model"), "");
+    ui.settings_act(KeyCode::Left);
+    assert_eq!(get_setting(&ui.cfg, "vscode.inline_model"), "model-a");
 }
 
 #[test]

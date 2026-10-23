@@ -38,6 +38,48 @@ pub const LEAN_DROP: &[&str] = &[
     "ReportFindings", "Artifact", "ArtifactComments", "ArtifactData", "DesignSync",
 ];
 
+/// Tools dropped for VS Code / Copilot in lean / groups mode.
+pub const COPILOT_DROP: &[&str] = &[
+    "activate_*",
+    "*notebook*",
+    "copilot_getNotebookSummary",
+    "github_*",
+    "vscode_*",
+    "get_vscode_api",
+    "run_vscode_command",
+    "install_extension",
+    "create_directory",
+    "create_new_workspace",
+    "create_and_run_task",
+    "get_task_output",
+    "run_task",
+    "runSubagent",
+    "manage_todo_list",
+    "testFailure",
+    "memory",
+    "resolve_memory_file_uri",
+    "session_store_sql",
+    "click_element",
+    "drag_element",
+    "handle_dialog",
+    "hover_element",
+    "navigate_page",
+    "open_browser_page",
+    "read_page",
+    "run_playwright_code",
+    "screenshot_page",
+    "type_in_page",
+    "run_in_terminal",
+    "get_terminal_output",
+    "kill_terminal",
+    "terminal_last_command",
+    "terminal_selection",
+    "send_to_terminal",
+    "configure_python_*",
+    "find_dotnet_*",
+    "container-tools_*",
+];
+
 pub fn shorten(text: &str, max: usize) -> String {
     let first = text.split("\n\n").next().unwrap_or(text).trim();
     if first.chars().count() <= max {
@@ -97,7 +139,20 @@ pub fn trim_openai_tools(body: &mut Value, mode: ToolMode, rules: &crate::toolru
     tools.retain(|t| {
         let n = t["function"]["name"].as_str().unwrap_or("");
         let c = crate::toolrules::vscode_canonical(n);
-        !n.starts_with("mcp_") || rules.allows(&std::iter::once(n).chain(c.as_deref()).collect::<Vec<_>>())
+        let names: Vec<&str> = std::iter::once(n).chain(c.as_deref()).collect();
+        if rules.denies(&names) {
+            return false;
+        }
+        if rules.allows(&names) {
+            return true;
+        }
+        if n.starts_with("mcp_") {
+            return false;
+        }
+        if matches!(mode, ToolMode::Lean | ToolMode::Groups) && rules.drops_copilot(&names) {
+            return false;
+        }
+        true
     });
     if matches!(mode, ToolMode::Lean | ToolMode::Groups) {
         for t in tools.iter_mut() {
@@ -711,11 +766,25 @@ mod vscode_tests {
         let mut body = json!({"tools": [
             {"type": "function", "function": {"name": "read_file", "description": long, "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "x ".repeat(300)}}}}},
             {"type": "function", "function": {"name": "mcp_rea_open_binary", "description": "MCP", "parameters": {}}},
+            {"type": "function", "function": {"name": "run_in_terminal", "description": "Terminal", "parameters": {}}},
+            {"type": "function", "function": {"name": "activate_group_0", "description": "Stub", "parameters": {}}},
         ]});
-        assert_eq!(trim_openai_tools(&mut body, ToolMode::Lean, &crate::toolrules::Rules::default()), (2, 1));
+        // read_file is kept; mcp_rea, run_in_terminal, activate_group_0 are dropped
+        assert_eq!(trim_openai_tools(&mut body, ToolMode::Lean, &crate::toolrules::Rules::default()), (4, 1));
+        assert_eq!(body["tools"][0]["function"]["name"], "read_file");
         assert_eq!(body["tools"][0]["function"]["description"], "Reads a file.");
         assert!(body["tools"][0]["function"]["parameters"]["properties"]["path"]["description"].as_str().unwrap().chars().count() <= 161);
         assert_eq!(body["tools"][0]["function"]["parameters"]["properties"]["path"]["type"], "string");
+
+        // allow wins over copilot_drop
+        let mut body2 = json!({"tools": [
+            {"type": "function", "function": {"name": "run_in_terminal", "description": "Terminal", "parameters": {}}},
+        ]});
+        let mut rules = crate::toolrules::Rules::default();
+        rules.allow = vec!["run_in_terminal".into()];
+        assert_eq!(trim_openai_tools(&mut body2, ToolMode::Lean, &rules), (1, 1));
+        assert_eq!(body2["tools"][0]["function"]["name"], "run_in_terminal");
+
         let mut all = json!({"tools": [{"type": "function", "function": {"name": "mcp_x_y"}}]});
         assert_eq!(trim_openai_tools(&mut all, ToolMode::All, &crate::toolrules::Rules::default()), (1, 1));
     }

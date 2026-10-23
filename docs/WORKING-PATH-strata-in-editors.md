@@ -1,6 +1,6 @@
 # Working path: Strata usable in the editor chat
 
-Status: adopted 2026-10-23. Step 1 is done; steps 2-5 are implemented in the order below, easiest first.
+Status: adopted 2026-10-23. Steps 1, 2, and 3 are done; steps 4-5 are implemented in the order below, easiest first.
 `PLAN-strata-in-editors.md` stays as the background plan; where the two disagree, this file wins. All numbers here
 were measured on the M1 Max (32 GB, Asahi) with Q2_0 and are quoted with their source.
 
@@ -48,8 +48,8 @@ worst case, so the path below optimises chat.
 | # | step | effort | effect on a 20.5k chat turn |
 |---|---|---|---|
 | 1 | `strata.prompt_path = 2048` | one config line; **done** | 188 s -> 166 s; same energy, less wall clock |
-| 2 | split chat/Fix models in the extension (PLAN Part 5) | ~80 lines, no model run | an escape hatch: chat can leave Strata entirely until 3-5 land |
-| 3 | a Copilot tool drop list (PLAN Part 3.1, extended) | one list + a rule, ~40 lines | 20.5k -> ~4k; ~166 s -> ~35 s |
+| 2 | split chat/Fix models in the extension (PLAN Part 5) | ~80 lines, no model run; **done** | an escape hatch: chat can leave Strata entirely until 3-5 land |
+| 3 | a Copilot tool drop list (PLAN Part 3.1, extended) | one list + a rule, ~40 lines; **done** | 20.5k -> ~4k; ~166 s -> ~35 s |
 | 4 | a lean Copilot system prompt (PLAN Part 3.2) | needs one captured request, then text | ~4k -> ~3k; ~35 s -> ~25 s |
 | 5 | prefix reuse (PLAN Part 2) | lmdeck sends `strata_prefix` + a memory cap | repeat turn reads only the new part: seconds |
 
@@ -68,41 +68,36 @@ path is the same amount of GPU work either way, so a faster chunk means fewer se
 
 Done when: after a reload, the engine log says `prompts on the matrix units in chunks of 2048`.
 
-### Step 2 - chat and Fix on different models (PLAN Part 5)
+### Step 2 - chat and Fix on different models (PLAN Part 5) (done)
 
 Today both `inlineChat.defaultModel` and `chat.defaultModel` get `vscode.model` (`KEYS`,
-`vscode-extension/extension.js:14`). Add `vscode.inline_model` and `vscode.chat_model` (empty = `vscode.model`):
+`vscode-extension/extension.js:14`). Added `vscode.inline_model` and `vscode.chat_model` (empty = `vscode.model`):
 
 - `src/config.rs`: two `String` fields next to `vscode.model`, their `Setting` rows, get/set arms, and the
-  `/lmdeck/vscode` payload already returning `suggested_model` (add both fields beside it).
+  `/lmdeck/vscode` payload returning `suggested_model`, `inline_model`, and `chat_model`.
 - `vscode-extension/extension.js`: `applyLocal` sets `inlineChat.defaultModel` from `inline_model` and
-  `chat.defaultModel` from `chat_model`; `restore()` already saves and undoes each key separately.
+  `chat.defaultModel` from `chat_model`; `restore()` saves and undoes each key separately.
+  Both models are controllable directly in the editor UI through the lmdeck Quick Pick menu (`Choose model for Copilot inline chat (Fix)`, `Choose model for Copilot chat`) and via settings.
+  Background user data collection and background quota checks are strictly opt-in (`lmdeck.collectUserData`, default false) and easily toggleable with one click in the menu.
 - `src/tui/settings.rs` and the bar panel: show both, arrow keys to choose among models that can call tools.
 
-This is relief, not a fix: a small model in chat means giving up Strata there. It also puts Fix on a fast model
-(Qwen3.5-4B reads prompts at ~467 tok/s), where Strata's 20k-token requests are wasted anyway.
-
-Done when: lmdeck's Log shows `applied strata/q2_0` for one key and the small model for the other, and switching a
+Done: lmdeck's Log shows `applied strata/q2_0` for one key and the small model for the other, and switching a
 VS Code window from Fix to chat does not need a reload.
 
-### Step 3 - drop the tools a local model does not need
+### Step 3 - drop the tools a local model does not need (done)
 
-Add a Copilot drop list next to `LEAN_DROP` and apply it to VS Code requests in `trim_openai_tools`
-(`src/anthropic.rs:91`), keyed on the client like `toolrules::status` already does (`src/toolrules.rs:76`).
+Added `COPILOT_DROP` next to `LEAN_DROP` and applied it to VS Code requests in `trim_openai_tools`
+(`src/anthropic.rs:91`), keyed on the client like `toolrules::status` does (`src/toolrules.rs:76`).
+Configured via `server.copilot_drop` (empty = default set; `server.tool_allow` wins over it).
 
-Keep by default: `file_search`, `grep_search`, `read_file`, `list_dir`, `replace_string_in_file`,
+Kept by default: `file_search`, `grep_search`, `read_file`, `list_dir`, `replace_string_in_file`,
 `insert_edit_into_file`, `create_file`, `get_errors`, `fetch_webpage`, `view_image` (~2.8k raw tokens, 10 tools).
-Drop by default: the playwright set, `activate_*`, notebook, github, `vscode_*` meta, `memory`,
-`manage_todo_list`, `runSubagent`, `session_store_sql`, `run_in_terminal` (1,880 tokens on its own), python/dotnet
-setup. Everything dropped stays available through `server.tool_allow` (the glob list already exists,
-`src/config.rs:786`), so agent mode can be re-enabled per tool instead of paying for all 72.
+Dropped by default: the playwright set, `activate_*`, notebook, github, `vscode_*` meta, `memory`,
+`manage_todo_list`, `runSubagent`, `session_store_sql`, `run_in_terminal`, python/dotnet setup.
+Everything dropped stays available through `server.tool_allow`.
 
-Expected: 19,366 raw tool tokens -> ~2.8k, request ~20.5k -> ~4k, and that is the difference between ~166 s and ~35 s
-to the first token at chunk 2048. Verify from lmdeck's log: `VS Code request ~A -> ~B tokens, tools 72 -> N`.
-
-Risk: dropping `run_in_terminal` breaks build/test loops, so it has to be allow-listed to come back. Make the list a
-setting (`server.copilot_drop`, globs) rather than a constant, and let `server.tool_allow` win over it the way
-`toolrules::status` already orders denies, allows and the mode (`src/toolrules.rs:75`), so this stays reversible.
+Measured result via `lmdeck tools`:
+`copilot: 89 tools, ~2829 tokens of schemas sent directly` (dropped from ~19,366 tokens; 72 non-MCP tools trimmed to 10).
 
 ### Step 4 - a lean Copilot system prompt (PLAN Part 3.2)
 

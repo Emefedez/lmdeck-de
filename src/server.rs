@@ -1679,6 +1679,9 @@ fn status_value(a: &App) -> Value {
         "server.mem_check",
         "server.gpu_heap",
         "vscode.fallback",
+        "vscode.model",
+        "vscode.inline_model",
+        "vscode.chat_model",
     ]
     .iter()
     .map(|k| (k.to_string(), json!(crate::config::get_setting(&cfg, k))))
@@ -1909,6 +1912,12 @@ async fn lm_models(State(a): State<App>) -> Json<Value> {
             v["gpu_fit"] = json!(crate::compat::gpu_fit(m.size, cfg.llama.ctx_size as u64));
             if m.format == Format::Mlx {
                 v["compat"] = json!(crate::compat::assess_mlx(&cfg, m.repo.as_deref().unwrap_or(&m.name), m.qmode.as_deref()));
+            } else if let Some(why) = &m.unsupported {
+                v["compat"] = json!({
+                    "level": "unlikely",
+                    "reason": why,
+                    "recommend": "Use a standard TQ1_0/TQ2_0 ternary GGUF, or Prism's runtime for PQ2_0",
+                });
             }
             v
         })
@@ -1999,11 +2008,16 @@ async fn lm_vscode(State(a): State<App>) -> Json<Value> {
     let active = a.vscode_active.lock().unwrap().clone();
     let v = tokio::task::spawn_blocking(move || {
         let _ = crate::vscode::ensure_provider(&cfg);
+        let suggested = crate::vscode::pick_model(&cfg, &models, loaded.as_deref());
+        let inline = crate::vscode::pick_inline_model(&cfg, &models, loaded.as_deref());
+        let chat = crate::vscode::pick_chat_model(&cfg, &models, loaded.as_deref());
         json!({
             "installed": crate::vscode::installed(),
             "mode": cfg.vscode.fallback,
             "quota_blocked": crate::vscode::quota_blocked(),
-            "suggested_model": crate::vscode::pick_model(&cfg, &models, loaded.as_deref()),
+            "suggested_model": suggested,
+            "inline_model": inline,
+            "chat_model": chat,
             "active_model": active,
         })
     })

@@ -93,6 +93,24 @@ pub fn pick_model(cfg: &Config, models: &[LocalModel], loaded: Option<&str>) -> 
     models.iter().filter(tools).filter(|m| crate::compat::gpu_fit(m.size, 8192) != "too big").min_by_key(|m| m.size).map(|m| m.name.clone())
 }
 
+/// Model for VS Code inline chat / Fix: configured `vscode.inline_model`,
+/// else `pick_model` (which checks `vscode.model`, then loaded, then smallest).
+pub fn pick_inline_model(cfg: &Config, models: &[LocalModel], loaded: Option<&str>) -> Option<String> {
+    if !cfg.vscode.inline_model.is_empty() {
+        return Some(cfg.vscode.inline_model.clone());
+    }
+    pick_model(cfg, models, loaded)
+}
+
+/// Model for VS Code chat: configured `vscode.chat_model`,
+/// else `pick_model` (which checks `vscode.model`, then loaded, then smallest).
+pub fn pick_chat_model(cfg: &Config, models: &[LocalModel], loaded: Option<&str>) -> Option<String> {
+    if !cfg.vscode.chat_model.is_empty() {
+        return Some(cfg.vscode.chat_model.clone());
+    }
+    pick_model(cfg, models, loaded)
+}
+
 /// Remove `// set by lmdeck` lines earlier builds wrote into settings.json
 /// (the extension now manages those settings through VS Code's API).
 pub fn reset_settings_lines() -> Result<bool> {
@@ -104,4 +122,60 @@ pub fn reset_settings_lines() -> Result<bool> {
     let new = raw.lines().filter(|l| !l.contains(MARK)).collect::<Vec<_>>().join("\n") + if raw.ends_with('\n') { "\n" } else { "" };
     std::fs::write(&p, new)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Format;
+
+    fn test_model(name: &str, tools: bool, size: u64) -> LocalModel {
+        LocalModel {
+            name: name.into(),
+            format: Format::Mlx,
+            tools,
+            size,
+            repo: None,
+            path: Default::default(),
+            files: vec![],
+            quant: String::new(),
+            qmode: None,
+            arch: String::new(),
+            unsupported: None,
+            params: String::new(),
+            ctx_len: None,
+            mmproj: None,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            thinking: false,
+            vision: false,
+        }
+    }
+
+    #[test]
+    fn pick_models_honors_chat_and_inline_overrides() {
+        let mut cfg = Config::default();
+        let models = vec![
+            test_model("fast-inline-model", true, 2 << 30),
+            test_model("strata/q2_0", true, 13 << 30),
+            test_model("small-no-tools", false, 1 << 30),
+        ];
+
+        // Default: falls back to smallest tool model
+        assert_eq!(pick_model(&cfg, &models, None), Some("fast-inline-model".into()));
+        assert_eq!(pick_inline_model(&cfg, &models, None), Some("fast-inline-model".into()));
+        assert_eq!(pick_chat_model(&cfg, &models, None), Some("fast-inline-model".into()));
+
+        // vscode.model overrides all if inline/chat are empty
+        cfg.vscode.model = "default-override".into();
+        assert_eq!(pick_model(&cfg, &models, None), Some("default-override".into()));
+        assert_eq!(pick_inline_model(&cfg, &models, None), Some("default-override".into()));
+        assert_eq!(pick_chat_model(&cfg, &models, None), Some("default-override".into()));
+
+        // inline_model and chat_model override individually
+        cfg.vscode.inline_model = "fast-inline-model".into();
+        cfg.vscode.chat_model = "strata/q2_0".into();
+        assert_eq!(pick_inline_model(&cfg, &models, None), Some("fast-inline-model".into()));
+        assert_eq!(pick_chat_model(&cfg, &models, None), Some("strata/q2_0".into()));
+        assert_eq!(pick_model(&cfg, &models, None), Some("default-override".into()));
+    }
 }

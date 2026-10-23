@@ -13,10 +13,21 @@
 use crate::anthropic::ToolMode;
 use serde_json::{json, Value};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Rules {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
+    pub copilot_drop: Vec<String>,
+}
+
+impl Default for Rules {
+    fn default() -> Self {
+        Self {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            copilot_drop: crate::anthropic::COPILOT_DROP.iter().map(|s| s.to_string()).collect(),
+        }
+    }
 }
 
 pub fn glob(pat: &str, name: &str) -> bool {
@@ -40,7 +51,15 @@ pub fn glob(pat: &str, name: &str) -> bool {
 
 impl Rules {
     pub fn from_cfg(c: &crate::config::Config) -> Self {
-        Rules { allow: c.server.tool_allow.clone(), deny: c.server.tool_deny.clone() }
+        Rules {
+            allow: c.server.tool_allow.clone(),
+            deny: c.server.tool_deny.clone(),
+            copilot_drop: if c.server.copilot_drop.is_empty() {
+                crate::anthropic::COPILOT_DROP.iter().map(|s| s.to_string()).collect()
+            } else {
+                c.server.copilot_drop.clone()
+            },
+        }
     }
 
     fn any(pats: &[String], names: &[&str]) -> bool {
@@ -55,6 +74,11 @@ impl Rules {
     /// Denied and not allowed.
     pub fn denies(&self, names: &[&str]) -> bool {
         Self::any(&self.deny, names) && !self.allows(names)
+    }
+
+    /// Dropped for Copilot in lean / groups mode, unless allowed.
+    pub fn drops_copilot(&self, names: &[&str]) -> bool {
+        Self::any(&self.copilot_drop, names) && !self.allows(names)
     }
 }
 
@@ -87,6 +111,7 @@ pub fn status(client: &str, name: &str, mode: ToolMode, rules: &Rules) -> &'stat
         (ToolMode::Groups, true) if client != "codex" => "group",
         (_, true) => "dropped",
         (ToolMode::Lean | ToolMode::Groups, false) if client == "claude" && crate::anthropic::LEAN_DROP.contains(&name) => "dropped",
+        (ToolMode::Lean | ToolMode::Groups, false) if client == "copilot" && rules.drops_copilot(&names) => "dropped",
         (ToolMode::Lean | ToolMode::Groups, false) => "sent (short)",
         (ToolMode::Core, false) => "sent",
     }
@@ -200,7 +225,11 @@ mod tests {
     use super::*;
 
     fn rules(allow: &[&str], deny: &[&str]) -> Rules {
-        Rules { allow: allow.iter().map(|s| s.to_string()).collect(), deny: deny.iter().map(|s| s.to_string()).collect() }
+        Rules {
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+            copilot_drop: crate::anthropic::COPILOT_DROP.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
     #[test]
@@ -221,6 +250,10 @@ mod tests {
         assert_eq!(status("claude", "mcp__hypruse__ui", ToolMode::Groups, &r), "group");
         assert_eq!(status("codex", "mcp__hypruse__ui", ToolMode::Groups, &r), "dropped");
         assert_eq!(status("copilot", "mcp_rea_open_binary", ToolMode::All, &r), "denied");
+        assert_eq!(status("copilot", "run_in_terminal", ToolMode::Lean, &r), "dropped");
+        assert_eq!(status("copilot", "read_file", ToolMode::Lean, &r), "sent (short)");
+        let r_allowed = rules(&["run_in_terminal"], &[]);
+        assert_eq!(status("copilot", "run_in_terminal", ToolMode::Lean, &r_allowed), "allowed");
         assert_eq!(status("claude", "WebSearch", ToolMode::All, &r), "denied");
     }
 

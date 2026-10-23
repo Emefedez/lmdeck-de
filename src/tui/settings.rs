@@ -25,13 +25,13 @@ impl Ui {
         let default = get_setting(&Config::default(), s.key);
         let enter = match s.kind {
             Kind::Bool => if value == "true" { "Turn off" } else { "Turn on" },
-            Kind::Choice(_) | Kind::PromptChunk => "Next value",
+            Kind::Choice(_) | Kind::PromptChunk | Kind::ToolModel => "Next value",
             Kind::Prompt => "Open in your editor",
             _ => "Edit",
         };
         let mut acts = vec![
             Act::new(KeyCode::Enter, enter),
-            Act::new(KeyCode::Right, "Change").or(KeyCode::Left).hint("←/→").when(matches!(s.kind, Kind::Bool | Kind::Choice(_) | Kind::Gib | Kind::PromptChunk), "only on/off, choices and sliders change with ←/→; Enter edits"),
+            Act::new(KeyCode::Right, "Change").or(KeyCode::Left).hint("←/→").when(matches!(s.kind, Kind::Bool | Kind::Choice(_) | Kind::Gib | Kind::PromptChunk | Kind::ToolModel), "only on/off, choices, sliders and models change with ←/→; Enter edits"),
             Act::new(KeyCode::Char('r'), "Reset to default").when(value != default && s.kind != Kind::Prompt, "already the default"),
             Act::new(KeyCode::Char('o'), "Open config.toml"),
         ];
@@ -47,7 +47,7 @@ impl Ui {
         let s = self.setting();
         match key {
             KeyCode::Enter => match s.kind {
-                Kind::Bool | Kind::Choice(_) => self.step_setting(s.key, 1),
+                Kind::Bool | Kind::Choice(_) | Kind::ToolModel => self.step_setting(s.key, 1),
                 Kind::PromptChunk => {
                     let cur = get_setting(&self.cfg, s.key);
                     let next = crate::config::prompt_chunk_cycle(&cur);
@@ -90,6 +90,16 @@ impl Ui {
                 None => return,
             },
             Kind::PromptChunk => crate::config::prompt_chunk_step(&cur, dir).to_string(),
+            Kind::ToolModel => {
+                let mut opts = vec![String::new()];
+                for m in &self.models {
+                    if m.tools && !opts.contains(&m.name) {
+                        opts.push(m.name.clone());
+                    }
+                }
+                let i = opts.iter().position(|o| o == &cur).unwrap_or(0) as i32;
+                opts[(i + dir).rem_euclid(opts.len() as i32) as usize].clone()
+            }
             _ => return,
         };
         self.edit_config(key, |c| set_setting(c, key, &next));
@@ -145,6 +155,14 @@ impl Ui {
                     .then(|| "file".to_string())
                     .unwrap_or_else(|| "none".into()),
                 Kind::Gib | Kind::Choice(_) | Kind::Bool | Kind::PromptChunk => format!("◂ {value} ▸"),
+                Kind::ToolModel => {
+                    let display = if value.is_empty() {
+                        if s.key == "vscode.model" { "(auto)" } else { "(vscode.model)" }
+                    } else {
+                        &value
+                    };
+                    format!("◂ {display} ▸")
+                }
                 _ => value.clone(),
             };
             let changed = value != get_setting(&Config::default(), s.key);
@@ -174,6 +192,14 @@ impl Ui {
             l.push(kv("Choices", &opts.join(" / ")));
         } else if s.kind == Kind::PromptChunk {
             l.push(kv("Choices", &crate::config::STRATA_PROMPT_CHUNKS.join(" / ")));
+        } else if s.kind == Kind::ToolModel {
+            let tools: Vec<&str> = self.models.iter().filter(|m| m.tools).map(|m| m.name.as_str()).collect();
+            let summary = if tools.is_empty() {
+                "(none local)".to_string()
+            } else {
+                format!("(empty = {}) / {}", if s.key == "vscode.model" { "auto" } else { "vscode.model" }, tools.join(" / "))
+            };
+            l.push(kv("Choices", &summary));
         }
         l.push(kv("Applies", applies(s.key)));
         l.push(Line::raw(""));

@@ -229,6 +229,7 @@ fn scan_snapshot(repo: &str, snap: &Path, out: &mut Vec<LocalModel>) {
             }
             let tag = quant_tag(&key);
             let meta = gguf_meta(&parts[0]).unwrap_or_default();
+            let unsupported = gguf_unsupported(&meta);
             out.push(LocalModel {
                 name: format!("{repo}:{tag}"),
                 format: Format::Gguf,
@@ -239,7 +240,7 @@ fn scan_snapshot(repo: &str, snap: &Path, out: &mut Vec<LocalModel>) {
                 quant: tag.clone(),
                 qmode: None,
                 arch: meta.arch,
-                unsupported: None,
+                unsupported,
                 params: if meta.size_label.is_empty() { params_from_name(repo) } else { meta.size_label },
                 ctx_len: meta.ctx_len,
                 vision: mmproj.is_some(),
@@ -336,6 +337,7 @@ fn scan_loose(dir: &Path, out: &mut Vec<LocalModel>) {
         }
         let stem = key.trim_end_matches(".gguf").to_string();
         let meta = gguf_meta(&parts[0]).unwrap_or_default();
+        let unsupported = gguf_unsupported(&meta);
         let mmproj = parts[0].parent().and_then(|d| {
             std::fs::read_dir(d).ok()?.flatten().map(|e| e.path()).find(|p| {
                 ext_is(p, "gguf") && fname(p).to_lowercase().starts_with("mmproj")
@@ -352,7 +354,7 @@ fn scan_loose(dir: &Path, out: &mut Vec<LocalModel>) {
             quant: quant_tag(&key),
             qmode: None,
             arch: meta.arch,
-            unsupported: None,
+            unsupported,
             params: if meta.size_label.is_empty() { params_from_name(&stem) } else { meta.size_label },
             ctx_len: meta.ctx_len,
             vision: mmproj.is_some(),
@@ -452,6 +454,42 @@ pub struct GgufMeta {
     pub ctx_len: Option<u64>,
     pub tools: bool,
     pub thinking: bool,
+    /// `general.file_type` (LLAMA_FTYPE_*); > 42 means a fork, not upstream llama.cpp.
+    pub file_type: Option<u32>,
+    /// The highest `ggml_type` among the tensors.
+    pub max_type: Option<i32>,
+    /// The file carries `prism.*` metadata (Prism's hadamard-rotated ternary, "PQ2_0").
+    pub prism: bool,
+}
+
+/// The highest `ggml_type` the bundled llama.cpp knows: build c35b667 (2026-10-08) has
+/// `GGML_TYPE_COUNT = 43`, so 0..=42 including TQ1_0 (34) and TQ2_0 (35). Raise it when
+/// `llama.git_ref` moves to a build that adds types.
+pub const KNOWN_GGML_TYPES: i32 = 42;
+
+/// Why a GGUF cannot be loaded by this llama.cpp, if it cannot. The file's own metadata says
+/// it: a type above `KNOWN_GGML_TYPES`, or Prism's `prism.hadamard.*` block, whose weights are
+/// rotated before ternary quantization and need Prism's runtime to undo.
+pub fn gguf_unsupported(m: &GgufMeta) -> Option<String> {
+    let custom = m.max_type.filter(|t| *t > KNOWN_GGML_TYPES);
+    let file_type = m.file_type.map(|f| f.to_string()).unwrap_or_else(|| "?".into());
+    if m.prism {
+        let ty = match custom {
+            Some(t) => format!("custom ggml type {t}"),
+            None => "a custom ggml type".into(),
+        };
+        return Some(format!(
+            "Prism rotated ternary ({ty}, file type {file_type}): the weights are hadamard-rotated before quantization, \
+             so llama.cpp cannot read them (it knows types 0-{KNOWN_GGML_TYPES}). Needs Prism's runtime, or a standard \
+             TQ1_0/TQ2_0 build"
+        ));
+    }
+    custom.map(|t| {
+        format!(
+            "custom ggml tensor type {t} (file type {file_type}): this llama.cpp build knows types 0-{KNOWN_GGML_TYPES}; \
+             rebuild with a newer `llama.git_ref` if upstream added it"
+        )
+    })
 }
 
 pub fn gguf_meta(path: &Path) -> Option<GgufMeta> {
@@ -463,7 +501,7 @@ pub fn gguf_meta(path: &Path) -> Option<GgufMeta> {
         return None;
     }
     let _version = rd_u32(&mut r)?;
-    let _tensors = rd_u64(&mut r)?;
+    let tensors = rd_u64(&mut r)?;
     let kvs = rd_u64(&mut r)?;
     let mut m = GgufMeta::default();
     let mut ctx_by_key: Vec<(String, u64)> = Vec::new();
@@ -483,6 +521,15 @@ pub fn gguf_meta(path: &Path) -> Option<GgufMeta> {
                     ctx_by_key.push((k.to_string(), v));
                 }
             }
+            "general.file_type" => {
+                if let Some(Some(v)) = rd_int(&mut r, ty) {
+                    m.file_type = Some(v as u32);
+                }
+            }
+            k if k.starts_with("prism.") => {
+                m.prism = true;
+                skip_val(&mut r, ty)?;
+            }
             _ => skip_val(&mut r, ty)?,
         }
     }
@@ -491,7 +538,26 @@ pub fn gguf_meta(path: &Path) -> Option<GgufMeta> {
         .find(|(k, _)| k.starts_with(&format!("{}.", m.arch)))
         .or(ctx_by_key.first())
         .map(|(_, v)| *v);
+    m.max_type = gguf_tensor_types(&mut r, tensors);
     Some(m)
+}
+
+/// The highest `ggml_type` in the file's tensor infos, right after the metadata block.
+/// `None` when the header cannot be read that far (the string/quant checks still work).
+fn gguf_tensor_types<R: Read + Seek>(r: &mut BufReader<R>, tensors: u64) -> Option<i32> {
+    let mut max = 0i32;
+    for _ in 0..tensors.min(1_000_000) {
+        let _name = rd_str(r)?;
+        let dims = rd_u32(r)?;
+        if dims > 8 {
+            return None;
+        }
+        r.seek_relative(i64::from(dims) * 8).ok()?;
+        let ty = rd_u32(r)? as i32;
+        let _offset = rd_u64(r)?;
+        max = max.max(ty);
+    }
+    Some(max)
 }
 
 fn rd_u32<R: Read>(r: &mut R) -> Option<u32> {
@@ -672,6 +738,76 @@ mod tests {
     fn splits() {
         assert_eq!(split_key("big-Q8_0-00001-of-00003.gguf"), "big-Q8_0.gguf");
         assert_eq!(split_key("small-Q8_0.gguf"), "small-Q8_0.gguf");
+    }
+
+    fn put_str(b: &mut Vec<u8>, s: &str) {
+        b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        b.extend_from_slice(s.as_bytes());
+    }
+
+    /// One tensor of `tensor_type`, plus Prism's metadata when `prism`.
+    fn synthetic_gguf(file_type: u32, tensor_type: i32, prism: bool) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&(if prism { 3u64 } else { 2u64 }).to_le_bytes());
+        put_str(&mut b, "general.architecture");
+        b.extend_from_slice(&8u32.to_le_bytes());
+        put_str(&mut b, "qwen35");
+        put_str(&mut b, "general.file_type");
+        b.extend_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(&file_type.to_le_bytes());
+        if prism {
+            put_str(&mut b, "prism.hadamard.version");
+            b.extend_from_slice(&4u32.to_le_bytes());
+            b.extend_from_slice(&1u32.to_le_bytes());
+        }
+        put_str(&mut b, "output.weight");
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&16u64.to_le_bytes());
+        b.extend_from_slice(&16u64.to_le_bytes());
+        b.extend_from_slice(&tensor_type.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b
+    }
+
+    fn meta_of(bytes: Vec<u8>, tag: &str) -> GgufMeta {
+        let dir = std::env::temp_dir().join(format!("lmdeck-gguf-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.gguf");
+        std::fs::write(&p, bytes).unwrap();
+        let m = gguf_meta(&p).expect("header parses");
+        std::fs::remove_dir_all(&dir).ok();
+        m
+    }
+
+    #[test]
+    fn prism_rotated_ternary_is_flagged() {
+        // The Huihui PQ2_0 file: file type 141, 348 tensors as ggml type 142, prism.hadamard.* keys.
+        let m = meta_of(synthetic_gguf(141, 142, true), "prism");
+        assert_eq!(m.arch, "qwen35");
+        assert_eq!(m.file_type, Some(141));
+        assert_eq!(m.max_type, Some(142));
+        assert!(m.prism);
+        let why = gguf_unsupported(&m).expect("flagged");
+        assert!(why.contains("Prism") && why.contains("142"), "{why}");
+    }
+
+    #[test]
+    fn standard_ternary_gguf_is_supported() {
+        // llama.cpp's own ternary type TQ2_0 = 35, file type 36.
+        let m = meta_of(synthetic_gguf(36, 35, false), "tq2");
+        assert_eq!(m.max_type, Some(35));
+        assert!(!m.prism);
+        assert!(gguf_unsupported(&m).is_none());
+    }
+
+    #[test]
+    fn unknown_custom_type_is_flagged() {
+        let m = meta_of(synthetic_gguf(141, 142, false), "custom");
+        let why = gguf_unsupported(&m).expect("flagged");
+        assert!(why.contains("142") && why.contains("llama.cpp"), "{why}");
     }
 
     #[test]
