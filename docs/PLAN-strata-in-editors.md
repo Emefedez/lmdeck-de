@@ -1,6 +1,8 @@
 # Plan: Strata fast and usable from editors (VS Code Fix, chat, coding agents)
 
 Status: plan only, nothing below is implemented unless it says so. Written 2026-10-21.
+The adopted order, with the 2026-10-23 measurements behind it, is in
+[WORKING-PATH-strata-in-editors.md](WORKING-PATH-strata-in-editors.md); this file is the background.
 
 ## The goal
 
