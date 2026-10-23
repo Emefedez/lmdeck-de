@@ -5,8 +5,8 @@ import qs.Ui
 import qs.Commons as Commons
 
 // Live lmdeck view inside the Agents panel, split into themed cards:
-// Server · Now · Downloads · KV cache · Strata · Coding agents ·
-// Memory & residency · Backend & network · Models · Hugging Face.
+// Server · Now · Downloads · Backends (MLX, GGUF, Strata) · Coding agents ·
+// Memory & residency · Network & integration · Models · Hugging Face.
 Column {
   id: sec
 
@@ -20,6 +20,10 @@ Column {
 
   property string searchKind: "mlx"
   property string searchSort: "relevance"
+
+  property bool mlxOpen: true
+  property bool ggufOpen: true
+  property bool strataOpen: true
 
   spacing: Style.space(14)
 
@@ -348,96 +352,109 @@ Column {
     }
   }
 
-  // ======================= KV cache =======================
+  // ======================= Backends =======================
   Card {
     visible: lm.up
-    title: "KV CACHE"
+    title: "BACKENDS"
     badge: sec.anyStale ? "reload to apply" : ""
     badgeColor: sec.urgent
 
-    Caption { text: "MLX  (Apple GPU)"; color: sec.dim }
-    SettingRow {
-      label: "Quantization"
-      key: "mlx.kv_bits"
-      info: "Precision of the attention cache (the model's memory of the conversation), not of the weights. Measured on Qwen3.8-27B (hybrid, so the cache is small): f16 is the fastest. 8-bit saves ~40% of the cache (0.4 GiB at 12k tokens) and keeps the same answers, but generates 10-15% slower. 4-bit saves ~60% but answers drift within a few dozen tokens, and on the Omarchy package runtime (0.7.28) it computes wrong results, so lmdeck falls back to f16 there. Worth it only when memory, not speed, is the limit. Weights keep their own quant (the 4bit in the model name)."
-      options: [{ value: "0", label: "f16" }, { value: "8", label: "8-bit" }, { value: "4", label: "4-bit" }]
-    }
-    SettingRow {
-      label: "Decode attention"
-      key: "mlx.decode_attention"
-      info: "How each new token attends to the conversation once it is longer than ~1k tokens. composed: two matrix multiplies and a softmax, much faster on omarchy-mlx's GPU backend (Qwen3.8-27B at 12k context: 4.8 -> 8.5 tok/s, 4k: 9.3 -> 11.3) with the same results up to rounding. fused: the backend's own attention kernel. Prompt reading always uses the fused kernel. Reload the model to apply."
-      options: [{ value: "composed", label: "composed" }, { value: "fused", label: "fused" }]
-    }
-    SettingRow {
-      label: "Window"
-      key: "mlx.max_kv_size"
-      info: "How many tokens of conversation the cache keeps. \u221e keeps everything (memory grows with the chat). A window (4k/8k/32k) caps memory; older tokens are dropped, so the model forgets the start of very long chats."
-      options: [{ value: "0", label: "∞" }, { value: "4096", label: "4k" }, { value: "8192", label: "8k" }, { value: "32768", label: "32k" }]
-    }
-    SettingRow {
-      label: "Prompt cache"
-      key: "mlx.prompt_cache_size"
-      info: "How many previous prompts stay cached so a follow-up that starts the same way (agents, long system prompts) skips re-reading them. More = faster repeats, more RAM; off = always reprocess."
-      options: [{ value: "0", label: "off" }, { value: "4", label: "4" }, { value: "10", label: "10" }, { value: "32", label: "32" }]
+    DropdownSection {
+      title: "MLX  (Apple GPU)"
+      open: sec.mlxOpen
+      onOpenChanged: sec.mlxOpen = open
+
+      SettingRow {
+        label: "Quantization"
+        key: "mlx.kv_bits"
+        info: "Precision of the attention cache (the model's memory of the conversation), not of the weights. Measured on Qwen3.8-27B (hybrid, so the cache is small): f16 is the fastest. 8-bit saves ~40% of the cache (0.4 GiB at 12k tokens) and keeps the same answers, but generates 10-15% slower. 4-bit saves ~60% but answers drift within a few dozen tokens, and on the Omarchy package runtime (0.7.28) it computes wrong results, so lmdeck falls back to f16 there. Worth it only when memory, not speed, is the limit. Weights keep their own quant (the 4bit in the model name)."
+        options: [{ value: "0", label: "f16" }, { value: "8", label: "8-bit" }, { value: "4", label: "4-bit" }]
+      }
+      SettingRow {
+        label: "Decode attention"
+        key: "mlx.decode_attention"
+        info: "How each new token attends to the conversation once it is longer than ~1k tokens. composed: two matrix multiplies and a softmax, much faster on omarchy-mlx's GPU backend (Qwen3.8-27B at 12k context: 4.8 -> 8.5 tok/s, 4k: 9.3 -> 11.3) with the same results up to rounding. fused: the backend's own attention kernel. Prompt reading always uses the fused kernel. Reload the model to apply."
+        options: [{ value: "composed", label: "composed" }, { value: "fused", label: "fused" }]
+      }
+      SettingRow {
+        label: "Window"
+        key: "mlx.max_kv_size"
+        info: "How many tokens of conversation the cache keeps. \u221e keeps everything (memory grows with the chat). A window (4k/8k/32k) caps memory; older tokens are dropped, so the model forgets the start of very long chats."
+        options: [{ value: "0", label: "∞" }, { value: "4096", label: "4k" }, { value: "8192", label: "8k" }, { value: "32768", label: "32k" }]
+      }
+      SettingRow {
+        label: "Prompt cache"
+        key: "mlx.prompt_cache_size"
+        info: "How many previous prompts stay cached so a follow-up that starts the same way (agents, long system prompts) skips re-reading them. More = faster repeats, more RAM; off = always reprocess."
+        options: [{ value: "0", label: "off" }, { value: "4", label: "4" }, { value: "10", label: "10" }, { value: "32", label: "32" }]
+      }
+      SettingRow {
+        label: "MLX fast path"
+        key: "mlx.fast_path"
+        info: "Uses mlx_fast_server for faster prefill and batching. Reload the model to apply."
+        options: [{ value: "true", label: "on" }, { value: "false", label: "off" }]
+      }
     }
 
     Divider {}
 
-    Caption { text: "GGUF  (llama.cpp)"; color: sec.dim }
-    SettingRow {
-      label: "Type"
-      key: "llama.cache_type_k"
-      info: "GGUF attention-cache precision. f16: exact. q8_0: half the memory, near-lossless. q4_0: a quarter, some quality loss. Needs flash attention for the V cache."
-      options: ["f16", "q8_0", "q4_0"]
-      handler: function(v) { lm.setSetting("llama.cache_type_k", v); lm.setSetting("llama.cache_type_v", v) }
-    }
-    SettingRow {
-      label: "Context"
-      key: "llama.ctx_size"
-      info: "Maximum context for GGUF models. llama.cpp reserves cache for all of it up front, so bigger means more memory even for short chats."
-      options: [{ value: "4096", label: "4k" }, { value: "8192", label: "8k" }, { value: "16384", label: "16k" }, { value: "32768", label: "32k" }, { value: "65536", label: "64k" }]
-    }
-    SettingRow {
-      label: "Prefix reuse"
-      key: "llama.cache_reuse"
-      info: "Reuse cached chunks when a prompt shifts (agent loops re-send history). 256/1k = minimum matching chunk in tokens; off disables it."
-      options: [{ value: "0", label: "off" }, { value: "256", label: "256" }, { value: "1024", label: "1k" }]
+    DropdownSection {
+      title: "GGUF  (llama.cpp)"
+      open: sec.ggufOpen
+      onOpenChanged: sec.ggufOpen = open
+
+      SettingRow {
+        label: "Type"
+        key: "llama.cache_type_k"
+        info: "GGUF attention-cache precision. f16: exact. q8_0: half the memory, near-lossless. q4_0: a quarter, some quality loss. Needs flash attention for the V cache."
+        options: ["f16", "q8_0", "q4_0"]
+        handler: function(v) { lm.setSetting("llama.cache_type_k", v); lm.setSetting("llama.cache_type_v", v) }
+      }
+      SettingRow {
+        label: "Context"
+        key: "llama.ctx_size"
+        info: "Maximum context for GGUF models. llama.cpp reserves cache for all of it up front, so bigger means more memory even for short chats."
+        options: [{ value: "4096", label: "4k" }, { value: "8192", label: "8k" }, { value: "16384", label: "16k" }, { value: "32768", label: "32k" }, { value: "65536", label: "64k" }]
+      }
+      SettingRow {
+        label: "Prefix reuse"
+        key: "llama.cache_reuse"
+        info: "Reuse cached chunks when a prompt shifts (agent loops re-send history). 256/1k = minimum matching chunk in tokens; off disables it."
+        options: [{ value: "0", label: "off" }, { value: "256", label: "256" }, { value: "1024", label: "1k" }]
+      }
     }
 
-    SmallButton {
-      visible: sec.anyStale
-      text: "Reload loaded model to apply"
-      onClicked: lm.reload("")
-    }
-  }
+    Divider {}
 
-  // ======================= Strata =======================
-  Card {
-    visible: lm.up
-    title: "STRATA"
+    DropdownSection {
+      title: "Strata  (Apple GPU Vulkan)"
+      open: sec.strataOpen
+      onOpenChanged: sec.strataOpen = open
 
-    Caption {
-      width: parent.width
-      text: "Qwen3.8-Flash-Next Q2_0: 125B MoE, experts streamed from the SSD (Vulkan)"
-      color: sec.dim
-      wrapMode: Text.WordWrap
+      Caption {
+        width: parent.width
+        text: "Qwen3.8-Flash-Next Q2_0: 125B MoE, experts streamed from the SSD (Vulkan)"
+        color: sec.dim
+        wrapMode: Text.WordWrap
+      }
+      SettingRow {
+        label: "Prompt path"
+        key: "strata.prompt_path"
+        info: "How the engine reads a prompt. off: through decode windows, 14.7 tok/s on a 10.6k-token prompt, so a ~20k-token Copilot chat request waits over 20 minutes. 1024 / 2048 / 4096: the GPU chunked path, 7.4x / 8.4x / 9.2x faster, holding 1.6 / 2.6 / 4.5 GB of the expert arena while a prompt runs. 2048 is the balance on 32 GB (10.4 GB of decode cache left); 4096 is fastest but hotter and leaves 8.5 GB. Applies on the next model load."
+        options: [{ value: "off", label: "off" }, { value: "1024", label: "1024" }, { value: "2048", label: "2048" }, { value: "4096", label: "4096" }]
+      }
+      Caption {
+        width: parent.width
+        readonly property var m: sec.promptMetrics(sec.setting("strata.prompt_path"))
+        visible: !!m
+        text: !m ? "" : "Speed " + sec.stars(m.speed) + "  " + m.tok.toFixed(1) + " tok/s (" + m.speedup.toFixed(1) + "x)"
+          + "\nUsability " + sec.stars(m.use) + "  " + m.cache.toFixed(1) + " GB decode cache · " + m.buffer.toFixed(2) + " GB chunk buffers"
+          + "\nHeat " + sec.stars(m.noise) + "  " + m.heat
+        color: sec.dim
+        wrapMode: Text.WordWrap
+      }
     }
-    SettingRow {
-      label: "Prompt path"
-      key: "strata.prompt_path"
-      info: "How the engine reads a prompt. off: through decode windows, 14.7 tok/s on a 10.6k-token prompt, so a ~20k-token Copilot chat request waits over 20 minutes. 1024 / 2048 / 4096: the GPU chunked path, 7.4x / 8.4x / 9.2x faster, holding 1.6 / 2.6 / 4.5 GB of the expert arena while a prompt runs. 2048 is the balance on 32 GB (10.4 GB of decode cache left); 4096 is fastest but hotter and leaves 8.5 GB. Applies on the next model load."
-      options: [{ value: "off", label: "off" }, { value: "1024", label: "1024" }, { value: "2048", label: "2048" }, { value: "4096", label: "4096" }]
-    }
-    Caption {
-      width: parent.width
-      readonly property var m: sec.promptMetrics(sec.setting("strata.prompt_path"))
-      visible: !!m
-      text: !m ? "" : "Speed " + sec.stars(m.speed) + "  " + m.tok.toFixed(1) + " tok/s (" + m.speedup.toFixed(1) + "x)"
-        + "\nUsability " + sec.stars(m.use) + "  " + m.cache.toFixed(1) + " GB decode cache · " + m.buffer.toFixed(2) + " GB chunk buffers"
-        + "\nHeat " + sec.stars(m.noise) + "  " + m.heat
-      color: sec.dim
-      wrapMode: Text.WordWrap
-    }
+
     SmallButton {
       visible: sec.anyStale
       text: "Reload loaded model to apply"
@@ -507,16 +524,11 @@ Column {
     }
   }
 
-  // ======================= Backend & network =======================
+  // ======================= Network & integration =======================
   Card {
     visible: lm.up
-    title: "BACKEND & NETWORK"
+    title: "NETWORK & INTEGRATION"
 
-    SettingRow {
-      label: "MLX fast path"
-      key: "mlx.fast_path"
-      options: [{ value: "true", label: "on" }, { value: "false", label: "off" }]
-    }
     SettingRow {
       label: "Listen"
       key: "server.host"
@@ -918,6 +930,82 @@ Column {
       radius: height / 2
       width: parent.width * Math.max(0, Math.min(1, parent.value))
       color: parent.alarming ? sec.urgent : sec.foreground
+    }
+  }
+
+  component DropdownSection: Column {
+    id: dropSection
+    property string title: ""
+    property bool open: true
+    default property alias content: dropContent.data
+    width: parent ? parent.width : 0
+    spacing: Style.space(6)
+
+    Rectangle {
+      width: parent.width
+      implicitHeight: Math.max(headerRow.implicitHeight + Style.space(8), Style.space(28))
+      radius: Style.cornerRadius
+      color: headerMouse.containsMouse ? sec.alpha(sec.foreground, 0.07) : sec.alpha(sec.foreground, 0.03)
+      border.width: 1
+      border.color: sec.alpha(sec.foreground, 0.08)
+
+      Item {
+        id: headerRow
+        anchors.left: parent.left
+        anchors.leftMargin: Style.space(8)
+        anchors.right: parent.right
+        anchors.rightMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        implicitHeight: Math.max(arrowTxt.implicitHeight, titleTxt.implicitHeight)
+
+        Row {
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(6)
+
+          Text {
+            id: arrowTxt
+            textFormat: Text.PlainText
+            text: dropSection.open ? "▾" : "▸"
+            color: dropSection.open ? Commons.Color.accent : sec.dim
+            font.family: sec.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+
+          Text {
+            id: titleTxt
+            textFormat: Text.PlainText
+            text: dropSection.title
+            color: sec.foreground
+            font.family: sec.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+        }
+
+        Caption {
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          text: dropSection.open ? "hide" : "show"
+          color: sec.dim
+        }
+      }
+
+      MouseArea {
+        id: headerMouse
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: dropSection.open = !dropSection.open
+      }
+    }
+
+    Column {
+      id: dropContent
+      visible: dropSection.open
+      width: parent.width
+      spacing: Style.space(6)
     }
   }
 
