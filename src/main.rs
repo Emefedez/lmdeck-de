@@ -430,13 +430,29 @@ async fn async_main(cli: Cli) -> Result<()> {
                 }).collect();
                 out.insert(client.clone(), json!({"updated": v["updated"], "tools": tools}));
             }
-            let all = json!({"local_tools": cfg.server.local_tools, "local_prompt": cfg.server.local_prompt,
-                             "tool_allow": cfg.server.tool_allow, "tool_deny": cfg.server.tool_deny, "clients": out});
+            let tool_models: Vec<String> = models::scan(&cfg).into_iter().filter(|m| m.tools).map(|m| m.name).collect();
+            let all = json!({
+                "local_tools": cfg.server.local_tools,
+                "local_prompt": cfg.server.local_prompt,
+                "tool_allow": cfg.server.tool_allow,
+                "tool_deny": cfg.server.tool_deny,
+                "vscode_fallback": cfg.vscode.fallback,
+                "vscode_model": cfg.vscode.model,
+                "vscode_inline_model": cfg.vscode.inline_model,
+                "vscode_chat_model": cfg.vscode.chat_model,
+                "tool_models": tool_models,
+                "clients": out,
+            });
             if json {
                 println!("{}", serde_json::to_string_pretty(&all)?);
                 return Ok(());
             }
-            println!("local_tools = {}   tool_allow = {:?}   tool_deny = {:?}", cfg.server.local_tools, cfg.server.tool_allow, cfg.server.tool_deny);
+            println!("local_tools = {}   local_prompt = {}   vscode.fallback = {}", cfg.server.local_tools, cfg.server.local_prompt, cfg.vscode.fallback);
+            let inline_disp = if cfg.vscode.inline_model.is_empty() { if cfg.vscode.model.is_empty() { "(auto)" } else { &cfg.vscode.model } } else { &cfg.vscode.inline_model };
+            let chat_disp = if cfg.vscode.chat_model.is_empty() { if cfg.vscode.model.is_empty() { "(auto)" } else { &cfg.vscode.model } } else { &cfg.vscode.chat_model };
+            println!("vscode.inline_model (Fix) = {}   vscode.chat_model = {}", inline_disp, chat_disp);
+            println!("tool models: {}", if tool_models.is_empty() { "(none)".to_string() } else { tool_models.join(", ") });
+            println!("tool_allow = {:?}   tool_deny = {:?}", cfg.server.tool_allow, cfg.server.tool_deny);
             if out.is_empty() {
                 println!("No tool lists seen yet: they are recorded on the first request from Claude Code, Codex or VS Code.");
             }

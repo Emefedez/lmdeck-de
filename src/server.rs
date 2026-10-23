@@ -1908,7 +1908,11 @@ async fn lm_models(State(a): State<App>) -> Json<Value> {
         .iter()
         .map(|m| {
             let mut v = json!(m);
-            v["device"] = json!(cfg.overrides.get(&m.name).and_then(|o| o.device.clone()).unwrap_or_else(|| "gpu".into()));
+            let ov = cfg.overrides.get(&m.name);
+            v["device"] = json!(ov.and_then(|o| o.device.clone()).unwrap_or_else(|| "gpu".into()));
+            // auto | stock | prism, and which build would actually run it.
+            v["engine_choice"] = json!(ov.and_then(|o| o.engine.clone()).unwrap_or_else(|| "auto".into()));
+            v["engine"] = json!(if cfg.runs_prism(m, ov) { "prism" } else { "stock" });
             v["gpu_fit"] = json!(crate::compat::gpu_fit(m.size, cfg.llama.ctx_size as u64));
             if m.format == Format::Mlx {
                 v["compat"] = json!(crate::compat::assess_mlx(&cfg, m.repo.as_deref().unwrap_or(&m.name), m.qmode.as_deref()));
@@ -1971,10 +1975,16 @@ async fn lm_override(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
                 }
                 o.system_prompt_mode = (!value.is_empty()).then(|| value.clone());
             }
+            "engine" => {
+                if !["", "auto", "stock", "prism"].contains(&value.as_str()) {
+                    return Err("engine must be auto, stock or prism".into());
+                }
+                o.engine = (!value.is_empty() && value != "auto").then(|| value.clone());
+            }
             _ => return Err("unknown override key".into()),
         }
         // An override with nothing left in it is removed.
-        if o.device.is_none() && o.ctx_size.is_none() && o.keep_alive.is_none() && o.system_prompt_mode.is_none() && o.gpu_layers.is_none() && o.extra_args.is_empty() && o.env.is_empty() {
+        if o.device.is_none() && o.ctx_size.is_none() && o.keep_alive.is_none() && o.system_prompt_mode.is_none() && o.gpu_layers.is_none() && o.engine.is_none() && o.extra_args.is_empty() && o.env.is_empty() {
             cfg.overrides.remove(&name);
         }
         Ok(())

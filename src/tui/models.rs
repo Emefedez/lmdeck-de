@@ -119,6 +119,7 @@ impl Ui {
         vec![
             Act::new(KeyCode::Enter, if loaded { "Unload" } else { "Load" }).or(KeyCode::Char('l')).when(m.is_some(), none),
             Act::new(KeyCode::Char('c'), "Chat").when(m.is_some(), none),
+            Act::new(KeyCode::Char('t'), "Tool role (Fix/Chat)").when(m.is_some(), none),
             Act::new(KeyCode::Char('f'), if m.is_some_and(|m| self.is_favorite(&m.name)) { "Unfavourite" } else { "Favourite" }).when(m.is_some(), none),
             Act::new(KeyCode::Char('e'), "Model settings").when(m.is_some(), none),
             Act::new(KeyCode::Char('m'), "Make room").when(m.is_some(), none).when(!fits, "it fits in free memory now"),
@@ -150,6 +151,46 @@ impl Ui {
             KeyCode::Char('c') => {
                 let exe = sys::exe_path().display().to_string();
                 return Some(Action::Exec(format!("chat with {}", m.name), vec![exe, "run".into(), m.name]));
+            }
+            KeyCode::Char('t') => {
+                let name = m.name.clone();
+                let is_inline = self.cfg.vscode.inline_model == name || (self.cfg.vscode.inline_model.is_empty() && self.cfg.vscode.model == name);
+                let is_chat = self.cfg.vscode.chat_model == name || (self.cfg.vscode.chat_model.is_empty() && self.cfg.vscode.model == name);
+                let toast_msg = match (is_inline, is_chat) {
+                    (false, false) => {
+                        self.edit_config("vscode.inline_model", |c| {
+                            c.vscode.inline_model = name.clone();
+                            Ok(())
+                        });
+                        format!("{name} set as VS Code Fix (inline) model")
+                    }
+                    (true, false) => {
+                        self.edit_config("tool role", |c| {
+                            c.vscode.inline_model = String::new();
+                            c.vscode.chat_model = name.clone();
+                            Ok(())
+                        });
+                        format!("{name} set as VS Code Chat model")
+                    }
+                    (false, true) => {
+                        self.edit_config("tool role", |c| {
+                            c.vscode.inline_model = name.clone();
+                            c.vscode.chat_model = name.clone();
+                            Ok(())
+                        });
+                        format!("{name} set as VS Code Fix & Chat model")
+                    }
+                    (true, true) => {
+                        self.edit_config("tool role", |c| {
+                            if c.vscode.inline_model == name { c.vscode.inline_model = String::new(); }
+                            if c.vscode.chat_model == name { c.vscode.chat_model = String::new(); }
+                            if c.vscode.model == name { c.vscode.model = String::new(); }
+                            Ok(())
+                        });
+                        format!("{name} unassigned from VS Code tool roles")
+                    }
+                };
+                self.toast(toast_msg);
             }
             KeyCode::Char('f') => {
                 let fav = self.is_favorite(&m.name);
@@ -271,13 +312,31 @@ impl Ui {
         self.draw_model_detail(f, detail);
     }
 
-    /// Name plus compatibility marker and CPU tag.
+    /// Name plus compatibility marker, CPU tag, and tool role tag.
     fn model_label(&self, m: &LocalModel, name: String) -> Line<'static> {
         let mut spans = vec![];
         if self.is_favorite(&m.name) {
             spans.push(Span::styled("★ ", Style::new().fg(Color::Yellow)));
         }
         spans.push(Span::raw(name));
+        let is_inline = self.cfg.vscode.inline_model == m.name || (self.cfg.vscode.inline_model.is_empty() && self.cfg.vscode.model == m.name);
+        let is_chat = self.cfg.vscode.chat_model == m.name || (self.cfg.vscode.chat_model.is_empty() && self.cfg.vscode.model == m.name);
+        if is_inline && is_chat {
+            spans.push(Span::styled(" [Fix+Chat]", Style::new().fg(Color::Yellow).bold()));
+        } else if is_inline {
+            spans.push(Span::styled(" [Fix]", Style::new().fg(Color::Cyan).bold()));
+        } else if is_chat {
+            spans.push(Span::styled(" [Chat]", Style::new().fg(Color::Magenta).bold()));
+        } else if m.tools {
+            spans.push(Span::styled(" [tools]", Style::new().fg(Color::DarkGray)));
+        }
+        if m.needs_prism {
+            if self.cfg.runs_prism(m, self.cfg.overrides.get(&m.name)) {
+                spans.push(Span::styled(" prism", Style::new().fg(Color::Cyan)));
+            } else {
+                spans.push(Span::styled(" ✗ needs Prism build", Style::new().fg(Color::Red)));
+            }
+        }
         if m.format == Format::Mlx {
             if m.unsupported.is_some() {
                 spans.push(Span::styled(" ✗ unsupported", Style::new().fg(Color::Red)));
@@ -341,6 +400,26 @@ impl Ui {
             crate::sysprompt::Source::None => "none",
         };
         l.push(kv("Sys prompt", prompt));
+        let is_inline = self.cfg.vscode.inline_model == m.name || (self.cfg.vscode.inline_model.is_empty() && self.cfg.vscode.model == m.name);
+        let is_chat = self.cfg.vscode.chat_model == m.name || (self.cfg.vscode.chat_model.is_empty() && self.cfg.vscode.model == m.name);
+        let role = match (is_inline, is_chat) {
+            (true, true) => "Fix (inline) + Chat",
+            (true, false) => "Fix (inline)",
+            (false, true) => "Chat",
+            (false, false) => if m.tools { "unassigned (press t to cycle)" } else { "none" },
+        };
+        let cap = if m.tools { "supports tool calling" } else { "no tool calling" };
+        l.push(kv("Tool role", &format!("{role} · {cap}")));
+        if m.needs_prism {
+            let e = if self.cfg.runs_prism(m, o) {
+                "Prism build (ternary PQ2_0/PTQ1_0; ~7 tok/s here, not a fast daily driver)".to_string()
+            } else if self.cfg.prism_server().is_some() {
+                "stock build (forced here; this file needs the Prism build to load)".to_string()
+            } else {
+                "needs the Prism build: set llama.prism_path (docs/TERNARY-PRISM.md)".to_string()
+            };
+            l.push(kv("Engine", &e));
+        }
         if m.format == Format::Mlx {
             if let Some(u) = &m.unsupported {
                 l.push(kv("Support", &format!("unsupported: {u}")));

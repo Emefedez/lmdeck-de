@@ -643,7 +643,15 @@ impl Manager {
                 (a, env)
             }
             Format::Gguf => {
-                let bin = cfg.llama_server().ok_or_else(|| {
+                let want_prism = ov.engine.as_deref() == Some("prism") || (m.needs_prism && ov.engine.as_deref() != Some("stock"));
+                if want_prism {
+                    if let Some(p) = cfg.prism_server() {
+                        if !p.exists() {
+                            bail!("llama.prism_path is {} but there is no llama-server there (build the Prism fork, see docs/TERNARY-PRISM.md)", p.display());
+                        }
+                    }
+                }
+                let bin = cfg.llama_server_for(m, Some(&ov)).ok_or_else(|| {
                     anyhow!("llama-server not found: build it in lmdeck: Backends → Build llama.cpp, or `lmdeck llama build`")
                 })?;
                 let ctx = ov.ctx_size.unwrap_or(cfg.llama.ctx_size);

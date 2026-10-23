@@ -370,6 +370,7 @@ mod tests {
             qmode: None,
             arch: String::new(),
             unsupported: None,
+            needs_prism: false,
             params: String::new(),
             ctx_len: None,
             mmproj: None,

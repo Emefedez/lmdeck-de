@@ -167,9 +167,12 @@ function render(error) {
     item.tooltip = error;
   } else if (active) {
     const parts = active.split(" · ");
-    const shortText = parts.length > 1
+    let shortText = parts.length > 1
       ? `${parts[0].split("/").pop().replace(" (chat)", "")}/${parts[1].split("/").pop().replace(" (Fix)", "")}`
       : active.split("/").pop();
+    if (shortText.length > 24) {
+      shortText = shortText.slice(0, 22) + "…";
+    }
     item.text = `$(server-environment) ${shortText}`;
     item.tooltip =
       `${active} via lmdeck` +

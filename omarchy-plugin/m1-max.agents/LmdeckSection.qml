@@ -584,7 +584,8 @@ Column {
           text: (modelRow.loaded ? "● " : "") + modelData.name
             + (level === "unlikely" ? "  ✗" : level === "untested" ? "  ?" : level === "qualified" ? "  ✓" : "")
             + (modelData.device === "cpu" ? "  cpu" : "")
-          color: level === "unlikely" ? sec.urgent : sec.foreground
+            + (modelData.needs_prism && modelData.engine !== "prism" ? "  ✗ prism build" : "")
+          color: level === "unlikely" || (modelData.needs_prism && modelData.engine !== "prism") ? sec.urgent : sec.foreground
           elide: Text.ElideMiddle
         }
         Caption {
@@ -592,7 +593,8 @@ Column {
           anchors.right: parent.right
           anchors.rightMargin: Style.space(6)
           anchors.verticalCenter: parent.verticalCenter
-          text: modelData.format + " · " + modelData.quant + " · " + lm.bytes(modelData.size)
+          text: (modelData.engine === "prism" ? "prism · " : "")
+            + modelData.format + " · " + modelData.quant + " · " + lm.bytes(modelData.size)
           color: sec.dim
         }
         MouseArea {
@@ -607,6 +609,7 @@ Column {
           text: (modelRow.loaded ? "Click to unload" : "Click to load")
             + (modelData.compat && modelData.compat.reason ? " — " + modelData.compat.reason : "")
             + (modelData.compat && modelData.compat.recommend ? ". Recommended: " + modelData.compat.recommend : "")
+            + (modelData.engine === "prism" ? ". Runs on the Prism build (ternary types; slower)" : "")
           fontFamily: sec.fontFamily
         }
       }
@@ -966,14 +969,72 @@ Column {
         onClicked: pickerRow.step(-1)
       }
 
-      Caption {
+      Item {
+        id: textContainer
         anchors.verticalCenter: parent.verticalCenter
-        text: {
-          if (pickerRow.currentVal !== "") return pickerRow.currentVal.split("/").pop()
-          var fb = sec.setting(pickerRow.fallbackKey)
-          return fb !== "" ? "(" + fb.split("/").pop() + ")" : "(auto)"
+        width: Math.max(80, Math.min(150, (pickerRow.width > 0 ? pickerRow.width - lbl.implicitWidth - 64 : 140)))
+        height: Math.max(modelText.implicitHeight, 18)
+        clip: true
+
+        readonly property bool hovered: mouseArea.containsMouse
+        readonly property bool overflows: modelText.implicitWidth > width
+
+        Text {
+          id: modelText
+          anchors.verticalCenter: parent.verticalCenter
+          x: 0
+          width: textContainer.overflows && !textContainer.hovered ? textContainer.width : implicitWidth
+          elide: textContainer.hovered ? Text.ElideNone : Text.ElideRight
+          text: {
+            if (pickerRow.currentVal !== "") return pickerRow.currentVal.split("/").pop()
+            var fb = sec.setting(pickerRow.fallbackKey)
+            return fb !== "" ? "(" + fb.split("/").pop() + ")" : "(auto)"
+          }
+          color: pickerRow.currentVal !== "" ? Commons.Color.accent : sec.dim
+          font.family: sec.fontFamily
+          font.pixelSize: Style.font.caption
+
+          SequentialAnimation on x {
+            id: scrollAnim
+            running: textContainer.hovered && textContainer.overflows
+            loops: Animation.Infinite
+            alwaysRunToEnd: false
+
+            PauseAnimation { duration: 600 }
+            NumberAnimation {
+              to: textContainer.width - modelText.implicitWidth
+              duration: Math.max(1000, (modelText.implicitWidth - textContainer.width) * 20)
+              easing.type: Easing.InOutQuad
+            }
+            PauseAnimation { duration: 1000 }
+            NumberAnimation {
+              to: 0
+              duration: Math.max(1000, (modelText.implicitWidth - textContainer.width) * 20)
+              easing.type: Easing.InOutQuad
+            }
+            PauseAnimation { duration: 400 }
+          }
+
+          onXChanged: {
+            if (!textContainer.hovered && x !== 0) x = 0
+          }
         }
-        color: pickerRow.currentVal !== "" ? Commons.Color.accent : sec.dim
+
+        MouseArea {
+          id: mouseArea
+          anchors.fill: parent
+          hoverEnabled: true
+          acceptedButtons: Qt.NoButton
+          onWheel: function(wheel) {
+            if (textContainer.overflows) {
+              scrollAnim.stop()
+              var delta = wheel.angleDelta.y || wheel.angleDelta.x
+              var newX = modelText.x + (delta > 0 ? 15 : -15)
+              var minX = textContainer.width - modelText.implicitWidth
+              modelText.x = Math.max(minX, Math.min(0, newX))
+            }
+          }
+        }
       }
 
       SmallButton {

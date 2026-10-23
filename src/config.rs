@@ -139,6 +139,9 @@ pub struct MlxCfg {
 pub struct LlamaCfg {
     /// Path to llama-server. Empty = lmdeck's own build, then $PATH.
     pub server_path: String,
+    /// Second llama-server that reads Prism ternary GGUFs (PQ2_0/PTQ1_0, hadamard-folded).
+    /// Models whose header needs it use it automatically; empty = none.
+    pub prism_path: String,
     pub gpu_layers: i32,
     /// When a GGUF model does not fit whole, offload only as many layers as fit instead of refusing.
     pub auto_offload: bool,
@@ -157,6 +160,9 @@ pub struct LlamaCfg {
     pub env: BTreeMap<String, String>,
     /// Git ref built by "Build llama.cpp".
     pub git_ref: String,
+    /// Git remote that "Build llama.cpp" clones. Empty = upstream ggml-org/llama.cpp; set
+    /// https://github.com/PrismML-Eng/llama.cpp with ref `prism` for Prism ternary (PQ2_0/PTQ1_0).
+    pub repo: String,
     /// The GGUF system prompt's mode (prompts/llama.md): "prepend" / "replace" / "fallback".
     pub system_prompt_mode: String,
 }
@@ -291,6 +297,10 @@ pub struct ModelOverride {
     /// Mode for this model's system prompt (the prompt itself is prompts/models/<model>.md).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt_mode: Option<String>,
+    /// Which llama.cpp build runs this model: "stock" or "prism". Unset = auto (the Prism build
+    /// for GGUFs whose header needs PQ2_0/PTQ1_0, when llama.prism_path is set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
 }
 
 impl Default for Config {
@@ -380,6 +390,7 @@ impl Default for LlamaCfg {
     fn default() -> Self {
         Self {
             server_path: String::new(),
+            prism_path: String::new(),
             gpu_layers: 999,
             auto_offload: true,
             ctx_size: 8192,
@@ -392,6 +403,7 @@ impl Default for LlamaCfg {
             extra_args: vec![],
             env: BTreeMap::new(),
             git_ref: "master".into(),
+            repo: String::new(),
             system_prompt_mode: "prepend".into(),
         }
     }
@@ -462,6 +474,31 @@ impl Config {
             return Some(own);
         }
         which("llama-server")
+    }
+
+    /// The Prism build, when one is configured.
+    pub fn prism_server(&self) -> Option<PathBuf> {
+        let p = self.llama.prism_path.trim();
+        (!p.is_empty()).then(|| expand(p))
+    }
+
+    /// The llama-server that should run `m`: an explicit per-model choice first, then the Prism
+    /// build for files that need it, then the normal build.
+    pub fn llama_server_for(&self, m: &crate::models::LocalModel, ov: Option<&ModelOverride>) -> Option<PathBuf> {
+        match ov.and_then(|o| o.engine.as_deref()) {
+            Some("prism") => self.prism_server().or_else(|| self.llama_server()),
+            Some("stock") => self.llama_server(),
+            _ if m.needs_prism => self.prism_server().or_else(|| self.llama_server()),
+            _ => self.llama_server(),
+        }
+    }
+
+    /// True when `m` would actually run on the Prism build.
+    pub fn runs_prism(&self, m: &crate::models::LocalModel, ov: Option<&ModelOverride>) -> bool {
+        match (self.llama_server_for(m, ov), self.prism_server()) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -771,7 +808,9 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "MLX", key: "mlx.extra_args", kind: Kind::Text, help: "Extra mlx_lm.server args" },
     Setting { section: "MLX", key: "mlx.env", kind: Kind::Text, help: "Env for the MLX backend, K=V,K=V (e.g. MLX_OMARCHY_GDN_RAW_REPEAT=0)" },
     Setting { section: "GGUF (llama.cpp)", key: "llama.server_path", kind: Kind::Text, help: "llama-server binary (empty = lmdeck build, then PATH)" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.prism_path", kind: Kind::Text, help: "Second llama-server for Prism ternary GGUFs (PQ2_0/PTQ1_0); models whose header needs it use it automatically" },
     Setting { section: "GGUF (llama.cpp)", key: "llama.git_ref", kind: Kind::Text, help: "llama.cpp branch or tag that Backends builds" },
+    Setting { section: "GGUF (llama.cpp)", key: "llama.repo", kind: Kind::Text, help: "Git remote Backends clones (empty = ggml-org/llama.cpp). PrismML-Eng/llama.cpp + ref prism reads Prism ternary PQ2_0/PTQ1_0 models" },
     Setting { section: "GGUF (llama.cpp)", key: "llama.ctx_size", kind: Kind::Number, help: "GGUF context window (KV is allocated for all of it)" },
     Setting { section: "GGUF (llama.cpp)", key: "llama.gpu_layers", kind: Kind::Number, help: "Layers offloaded to the GPU (999 = all)" },
     Setting { section: "GGUF (llama.cpp)", key: "llama.auto_offload", kind: Kind::Bool, help: "GGUF too big for free memory: put only the layers that fit on the GPU" },
@@ -868,6 +907,7 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "mlx.extra_args" => c.mlx.extra_args.join(" "),
         "mlx.env" => kv_join(&c.mlx.env),
         "llama.server_path" => c.llama.server_path.clone(),
+        "llama.prism_path" => c.llama.prism_path.clone(),
         "llama.gpu_layers" => c.llama.gpu_layers.to_string(),
         "llama.auto_offload" => c.llama.auto_offload.to_string(),
         "llama.ctx_size" => c.llama.ctx_size.to_string(),
@@ -880,6 +920,7 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "llama.extra_args" => c.llama.extra_args.join(" "),
         "llama.env" => kv_join(&c.llama.env),
         "llama.git_ref" => c.llama.git_ref.clone(),
+        "llama.repo" => c.llama.repo.clone(),
         "hooks.on_load" => c.hooks.on_load.clone(),
         "hooks.on_idle" => c.hooks.on_idle.clone(),
         "usage.omarchy_record" => c.usage.omarchy_record.to_string(),
@@ -980,6 +1021,7 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "mlx.extra_args" => c.mlx.extra_args = words(v),
         "mlx.env" => c.mlx.env = kv_parse(v),
         "llama.server_path" => c.llama.server_path = v.into(),
+        "llama.prism_path" => c.llama.prism_path = v.into(),
         "llama.gpu_layers" => c.llama.gpu_layers = v.parse().map_err(|_| "not a number".to_string())?,
         "llama.auto_offload" => c.llama.auto_offload = v.parse().map_err(|_| "true or false".to_string())?,
         "llama.ctx_size" => c.llama.ctx_size = num(v)? as u32,
@@ -1001,6 +1043,7 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         "llama.extra_args" => c.llama.extra_args = words(v),
         "llama.env" => c.llama.env = kv_parse(v),
         "llama.git_ref" => c.llama.git_ref = v.into(),
+        "llama.repo" => c.llama.repo = v.into(),
         "hooks.on_load" => c.hooks.on_load = v.into(),
         "hooks.on_idle" => c.hooks.on_idle = v.into(),
         "usage.omarchy_record" => c.usage.omarchy_record = boolean(v)?,
@@ -1070,7 +1113,7 @@ pub fn needs_reload(key: &str) -> bool {
         return false; // applied per request
     }
     key.starts_with("mlx.")
-        || (key.starts_with("llama.") && key != "llama.git_ref")
+        || (key.starts_with("llama.") && !matches!(key, "llama.git_ref" | "llama.repo"))
         || matches!(key, "strata.engine" | "strata.vk_icd" | "strata.extra_args" | "strata.env" | "strata.prompt_path")
         || key == "server.uclamp_boost"
 }

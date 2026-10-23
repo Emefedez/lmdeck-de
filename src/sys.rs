@@ -724,10 +724,16 @@ say "Done. Run configs (strata-<model>.json) in $DIR show up as strata/<model> i
 pub fn script_build_llama(cfg: &Config) -> String {
     let dir = llama_dir();
     let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let repo = if cfg.llama.repo.trim().is_empty() {
+        "https://github.com/ggml-org/llama.cpp".to_string()
+    } else {
+        cfg.llama.repo.trim().to_string()
+    };
     format!(
         r#"{HEADER}
 DIR="{dir}"
 REF="{gitref}"
+REPO="{repo}"
 say "Building llama.cpp ($REF) with the Vulkan backend into $DIR"
 {own}
 need=()
@@ -738,9 +744,10 @@ if ((${{#need[@]}})); then
 fi
 mkdir -p "$DIR"
 if [[ -d "$DIR/src/.git" ]]; then
+  git -C "$DIR/src" remote set-url origin "$REPO" || die "git remote"
   git -C "$DIR/src" fetch --depth 1 origin "$REF" && git -C "$DIR/src" checkout -q FETCH_HEAD || die "git fetch"
 else
-  git clone --depth 1 --branch "$REF" https://github.com/ggml-org/llama.cpp "$DIR/src" || die "git clone"
+  git clone --depth 1 --branch "$REF" "$REPO" "$DIR/src" || die "git clone"
 fi
 say "Commit: $(git -C "$DIR/src" log -1 --format='%h %cs %s')"
 cmake -S "$DIR/src" -B "$DIR/build" -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DGGML_NATIVE=ON \
@@ -756,6 +763,7 @@ say "Done. GGUF models now load through $DIR/bin/llama-server"
 "#,
         dir = dir.display(),
         gitref = cfg.llama.git_ref,
+        repo = repo,
         own = if cfg.llama.server_path.is_empty() { String::new() } else {
             format!("warn \"llama.server_path is set ({}): lmdeck keeps using that binary; clear the setting to use this build\"", cfg.llama.server_path)
         },

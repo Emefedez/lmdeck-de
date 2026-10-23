@@ -48,6 +48,8 @@ pub(super) enum Field {
     Prompt,
     PromptMode,
     GpuLayers,
+    /// Which llama.cpp build runs this GGUF: auto / stock / prism.
+    Engine,
     PromptPath,
 }
 
@@ -82,6 +84,7 @@ fn model_fields(format: Format) -> Vec<Field> {
     let mut f = vec![Field::Context, Field::Device, Field::KeepAlive, Field::Prompt, Field::PromptMode];
     if format == Format::Gguf {
         f.push(Field::GpuLayers);
+        f.push(Field::Engine);
     }
     if format == Format::Strata {
         f.retain(|f| !matches!(f, Field::Device));
@@ -246,7 +249,7 @@ impl Ui {
         self.edit_config(name, move |c| {
             let o = c.overrides.entry(n.clone()).or_default();
             f(o)?;
-            if o.device.is_none() && o.ctx_size.is_none() && o.keep_alive.is_none() && o.system_prompt_mode.is_none() && o.gpu_layers.is_none() && o.extra_args.is_empty() && o.env.is_empty() {
+            if o.device.is_none() && o.ctx_size.is_none() && o.keep_alive.is_none() && o.system_prompt_mode.is_none() && o.gpu_layers.is_none() && o.engine.is_none() && o.extra_args.is_empty() && o.env.is_empty() {
                 c.overrides.remove(&n);
             }
             Ok(())
@@ -304,6 +307,7 @@ impl Ui {
                                 Field::KeepAlive => o.keep_alive = None,
                                 Field::PromptMode => o.system_prompt_mode = None,
                                 Field::GpuLayers => o.gpu_layers = None,
+                                Field::Engine => o.engine = None,
                                 Field::Prompt | Field::PromptPath => {}
                             }
                             Ok(())
@@ -317,6 +321,26 @@ impl Ui {
                     let cur = crate::config::get_setting(&self.cfg, "strata.prompt_path");
                     let next = crate::config::prompt_chunk_cycle(&cur);
                     self.edit_config("strata.prompt_path", |c| crate::config::set_setting(c, "strata.prompt_path", next));
+                    keep(self, sel);
+                }
+                Field::Engine => {
+                    let cur = self.cfg.overrides.get(&name).and_then(|o| o.engine.clone());
+                    let next = match cur.as_deref() {
+                        None => "stock",
+                        Some("stock") => "prism",
+                        _ => "",
+                    };
+                    let ok = self.edit_override(&name, |o| {
+                        o.engine = (!next.is_empty()).then(|| next.to_string());
+                        Ok(())
+                    });
+                    if ok {
+                        self.toast(match next {
+                            "" => format!("{name}: automatic engine again"),
+                            "prism" => format!("{name} will run on the Prism build (ternary types, slower)"),
+                            _ => format!("{name} forced onto the stock llama.cpp build"),
+                        });
+                    }
                     keep(self, sel);
                 }
                 Field::Context | Field::KeepAlive | Field::GpuLayers => {
@@ -616,6 +640,14 @@ impl Ui {
                 },
                 Field::PromptMode => o.and_then(|o| o.system_prompt_mode.clone()).unwrap_or_else(|| "the backend's".into()),
                 Field::GpuLayers => o.and_then(|o| o.gpu_layers).map(|n| n.to_string()).unwrap_or_else(|| "auto (all that fit)".into()),
+                Field::Engine => match o.and_then(|o| o.engine.as_deref()) {
+                    Some("prism") => "Prism build".into(),
+                    Some("stock") => "stock build".into(),
+                    _ => {
+                        let auto_prism = m.map(|m| m.needs_prism).unwrap_or(false) && self.cfg.prism_server().is_some();
+                        if auto_prism { "auto (Prism)".into() } else { "auto (stock)".into() }
+                    }
+                },
                 Field::PromptPath => format!("◂ {} ▸", crate::config::get_setting(&self.cfg, "strata.prompt_path")),
             }
         };
@@ -626,6 +658,7 @@ impl Ui {
             Field::Prompt => "System prompt",
             Field::PromptMode => "Prompt mode",
             Field::GpuLayers => "GPU layers",
+            Field::Engine => "Engine",
             Field::PromptPath => "Prompt path",
         };
         let mut l: Vec<Line> = fields.iter().enumerate().map(|(i, fl)| {
@@ -689,6 +722,7 @@ impl Ui {
             Field::Prompt => "Enter opens prompts/models/<model>.md in your editor; x goes back to the backend's prompt.",
             Field::PromptMode => "prepend (before the client's), replace (instead of it), fallback (only when the client sends none).",
             Field::GpuLayers => "GGUF layers on the GPU; the rest run on the CPU. auto = as many as fit.",
+            Field::Engine => "auto uses the Prism build only for GGUFs its header needs (PQ2_0/PTQ1_0); stock/prism force one.",
             Field::PromptPath => "←/→ or Enter: off (decode windows) / 1024 / 2048 / 4096 (GPU chunked path).",
         };
         l.push(dim(help));

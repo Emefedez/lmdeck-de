@@ -41,8 +41,12 @@ pub struct LocalModel {
     /// MLX quantization mode from config.json (affine, nvfp4, mxfp4, …).
     pub qmode: Option<String>,
     pub arch: String,
-    /// Why this checkpoint cannot be loaded as a standalone chat model (MLX only).
+    /// Why this checkpoint cannot be loaded as a standalone chat model (MLX, or a GGUF no
+    /// configured llama.cpp build can read).
     pub unsupported: Option<String>,
+    /// GGUF whose header needs the Prism build: `prism.hadamard.*` metadata or a Prism-only
+    /// tensor type (PQ2_0 = 142, PTQ1_0 = 143).
+    pub needs_prism: bool,
     pub params: String,
     pub ctx_len: Option<u64>,
     pub mmproj: Option<PathBuf>,
@@ -155,6 +159,7 @@ fn scan_strata(cfg: &Config, out: &mut Vec<LocalModel>) {
             qmode: None,
             arch: "qwen3.8-flash-next".into(),
             unsupported: None,
+            needs_prism: false,
             params: "125B".into(),
             ctx_len: arg("--max-context").and_then(|c| c.parse().ok()).or(Some(32768)),
             mmproj: None,
@@ -230,6 +235,7 @@ fn scan_snapshot(repo: &str, snap: &Path, out: &mut Vec<LocalModel>) {
             let tag = quant_tag(&key);
             let meta = gguf_meta(&parts[0]).unwrap_or_default();
             let unsupported = gguf_unsupported(&meta);
+            let prism_needed = needs_prism(&meta);
             out.push(LocalModel {
                 name: format!("{repo}:{tag}"),
                 format: Format::Gguf,
@@ -241,6 +247,7 @@ fn scan_snapshot(repo: &str, snap: &Path, out: &mut Vec<LocalModel>) {
                 qmode: None,
                 arch: meta.arch,
                 unsupported,
+                needs_prism: prism_needed,
                 params: if meta.size_label.is_empty() { params_from_name(repo) } else { meta.size_label },
                 ctx_len: meta.ctx_len,
                 vision: mmproj.is_some(),
@@ -297,6 +304,7 @@ fn scan_snapshot(repo: &str, snap: &Path, out: &mut Vec<LocalModel>) {
             quant,
             arch: cfg.get("model_type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             unsupported,
+            needs_prism: false,
             params: params_from_name(repo),
             ctx_len,
             mmproj: None,
@@ -338,6 +346,7 @@ fn scan_loose(dir: &Path, out: &mut Vec<LocalModel>) {
         let stem = key.trim_end_matches(".gguf").to_string();
         let meta = gguf_meta(&parts[0]).unwrap_or_default();
         let unsupported = gguf_unsupported(&meta);
+        let prism_needed = needs_prism(&meta);
         let mmproj = parts[0].parent().and_then(|d| {
             std::fs::read_dir(d).ok()?.flatten().map(|e| e.path()).find(|p| {
                 ext_is(p, "gguf") && fname(p).to_lowercase().starts_with("mmproj")
@@ -355,6 +364,7 @@ fn scan_loose(dir: &Path, out: &mut Vec<LocalModel>) {
             qmode: None,
             arch: meta.arch,
             unsupported,
+            needs_prism: prism_needed,
             params: if meta.size_label.is_empty() { params_from_name(&stem) } else { meta.size_label },
             ctx_len: meta.ctx_len,
             vision: mmproj.is_some(),
@@ -471,22 +481,52 @@ pub const KNOWN_GGML_TYPES: i32 = 42;
 /// it: a type above `KNOWN_GGML_TYPES`, or Prism's `prism.hadamard.*` block, whose weights are
 /// rotated before ternary quantization and need Prism's runtime to undo.
 pub fn gguf_unsupported(m: &GgufMeta) -> Option<String> {
-    let custom = m.max_type.filter(|t| *t > KNOWN_GGML_TYPES);
+    gguf_unsupported_with(m, llama_supports_prism())
+}
+
+/// True when the installed llama.cpp was built from the Prism fork: its `ggml.h` defines
+/// `GGML_TYPE_PQ2_0 = 142` (and PTQ1_0 = 143). Upstream's `GGML_TYPE_COUNT` stays at 43.
+pub fn llama_supports_prism() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        let mut headers = vec![crate::config::llama_dir().join("src/ggml/include/ggml.h")];
+        // llama.server_path / llama.prism_path may point at someone else's build
+        // (bin/llama-server next to src/).
+        if let Ok(cfg) = crate::config::Config::load() {
+            for bin in [cfg.llama_server(), cfg.prism_server()].into_iter().flatten() {
+                if let Some(root) = bin.parent().and_then(|p| p.parent()) {
+                    headers.push(root.join("src/ggml/include/ggml.h"));
+                }
+            }
+        }
+        headers.iter().any(|h| std::fs::read_to_string(h).map(|s| s.contains("GGML_TYPE_PQ2_0 = 142")).unwrap_or(false))
+    })
+}
+
+/// True when the file needs the Prism build (hadamard metadata, or a Prism-only type).
+pub fn needs_prism(m: &GgufMeta) -> bool {
+    m.prism || m.max_type.map(|t| t > KNOWN_GGML_TYPES && t <= 143).unwrap_or(false)
+}
+
+/// The reason, or `None`. `prism_ok` says whether the llama.cpp in use has Prism's types.
+pub fn gguf_unsupported_with(m: &GgufMeta, prism_ok: bool) -> Option<String> {
+    let known = if prism_ok { 143 } else { KNOWN_GGML_TYPES };
+    let custom = m.max_type.filter(|t| *t > known);
     let file_type = m.file_type.map(|f| f.to_string()).unwrap_or_else(|| "?".into());
-    if m.prism {
+    if m.prism && !prism_ok {
         let ty = match custom {
             Some(t) => format!("custom ggml type {t}"),
             None => "a custom ggml type".into(),
         };
         return Some(format!(
-            "Prism rotated ternary ({ty}, file type {file_type}): the weights are hadamard-rotated before quantization, \
-             so llama.cpp cannot read them (it knows types 0-{KNOWN_GGML_TYPES}). Needs Prism's runtime, or a standard \
-             TQ1_0/TQ2_0 build"
+            "Prism rotated ternary ({ty}, file type {file_type}): needs a Prism-capable llama.cpp - set \
+             llama.repo = https://github.com/PrismML-Eng/llama.cpp and llama.git_ref = prism, then build it \
+             (upstream llama.cpp knows types 0-{KNOWN_GGML_TYPES})"
         ));
     }
     custom.map(|t| {
         format!(
-            "custom ggml tensor type {t} (file type {file_type}): this llama.cpp build knows types 0-{KNOWN_GGML_TYPES}; \
+            "custom ggml tensor type {t} (file type {file_type}): this llama.cpp build knows types 0-{known}; \
              rebuild with a newer `llama.git_ref` if upstream added it"
         )
     })
@@ -790,8 +830,9 @@ mod tests {
         assert_eq!(m.file_type, Some(141));
         assert_eq!(m.max_type, Some(142));
         assert!(m.prism);
-        let why = gguf_unsupported(&m).expect("flagged");
+        let why = gguf_unsupported_with(&m, false).expect("flagged");
         assert!(why.contains("Prism") && why.contains("142"), "{why}");
+        assert!(gguf_unsupported_with(&m, true).is_none(), "a Prism build reads it");
     }
 
     #[test]
@@ -800,13 +841,13 @@ mod tests {
         let m = meta_of(synthetic_gguf(36, 35, false), "tq2");
         assert_eq!(m.max_type, Some(35));
         assert!(!m.prism);
-        assert!(gguf_unsupported(&m).is_none());
+        assert!(gguf_unsupported_with(&m, false).is_none());
     }
 
     #[test]
     fn unknown_custom_type_is_flagged() {
         let m = meta_of(synthetic_gguf(141, 142, false), "custom");
-        let why = gguf_unsupported(&m).expect("flagged");
+        let why = gguf_unsupported_with(&m, false).expect("flagged");
         assert!(why.contains("142") && why.contains("llama.cpp"), "{why}");
     }
 
