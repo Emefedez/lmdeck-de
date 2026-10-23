@@ -16,7 +16,7 @@ mod widgets;
 
 use crate::client::{self, Daemon};
 use crate::config::Config;
-use crate::hf::{RepoFile, RepoHit};
+use crate::hf::{self, RepoFile, RepoHit};
 use crate::models::LocalModel;
 use crate::sys::{self, Versions};
 use anyhow::Result;
@@ -74,7 +74,7 @@ enum Msg {
     Status(Option<Value>),
     Versions(Box<Versions>),
     Search(u64, Result<(Vec<RepoHit>, usize), String>),
-    Repo(String, Result<Vec<RepoFile>, String>),
+    Repo(String, Result<(Vec<RepoFile>, Option<hf::RepoConfig>), String>),
     Toast(String),
     Models,
     /// Load failed for lack of a GPU kernel: (model, recommended download).
@@ -104,6 +104,8 @@ enum Click {
 struct RepoView {
     repo: String,
     files: Option<Vec<RepoFile>>,
+    /// Why this checkpoint is not a standalone chat model, from its config.
+    unsupported: Option<String>,
     err: Option<String>,
     sel: TableState,
 }
@@ -447,7 +449,14 @@ impl Ui {
             Msg::Repo(repo, r) => {
                 if let Some(rv) = self.repo.as_mut().filter(|rv| rv.repo == repo) {
                     match r {
-                        Ok(f) => rv.files = Some(f),
+                        Ok((f, cfg)) => {
+                            rv.files = Some(f);
+                            rv.unsupported = cfg.and_then(|c| crate::compat::mlx_unsupported(
+                                c.model_type.as_deref().unwrap_or(""),
+                                &c.architectures,
+                                c.model_file.as_deref(),
+                            ));
+                        }
                         Err(e) => rv.err = Some(e),
                     }
                 }
@@ -633,7 +642,11 @@ impl Ui {
 
     /// Load through the daemon; a missing GPU kernel or a lack of memory opens the popup that
     /// deals with it instead of just a toast.
-    fn load_model(&self, name: String) {
+    fn load_model(&mut self, name: String) {
+        if let Some(why) = self.models.iter().find(|m| m.name == name).and_then(|m| m.unsupported.clone()) {
+            self.toast(format!("{name}: unsupported — {why}"));
+            return;
+        }
         let d = self.d.clone();
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();

@@ -279,11 +279,15 @@ impl Ui {
         }
         spans.push(Span::raw(name));
         if m.format == Format::Mlx {
-            let v = crate::compat::assess_mlx(&self.cfg, m.repo.as_deref().unwrap_or(&m.name), m.qmode.as_deref());
-            let color = match v.level { "unlikely" => Color::Red, "untested" => Color::Yellow, _ => Color::Green };
-            let mk = crate::compat::marker(v.level);
-            if !mk.is_empty() {
-                spans.push(Span::styled(format!(" {mk}"), Style::new().fg(color)));
+            if m.unsupported.is_some() {
+                spans.push(Span::styled(" ✗ unsupported", Style::new().fg(Color::Red)));
+            } else {
+                let v = crate::compat::assess_mlx(&self.cfg, m.repo.as_deref().unwrap_or(&m.name), m.qmode.as_deref());
+                let color = match v.level { "unlikely" => Color::Red, "untested" => Color::Yellow, _ => Color::Green };
+                let mk = crate::compat::marker(v.level);
+                if !mk.is_empty() {
+                    spans.push(Span::styled(format!(" {mk}"), Style::new().fg(color)));
+                }
             }
         }
         if self.cfg.overrides.get(&m.name).and_then(|o| o.device.as_deref()) == Some("cpu") {
@@ -338,9 +342,13 @@ impl Ui {
         };
         l.push(kv("Sys prompt", prompt));
         if m.format == Format::Mlx {
-            let v = crate::compat::assess_mlx(&self.cfg, m.repo.as_deref().unwrap_or(&m.name), m.qmode.as_deref());
-            if v.level != "qualified" && !v.reason.is_empty() {
-                l.push(kv("Apple GPU", &v.reason));
+            if let Some(u) = &m.unsupported {
+                l.push(kv("Support", &format!("unsupported: {u}")));
+            } else {
+                let v = crate::compat::assess_mlx(&self.cfg, m.repo.as_deref().unwrap_or(&m.name), m.qmode.as_deref());
+                if v.level != "qualified" && !v.reason.is_empty() {
+                    l.push(kv("Apple GPU", &v.reason));
+                }
             }
         }
         l.push(Line::raw(""));

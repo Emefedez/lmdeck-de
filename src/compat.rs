@@ -18,6 +18,9 @@ const PROBE: &str = include_str!("compat_probe.py");
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Probe {
+    /// Probe output format; bumped when a new field must be populated.
+    #[serde(default)]
+    pub schema: u32,
     /// Runtime fingerprint the probe ran against.
     pub runtime: String,
     pub mlx: String,
@@ -26,6 +29,9 @@ pub struct Probe {
     /// GPU working-set budget in bytes (Asahi exposes ~half of RAM to the GPU).
     #[serde(default)]
     pub gpu_budget: u64,
+    /// `model_type` values this runtime's `mlx_lm` can load.
+    #[serde(default)]
+    pub model_types: Vec<String>,
 }
 
 static PROBE_CACHE: LazyLock<Mutex<Option<Probe>>> = LazyLock::new(|| Mutex::new(None));
@@ -50,12 +56,12 @@ fn cache_path() -> std::path::PathBuf {
 pub fn probe(cfg: &Config) -> Option<Probe> {
     let key = runtime_key();
     if let Some(p) = PROBE_CACHE.lock().unwrap().as_ref() {
-        if p.runtime == key && p.gpu_budget > 0 {
+        if p.runtime == key && p.gpu_budget > 0 && p.schema >= 2 {
             return Some(p.clone());
         }
     }
     if let Some(p) = std::fs::read(cache_path()).ok().and_then(|b| serde_json::from_slice::<Probe>(&b).ok()) {
-        if p.runtime == key && p.gpu_budget > 0 {
+        if p.runtime == key && p.gpu_budget > 0 && p.schema >= 2 {
             *PROBE_CACHE.lock().unwrap() = Some(p.clone());
             return Some(p);
         }
@@ -69,10 +75,12 @@ pub fn probe(cfg: &Config) -> Option<Probe> {
     let line = String::from_utf8_lossy(&out.stdout).lines().rev().find(|l| l.starts_with('{'))?.to_string();
     let v: Value = serde_json::from_str(&line).ok()?;
     let p = Probe {
+        schema: v["schema"].as_u64().unwrap_or(0) as u32,
         runtime: key,
         mlx: v["mlx"].as_str().unwrap_or("").to_string(),
         modes: v["modes"].as_object()?.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         gpu_budget: v["gpu_budget"].as_u64().unwrap_or(0),
+        model_types: v["model_types"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
     };
     let _ = std::fs::write(cache_path(), serde_json::to_vec_pretty(&p).unwrap_or_default());
     crate::sys::log(&format!("compat probe ({}): {}", p.runtime, p.modes.iter().map(|(k, v)| format!("{k}={}", v == &Value::Bool(true))).collect::<Vec<_>>().join(" ")));
@@ -187,8 +195,78 @@ pub fn marker(level: &str) -> &'static str {
     match level {
         "qualified" => "✓",
         "untested" => "?",
-        "unlikely" => "✗",
+        "unlikely" | "unsupported" => "✗",
         _ => "",
+    }
+}
+
+/// Architecture-name fragments that mark a checkpoint as auxiliary rather than a
+/// standalone chat model (speculative drafters, MTP heads, ...). They load from
+/// their own runtime alongside a target model, never on their own.
+const AUX_ARCH: &[&str] = &["draft", "dflash", "speculat", "eagle", "medusa", "lookahead", "mtp"];
+
+/// Architecture suffixes for non-generative checkpoints (classifiers, embedders).
+const NON_CHAT_ARCH: &[&str] = &[
+    "ForSequenceClassification",
+    "ForTokenClassification",
+    "ForQuestionAnswering",
+    "ForMaskedLM",
+    "ForImageClassification",
+    "ForAudioClassification",
+    "ForObjectDetection",
+    "ForImageSegmentation",
+    "ForFeatureExtraction",
+    "ForCTC",
+    "ForReward",
+    "ForReranker",
+    "SentenceTransformer",
+];
+
+/// Why this checkpoint cannot be served as a chat model by lmdeck's MLX runtime,
+/// if we can tell from its `config.json`. `model_file` means the repo ships its
+/// own implementation, so its `model_type` need not appear in `mlx_lm`.
+pub fn mlx_unsupported(model_type: &str, architectures: &[String], model_file: Option<&str>) -> Option<String> {
+    if model_file.is_some_and(|f| !f.is_empty()) {
+        return None;
+    }
+    if let Some(a) = architectures.iter().find(|a| {
+        let l = a.to_lowercase();
+        AUX_ARCH.iter().any(|k| l.contains(k))
+    }) {
+        return Some(format!(
+            "{a} is a speculative/auxiliary checkpoint, not a standalone chat model: it needs its target model and a drafter runtime"
+        ));
+    }
+    if let Some(a) = architectures.iter().find(|a| NON_CHAT_ARCH.iter().any(|s| a.ends_with(s))) {
+        return Some(format!("{a} is not a text-generation model"));
+    }
+    let p = probe_cached_only()?;
+    if model_type.is_empty() || p.model_types.is_empty() {
+        return None;
+    }
+    if !p.model_types.iter().any(|t| t == model_type) {
+        return Some(format!("model type \"{model_type}\" has no mlx_lm implementation in this runtime ({}), so it cannot be loaded", if p.mlx.is_empty() { "omarchy-mlx" } else { &p.mlx }));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn archs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn draft_and_non_chat_checkpoints_are_unsupported() {
+        let a = archs(&["DFlash2DraftModel"]);
+        assert!(mlx_unsupported("qwen3", &a, None).unwrap().contains("draft"));
+        let a = archs(&["Qwen3ForSequenceClassification"]);
+        assert!(mlx_unsupported("qwen3", &a, None).unwrap().contains("text-generation"));
+        let a = archs(&["Qwen3ForCausalLM"]);
+        assert!(mlx_unsupported("qwen3", &a, None).is_none());
+        assert!(mlx_unsupported("qwen3", &a, Some("custom.py")).is_none());
     }
 }
 

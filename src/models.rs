@@ -41,6 +41,8 @@ pub struct LocalModel {
     /// MLX quantization mode from config.json (affine, nvfp4, mxfp4, …).
     pub qmode: Option<String>,
     pub arch: String,
+    /// Why this checkpoint cannot be loaded as a standalone chat model (MLX only).
+    pub unsupported: Option<String>,
     pub params: String,
     pub ctx_len: Option<u64>,
     pub mmproj: Option<PathBuf>,
@@ -152,6 +154,7 @@ fn scan_strata(cfg: &Config, out: &mut Vec<LocalModel>) {
             quant: if stem == "mock" { "mock".into() } else { quant },
             qmode: None,
             arch: "qwen3.8-flash-next".into(),
+            unsupported: None,
             params: "125B".into(),
             ctx_len: arg("--max-context").and_then(|c| c.parse().ok()).or(Some(32768)),
             mmproj: None,
@@ -236,6 +239,7 @@ fn scan_snapshot(repo: &str, snap: &Path, out: &mut Vec<LocalModel>) {
                 quant: tag.clone(),
                 qmode: None,
                 arch: meta.arch,
+                unsupported: None,
                 params: if meta.size_label.is_empty() { params_from_name(repo) } else { meta.size_label },
                 ctx_len: meta.ctx_len,
                 vision: mmproj.is_some(),
@@ -271,6 +275,16 @@ fn scan_snapshot(repo: &str, snap: &Path, out: &mut Vec<LocalModel>) {
             .or_else(|| cfg.get("max_position_embeddings"))
             .and_then(|v| v.as_u64());
         let template = read_template(snap);
+        let architectures: Vec<String> = cfg
+            .get("architectures")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let unsupported = crate::compat::mlx_unsupported(
+            cfg.get("model_type").and_then(|v| v.as_str()).unwrap_or(""),
+            &architectures,
+            cfg.get("model_file").and_then(|v| v.as_str()),
+        );
         out.push(LocalModel {
             name: repo.to_string(),
             format: Format::Mlx,
@@ -281,6 +295,7 @@ fn scan_snapshot(repo: &str, snap: &Path, out: &mut Vec<LocalModel>) {
             qmode: q.and_then(|q| q.get("mode")).and_then(|m| m.as_str()).map(str::to_string).or_else(|| q.map(|_| "affine".to_string())),
             quant,
             arch: cfg.get("model_type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            unsupported,
             params: params_from_name(repo),
             ctx_len,
             mmproj: None,
@@ -337,6 +352,7 @@ fn scan_loose(dir: &Path, out: &mut Vec<LocalModel>) {
             quant: quant_tag(&key),
             qmode: None,
             arch: meta.arch,
+            unsupported: None,
             params: if meta.size_label.is_empty() { params_from_name(&stem) } else { meta.size_label },
             ctx_len: meta.ctx_len,
             vision: mmproj.is_some(),

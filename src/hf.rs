@@ -45,6 +45,18 @@ fn auth(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
 
 // ---------- search ----------
 
+/// The part of a repo's `config.json` that decides whether it is a loadable
+/// standalone chat model. The Hub exposes this through `expand[]=config`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RepoConfig {
+    #[serde(default)]
+    pub architectures: Vec<String>,
+    #[serde(default)]
+    pub model_type: Option<String>,
+    #[serde(default)]
+    pub model_file: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RepoHit {
     pub id: String,
@@ -63,6 +75,12 @@ pub struct RepoHit {
     pub estimated_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub formats: Vec<String>,
+    /// `config.json` facts from the search response, when expanded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<RepoConfig>,
+    /// Set when this checkpoint cannot be loaded as a standalone chat model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsupported: Option<String>,
 }
 
 fn search_query(query: &str) -> &str {
@@ -95,6 +113,7 @@ pub async fn search_sorted(c: &reqwest::Client, query: &str, kind: &str, limit: 
             ("filter", kind.into()),
             ("expand[]", "downloads".into()), ("expand[]", "likes".into()),
             ("expand[]", "lastModified".into()), ("expand[]", "pipeline_tag".into()), ("expand[]", "gated".into()),
+            ("expand[]", "config".into()),
         ];
         searches.push(async move {
             let r = auth(c.get(format!("{HF}/api/models")).query(&q)).send().await?.error_for_status()?;
@@ -104,13 +123,41 @@ pub async fn search_sorted(c: &reqwest::Client, query: &str, kind: &str, limit: 
     let mut hits: Vec<RepoHit> = futures_util::future::try_join_all(searches).await?.into_iter().flatten().collect();
     // An explicit repo or pasted URL should work even if its format tag is missing.
     if query.split('/').count() == 2 && !query.contains(char::is_whitespace) {
-        let r = auth(c.get(format!("{HF}/api/models/{query}"))).send().await?;
+        let r = auth(c.get(format!("{HF}/api/models/{query}")).query(&[("expand[]", "config")])).send().await?;
         if r.status().is_success() { hits.push(r.json().await?); }
         else if r.status() != 404 { r.error_for_status()?; }
     }
+    mark_unsupported(&mut hits, kind);
     rank_hits(&mut hits, query, sort);
     hits.truncate(limit);
     Ok(hits)
+}
+
+/// Flag checkpoints whose own config says they are not standalone chat models.
+/// Only for MLX searches: a GGUF conversion may target a different runtime.
+fn mark_unsupported(hits: &mut [RepoHit], kind: &str) {
+    if kind != "mlx" {
+        return;
+    }
+    for hit in hits {
+        let Some(config) = &hit.config else { continue };
+        hit.unsupported = crate::compat::mlx_unsupported(
+            config.model_type.as_deref().unwrap_or(""),
+            &config.architectures,
+            config.model_file.as_deref(),
+        );
+    }
+}
+
+/// Fetch just `config.json` facts for one repo (for the repo detail screen).
+pub async fn repo_config(c: &reqwest::Client, repo: &str) -> Result<RepoConfig> {
+    #[derive(Deserialize)]
+    struct Info {
+        #[serde(default)]
+        config: Option<RepoConfig>,
+    }
+    let r = auth(c.get(format!("{HF}/api/models/{repo}")).query(&[("expand[]", "config")])).send().await?.error_for_status()?;
+    Ok(r.json::<Info>().await?.config.unwrap_or_default())
 }
 
 /// Search supported formats, then check actual variants rather than trusting repo tags.
@@ -829,6 +876,26 @@ mod tests {
         assert_eq!(hits[0].id, "b/Qwen3-4B");
         rank_hits(&mut hits, "Qwen3-4B", "downloads");
         assert_eq!(hits[0].downloads, 100);
+    }
+
+    #[test]
+    fn mlx_searches_flag_draft_and_non_chat_configs() {
+        let cfg = |arch: &str, model_type: &str| RepoConfig { architectures: vec![arch.into()], model_type: Some(model_type.into()), model_file: None };
+        let mut hits = vec![
+            RepoHit { id: "o/draft".into(), config: Some(cfg("DFlash2DraftModel", "qwen3")), ..Default::default() },
+            RepoHit { id: "o/classifier".into(), config: Some(cfg("Qwen3ForSequenceClassification", "qwen3")), ..Default::default() },
+            RepoHit { id: "o/chat".into(), config: Some(cfg("Qwen3ForCausalLM", "qwen3")), ..Default::default() },
+            RepoHit { id: "o/unknown".into(), ..Default::default() },
+        ];
+        mark_unsupported(&mut hits, "mlx");
+        assert!(hits[0].unsupported.as_deref().unwrap().contains("draft"));
+        assert!(hits[1].unsupported.is_some());
+        assert!(hits[2].unsupported.is_none());
+        assert!(hits[3].unsupported.is_none());
+        // GGUF may target another runtime, so MLX rules do not apply.
+        let mut gguf = vec![RepoHit { id: "o/draft".into(), config: Some(cfg("DFlash2DraftModel", "qwen3")), ..Default::default() }];
+        mark_unsupported(&mut gguf, "gguf");
+        assert!(gguf[0].unsupported.is_none());
     }
 
     #[test]

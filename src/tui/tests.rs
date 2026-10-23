@@ -154,6 +154,32 @@ async fn discover_cycles_formats_and_applies_a_budget() {
 }
 
 #[test]
+fn unsupported_checkpoints_are_marked_in_search_and_detail() {
+    let mut ui = ui();
+    ui.tab = Tab::Discover;
+    ui.catalog_mode = false;
+    ui.hits = vec![RepoHit {
+        id: "org/draft".into(),
+        formats: vec!["mlx".into()],
+        unsupported: Some("DFlash2DraftModel is a speculative/auxiliary checkpoint, not a standalone chat model".into()),
+        ..Default::default()
+    }];
+    let text = draw(&mut ui, 160, 40);
+    assert!(text.contains("unsupported"), "search row must say unsupported");
+    let file = |path: &str, size| RepoFile { path: path.into(), size, sha256: None, blob: String::new() };
+    ui.repo = Some(RepoView {
+        repo: "org/draft".into(),
+        files: Some(vec![file("config.json", 128), file("model.safetensors", 1 << 30)]),
+        unsupported: Some("DFlash2DraftModel is a speculative/auxiliary checkpoint, not a standalone chat model".into()),
+        err: None,
+        sel: TableState::default().with_selected(Some(0)),
+    });
+    let text = draw(&mut ui, 160, 40);
+    assert!(text.contains("not loadable by the MLX runtime"), "repo detail must say why");
+    assert!(ui.repo_choices().iter().all(|(_, label, _)| !label.contains("recommended")), "must not recommend an unsupported MLX variant");
+}
+
+#[test]
 fn opened_repo_obeys_format_and_budget_filters() {
     let mut ui = ui();
     ui.tab = Tab::Discover;
@@ -162,6 +188,7 @@ fn opened_repo_obeys_format_and_budget_filters() {
     ui.repo = Some(RepoView {
         repo: "org/mixed".into(),
         files: Some(vec![file("config.json", 128), file("model.safetensors", 4 << 30), file("model-Q4_K_M.gguf", 2 << 30), file("model-Q8_0.gguf", 6 << 30)]),
+        unsupported: None,
         err: None,
         sel: TableState::default().with_selected(Some(0)),
     });

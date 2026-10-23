@@ -180,12 +180,15 @@ impl Ui {
 
     fn open_repo(&mut self, repo: String) {
         let tx = self.tx.clone();
-        self.repo = Some(RepoView { repo: repo.clone(), files: None, err: None, sel: TableState::default().with_selected(Some(0)) });
+        self.repo = Some(RepoView { repo: repo.clone(), files: None, unsupported: None, err: None, sel: TableState::default().with_selected(Some(0)) });
         tokio::spawn(async move {
             let c = hf::client();
-            let r: Result<Vec<RepoFile>, String> = async {
+            let r: Result<(Vec<RepoFile>, Option<hf::RepoConfig>), String> = async {
                 let sha = hf::repo_sha(&c, &repo, "main").await?;
-                hf::repo_files(&c, &repo, &sha).await
+                let files = hf::repo_files(&c, &repo, &sha).await?;
+                // Not fatal: without it we simply cannot pre-flag an unsupported checkpoint.
+                let config = hf::repo_config(&c, &repo).await.ok();
+                Ok::<_, anyhow::Error>((files, config))
             }
             .await
             .map_err(|e| format!("{e:#}"));
@@ -204,7 +207,7 @@ impl Ui {
         };
         let advice: Vec<_> = choices.iter().map(|c| crate::compat::hardware_advice(&self.cfg, c.size, c.format)).collect();
         let recommended = crate::compat::recommended_choice(&choices, &advice)
-            .filter(|&i| choices[i].format != "mlx" || crate::compat::assess_mlx(&self.cfg, &rv.repo, None).level != "unlikely");
+            .filter(|&i| choices[i].format != "mlx" || (rv.unsupported.is_none() && crate::compat::assess_mlx(&self.cfg, &rv.repo, None).level != "unlikely"));
         choices
             .into_iter()
             .enumerate()
@@ -240,14 +243,22 @@ impl Ui {
         } else {
             let rows: Vec<Row> = self.hits.iter().map(|h| {
                 let v = h.formats.iter().any(|x| x == "mlx").then(|| crate::compat::assess_mlx(&self.cfg, &h.id, None));
-                let (mk, color) = match v.as_ref().map(|v| v.level) {
-                    Some("unlikely") => ("✗ ", Color::Red),
-                    Some("untested") => ("? ", Color::Yellow),
-                    Some("qualified") => ("✓ ", Color::Green),
-                    _ => ("  ", Color::Reset),
+                let (mk, color) = if h.unsupported.is_some() {
+                    ("✗ ", Color::Red)
+                } else {
+                    match v.as_ref().map(|v| v.level) {
+                        Some("unlikely") => ("✗ ", Color::Red),
+                        Some("untested") => ("? ", Color::Yellow),
+                        Some("qualified") => ("✓ ", Color::Green),
+                        _ => ("  ", Color::Reset),
+                    }
                 };
+                let mut id = vec![Span::styled(mk, Style::new().fg(color)), Span::raw(h.id.clone())];
+                if let Some(u) = &h.unsupported {
+                    id.push(Span::styled(format!(" · unsupported: {u}"), Style::new().fg(Color::Red)));
+                }
                 Row::new(vec![
-                    Cell::from(Line::from(vec![Span::styled(mk, Style::new().fg(color)), Span::raw(h.id.clone())])),
+                    Cell::from(Line::from(id)),
                     Cell::from(h.formats.join("/").to_uppercase()),
                     Cell::from(h.estimated_bytes.map(fmt_gib).unwrap_or_else(|| "—".into())),
                     Cell::from(compact(h.downloads)),
@@ -304,17 +315,30 @@ impl Ui {
             f.render_widget(Paragraph::new(dim("loading the file list…")).block(panel(&rv.repo)), detail);
             return;
         }
-        let verdict = Some(crate::compat::assess_mlx(&self.cfg, &rv.repo, None)).filter(|v| v.level != "ok" && choices.iter().any(|c| !c.0.contains(':')));
+        let has_mlx = choices.iter().any(|c| !c.0.contains(':'));
+        let verdict = if has_mlx && let Some(u) = &rv.unsupported {
+            Some(("unsupported", u.clone()))
+        } else {
+            Some(crate::compat::assess_mlx(&self.cfg, &rv.repo, None))
+                .filter(|v| v.level != "ok" && has_mlx)
+                .map(|v| (v.level, v.reason))
+        };
         let block = panel(&rv.repo);
         let inner = block.inner(detail);
         f.render_widget(block, detail);
-        let [vrect, hrect, trect] = Layout::vertical([Constraint::Length(if verdict.is_some() { 3 } else { 0 }), Constraint::Length(3), Constraint::Min(2)]).areas(inner);
-        if let Some(v) = &verdict {
-            let color = match v.level { "unlikely" => Color::Red, "untested" => Color::Yellow, _ => Color::Green };
-            let text = match v.level { "unlikely" => "likely won't run on the Apple GPU", "untested" => "untested on omarchy-mlx", _ => "qualified on omarchy-mlx" };
-            let mut l = vec![Line::from(Span::styled(format!("{} {text}", crate::compat::marker(v.level)), Style::new().fg(color).bold()))];
-            if !v.reason.is_empty() && v.level != "qualified" {
-                l.push(dim(v.reason.clone()));
+        let verdict_h = if has_mlx && rv.unsupported.is_some() { 5 } else if verdict.is_some() { 3 } else { 0 };
+        let [vrect, hrect, trect] = Layout::vertical([Constraint::Length(verdict_h), Constraint::Length(3), Constraint::Min(2)]).areas(inner);
+        if let Some((level, reason)) = &verdict {
+            let color = match *level { "unsupported" | "unlikely" => Color::Red, "untested" => Color::Yellow, _ => Color::Green };
+            let text = match *level {
+                "unsupported" => "not loadable by the MLX runtime",
+                "unlikely" => "likely won't run on the Apple GPU",
+                "untested" => "untested on omarchy-mlx",
+                _ => "qualified on omarchy-mlx",
+            };
+            let mut l = vec![Line::from(Span::styled(format!("{} {text}", crate::compat::marker(level)), Style::new().fg(color).bold()))];
+            if !reason.is_empty() && *level != "qualified" {
+                l.push(dim(reason.clone()));
             }
             f.render_widget(Paragraph::new(l).wrap(Wrap { trim: true }), vrect);
         }

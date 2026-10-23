@@ -369,6 +369,7 @@ mod tests {
             quant: quant.into(),
             qmode: None,
             arch: String::new(),
+            unsupported: None,
             params: String::new(),
             ctx_len: None,
             mmproj: None,

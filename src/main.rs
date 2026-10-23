@@ -249,7 +249,8 @@ async fn async_main(cli: Cli) -> Result<()> {
             let hits = if sort == "relevance" { hf::search(&c, &query, kind, 30).await? }
                 else { hf::search_sorted(&c, &query, kind, 30, &sort).await? };
             for h in hits {
-                println!("{:<64} ⬇{:>9} ♥{:>6}", h.id, h.downloads, h.likes);
+                let flag = if h.unsupported.is_some() { "  ✗ unsupported" } else { "" };
+                println!("{:<64} ⬇{:>9} ♥{:>6}{flag}", h.id, h.downloads, h.likes);
             }
             Ok(())
         }

@@ -1794,26 +1794,37 @@ async fn lm_repo(State(a): State<App>, Query(q): Query<RepoQ>) -> Resp {
     let res = async {
         let sha = hf::repo_sha(&a.hf, &q.id, "main").await?;
         let files = hf::repo_files(&a.hf, &q.id, &sha).await?;
-        // The MLX quantization mode lives in config.json; small, so just read it.
+        // The MLX quantization mode and support classification live in config.json; small, so just read it.
         let mut qmode = None;
+        let mut unsupported = None;
         if files.iter().any(|f| f.path == "config.json") && files.iter().any(|f| f.path.ends_with(".safetensors")) {
             if let Ok(r) = a.hf.get(format!("{}/{}/resolve/{sha}/config.json", hf::HF, q.id)).send().await {
                 if let Ok(v) = r.json::<Value>().await {
                     let qc = v.get("quantization").or_else(|| v.get("quantization_config"));
                     qmode = qc.and_then(|x| x.get("mode")).and_then(|m| m.as_str()).map(str::to_string).or_else(|| qc.map(|_| "affine".into()));
+                    let architectures: Vec<String> = v
+                        .get("architectures")
+                        .and_then(|x| x.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
+                    unsupported = crate::compat::mlx_unsupported(
+                        v.get("model_type").and_then(|x| x.as_str()).unwrap_or(""),
+                        &architectures,
+                        v.get("model_file").and_then(|x| x.as_str()),
+                    );
                 }
             }
         }
-        Ok::<_, anyhow::Error>((files, qmode))
+        Ok::<_, anyhow::Error>((files, qmode, unsupported))
     }
     .await;
     match res {
-        Ok((files, qmode)) => {
+        Ok((files, qmode, unsupported)) => {
             let cfg = a.mgr.cfg();
             let variants = hf::choices(&q.id, &files, &cfg.download.gguf_default_quant);
             let advice: Vec<_> = variants.iter().map(|c| crate::compat::hardware_advice(&cfg, c.size, c.format)).collect();
             let recommended = crate::compat::recommended_choice(&variants, &advice);
-            let recommended = recommended.filter(|&i| variants[i].format != "mlx" || crate::compat::assess_mlx(&cfg, &q.id, qmode.as_deref()).level != "unlikely");
+            let recommended = recommended.filter(|&i| variants[i].format != "mlx" || (unsupported.is_none() && crate::compat::assess_mlx(&cfg, &q.id, qmode.as_deref()).level != "unlikely"));
             let choices: Vec<Value> = variants.into_iter().zip(advice).enumerate().map(|(i, (c, hw))| {
                 let mut v = json!(c);
                 v["fit"] = json!(hw.fit);
@@ -1832,7 +1843,7 @@ async fn lm_repo(State(a): State<App>, Query(q): Query<RepoQ>) -> Resp {
                     }
                 }
             }
-            Json(json!({"choices": choices, "compat": compat, "qmode": qmode})).into_response()
+            Json(json!({"choices": choices, "compat": compat, "qmode": qmode, "unsupported": unsupported})).into_response()
         }
         Err(e) => err(StatusCode::BAD_GATEWAY, format!("{e:#}")),
     }
