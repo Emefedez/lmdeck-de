@@ -193,15 +193,22 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Some(Cmd::Ps) => {
             let Some(s) = d.status().await else { bail!("daemon not running (lmdeck serve / lmdeck service start)") };
-            println!("{:<58} {:<5} {:>9} {:>9} {:>8}", "NAME", "FMT", "SIZE", "RSS", "EXPIRES");
+            println!("{:<58} {:<6} {:>9} {:>9} {:>8} {:>13}", "NAME", "FMT", "SIZE", "RSS", "EXPIRES", "CONTEXT");
             for r in s["running"].as_array().cloned().unwrap_or_default() {
+                let c = &r["context"];
+                let ctx = match (c["used"].as_u64(), c["limit"].as_u64()) {
+                    (Some(u), Some(l)) => format!("{u}/{l}"),
+                    (None, Some(l)) => format!("0/{l}"),
+                    _ => "-".into(),
+                };
                 println!(
-                    "{:<58} {:<5} {:>9} {:>9} {:>8}",
+                    "{:<58} {:<6} {:>9} {:>9} {:>8} {:>13}",
                     r["name"].as_str().unwrap_or(""),
                     r["format"].as_str().unwrap_or(""),
                     human(r["size"].as_u64().unwrap_or(0)),
                     human(r["rss"].as_u64().unwrap_or(0)),
-                    r["expires_in_secs"].as_u64().map(|s| format!("{s}s")).unwrap_or("never".into())
+                    r["expires_in_secs"].as_u64().map(|s| format!("{s}s")).unwrap_or("never".into()),
+                    ctx
                 );
             }
             Ok(())

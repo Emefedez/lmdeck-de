@@ -44,7 +44,7 @@ and `?` lists the keys of the screen you are on.
 
 | Screen | For |
 |---|---|
-| 1 Home | Server on/off, what is loaded, memory (free, kept free, GPU heap, what models can use), backends, usage, downloads; `f` opens the memory manager (reserve and heap sliders, processes, make room) |
+| 1 Home | Server on/off, what is loaded and how full its context is (the last request's prompt + reply against the window, live while a prompt is read, with tokens/s and time left), memory (free, kept free, GPU heap, what models can use), backends, usage, downloads; `f` opens the memory manager (reserve and heap sliders, processes, make room) |
 | 2 Models | Local models with fit (the server's planner decides), grade and details; favourites (`f`, listed first), load, chat, per-model settings, make room, delete |
 | 3 Get models | The omarchy-mlx catalog and a Hugging Face search, with a memory estimate and fit for each variant |
 | 4 Backends | MLX, GGUF and Strata: state, and actions that show their plan and ask before they run |

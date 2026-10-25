@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Bumped on every state change worth redrawing (load, unload, request
 /// start/end, download start/finish, config change). Long-poll waiters wake.
@@ -163,11 +163,34 @@ fn mean_power(secs: f64) -> Option<f64> {
 pub struct Usage {
     data: Mutex<UsageData>,
     dirty: AtomicBool,
+    /// Per model, how full the context was: the last request and the largest one (memory only).
+    ctx: Mutex<BTreeMap<String, CtxFill>>,
+}
+
+/// One request's share of a model's context window: prompt + reply tokens.
+#[derive(Debug, Clone, Copy)]
+pub struct CtxUse {
+    pub prompt: u64,
+    pub completion: u64,
+    pub at: SystemTime,
+}
+
+impl CtxUse {
+    pub fn total(&self) -> u64 {
+        self.prompt + self.completion
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CtxFill {
+    pub last: CtxUse,
+    pub peak: CtxUse,
 }
 
 pub static USAGE: LazyLock<Usage> = LazyLock::new(|| Usage {
     data: Mutex::new(std::fs::read(usage_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
     dirty: AtomicBool::new(false),
+    ctx: Mutex::new(BTreeMap::new()),
 });
 
 fn usage_path() -> PathBuf {
@@ -183,6 +206,16 @@ impl Usage {
     pub fn record(&self, model: &str, prompt: u64, completion: u64, prompt_secs: f64, gen_secs: f64, ttft_secs: f64) {
         if prompt == 0 && completion == 0 {
             return;
+        }
+        // A backend that reported no prompt count says nothing about the context.
+        if prompt > 0 {
+            let now = CtxUse { prompt, completion, at: SystemTime::now() };
+            let mut c = self.ctx.lock().unwrap();
+            let e = c.entry(model.to_string()).or_insert(CtxFill { last: now, peak: now });
+            e.last = now;
+            if now.total() >= e.peak.total() {
+                e.peak = now;
+            }
         }
         let mut d = self.data.lock().unwrap();
         d.days.entry(crate::sys::local_date(0)).or_default().add(prompt, completion);
@@ -218,6 +251,16 @@ impl Usage {
         self.dirty.store(true, Ordering::Relaxed);
         drop(d);
         EVENTS.bump();
+    }
+
+    /// How full `model`'s context was on its last request, and at most, since it loaded.
+    pub fn context(&self, model: &str) -> Option<CtxFill> {
+        self.ctx.lock().unwrap().get(model).copied()
+    }
+
+    /// A model (re)loaded: its context starts empty.
+    pub fn reset_context(&self, model: &str) {
+        self.ctx.lock().unwrap().remove(model);
     }
 
     /// Compact summary for /lmdeck/status.
@@ -322,7 +365,7 @@ mod tests {
 
     #[test]
     fn perf_is_recorded_only_when_enabled() {
-        let u = Usage { data: Mutex::new(UsageData::default()), dirty: AtomicBool::new(false) };
+        let u = Usage { data: Mutex::new(UsageData::default()), dirty: AtomicBool::new(false), ctx: Mutex::new(BTreeMap::new()) };
         PERF.store(false, Ordering::Relaxed);
         u.record("org/m", 100, 200, 1.0, 4.0, 1.0);
         assert!(u.data.lock().unwrap().perf.is_empty(), "off: no perf record");

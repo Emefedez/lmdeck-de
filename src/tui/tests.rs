@@ -376,6 +376,24 @@ fn home_shows_reserves_heap_and_residency() {
 }
 
 #[test]
+fn home_shows_how_full_each_models_context_is() {
+    let mut ui = ui();
+    ui.status = Some(serde_json::json!({"pid": 1, "running": [{
+        "name": "strata/q2_0", "format": "strata", "rss": 15u64 << 30, "in_flight": 1,
+        "context": {"limit": 32768, "used": 21000, "live": true, "peak": 21000, "last": {"prompt": 1900, "completion": 155, "ago_secs": 30}},
+        "work": {"phase": "reading prompt", "prompt_done": 10240, "prompt_tokens": 19888, "tokens_per_sec": 100.0, "eta_secs": 96.0},
+    }]}));
+    let text = draw(&mut ui, 120, 30);
+    assert!(text.contains("Context") && text.contains("21.0k of 32k · 64%"), "{text}");
+    assert!(text.contains("reading prompt 10.2k/19.9k · 100 tok/s · 1m36s left"), "{text}");
+    // Narrow layout and a second model: one labelled line each, nothing else lost.
+    let s = ui.status.as_mut().unwrap();
+    s["running"].as_array_mut().unwrap().push(serde_json::json!({"name": "org/small", "format": "mlx", "rss": 1u64 << 30, "in_flight": 0, "context": {"limit": 32768, "used": null}}));
+    let text = draw(&mut ui, 80, 40);
+    assert!(text.contains("q2_0") && text.contains("small     empty · 32k window"), "{text}");
+}
+
+#[test]
 fn tabs_and_rows_support_the_mouse() {
     let mut ui = ui();
     draw(&mut ui, 120, 36);

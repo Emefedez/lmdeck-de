@@ -113,6 +113,21 @@ pub struct RunningView {
     pub device: String,
     /// Progress of the request(s) in flight: phase, prompt tokens read/total, rate, ETA.
     pub work: Option<serde_json::Value>,
+    /// How full the context window is; see `context_view`.
+    pub context: serde_json::Value,
+}
+
+/// The context window and how much of it the requests fill: `used` is the request in flight
+/// (its prompt plus the reply so far, when the backend's log tells) or else the last one,
+/// `peak` the largest since the model loaded. One window per request: a client that sends its
+/// whole conversation each turn shows that conversation's length.
+fn context_view(limit: u64, fill: Option<crate::usage::CtxFill>, work: Option<&serde_json::Value>) -> serde_json::Value {
+    let live = work.and_then(|w| Some(w["prompt_tokens"].as_u64()? + w["generated"].as_u64().unwrap_or(0)));
+    let ago = |t: SystemTime| t.elapsed().unwrap_or_default().as_secs();
+    let last = fill.map(|f| serde_json::json!({"prompt": f.last.prompt, "completion": f.last.completion, "ago_secs": ago(f.last.at)}));
+    let used = live.or(fill.map(|f| f.last.total()));
+    let peak = fill.map(|f| f.peak.total()).into_iter().chain(live).max();
+    serde_json::json!({"limit": limit, "used": used, "live": live.is_some(), "peak": peak, "last": last})
 }
 
 /// Seconds of day from a "YYYY-MM-DD HH:MM:SS,mmm" log prefix.
@@ -126,6 +141,9 @@ fn log_secs(line: &str) -> Option<f64> {
 /// Progress of in-flight work from the backend log written since `offset`.
 fn work_progress(log: &std::path::Path, offset: u64, started: Instant) -> serde_json::Value {
     let text = sys::read_since(log, offset, 64 * 1024);
+    if let Some(v) = strata_progress(&text, started.elapsed().as_secs_f64()) {
+        return v;
+    }
     // (secs of day, done, total); mlx_lm: "Prompt processing progress: a/b",
     // llama.cpp: "... n_tokens = a, ... progress = f".
     let mut pts: Vec<(Option<f64>, u64, u64)> = Vec::new();
@@ -166,6 +184,68 @@ fn work_progress(log: &std::path::Path, offset: u64, started: Instant) -> serde_
         "eta_secs": rate.map(|r| (total - done) as f64 / r),
         "elapsed_secs": elapsed,
     })
+}
+
+/// Strata's server logs the request it serves: "[strata] reading the prompt: 2,048 of 19,888
+/// tokens, 22 s so far" (or "19,888 tokens, 10 s so far" before the first part is read), then
+/// "thinking: 81 of budget ..." / "writing a tool call: read_file: 90 of max ..." per reply token
+/// count, and "done: ..." at the end. None = no Strata request in `text`.
+fn strata_progress(text: &str, elapsed: f64) -> Option<serde_json::Value> {
+    let num = |s: &str| s.trim().replace(',', "").parse::<u64>().ok();
+    // (secs into the request, read, total) of the current prompt; tokens of the reply so far.
+    let mut pts: Vec<(Option<f64>, u64, u64)> = Vec::new();
+    let mut generated: Option<u64> = None;
+    let mut seen = false;
+    for l in text.lines() {
+        let Some(rest) = l.trim_start().strip_prefix("[strata] ") else { continue };
+        if let Some(r) = rest.strip_prefix("reading the prompt:") {
+            let (counts, secs) = r.split_once(" tokens").unwrap_or((r, ""));
+            let secs = secs.trim_start_matches(',').trim().strip_suffix("s so far").and_then(|t| t.trim().parse::<f64>().ok());
+            let (done, total) = match counts.split_once(" of ") {
+                Some((a, b)) => (num(a), num(b)),
+                None => (Some(0), num(counts)),
+            };
+            let (Some(done), Some(total)) = (done, total) else { continue };
+            if generated.is_some() || pts.last().is_some_and(|p| p.2 != total) {
+                pts.clear(); // a new request
+            }
+            generated = None;
+            seen = true;
+            pts.push((secs, done, total));
+        } else if rest.starts_with("thinking:") || rest.starts_with("writing") {
+            // "<what>: N of budget|max ...": the number before the last " of " pair.
+            if let Some(n) = rest.split(" of ").next().and_then(|h| h.rsplit(':').next()).and_then(num) {
+                generated = Some(n);
+                seen = true;
+            }
+        } else if rest.starts_with("done:") {
+            pts.clear();
+            generated = None;
+            seen = true;
+        }
+    }
+    if !seen {
+        return None;
+    }
+    let Some(&(t1, done, total)) = pts.last() else {
+        return Some(serde_json::json!({"phase": "waiting", "elapsed_secs": elapsed}));
+    };
+    if let Some(g) = generated {
+        return Some(serde_json::json!({"phase": "generating", "prompt_tokens": total, "generated": g, "elapsed_secs": elapsed}));
+    }
+    let first = pts.iter().find(|p| p.1 > 0).copied();
+    let rate = match (first, t1) {
+        (Some((Some(t0), d0, _)), Some(t1)) if t1 > t0 && done > d0 => Some((done - d0) as f64 / (t1 - t0)),
+        _ => None,
+    };
+    Some(serde_json::json!({
+        "phase": "reading prompt",
+        "prompt_done": done,
+        "prompt_tokens": total,
+        "tokens_per_sec": rate,
+        "eta_secs": rate.map(|r| total.saturating_sub(done) as f64 / r),
+        "elapsed_secs": elapsed,
+    }))
 }
 
 pub struct Manager {
@@ -242,9 +322,16 @@ impl Manager {
     }
 
     pub fn views(&self) -> Vec<RunningView> {
+        let cfg = self.cfg();
         self.running()
             .iter()
-            .map(|r| RunningView {
+            .map(|r| {
+                let work = (r.in_flight.load(Ordering::Relaxed) > 0)
+                    .then(|| *r.work_start.lock().unwrap())
+                    .flatten()
+                    .map(|(off, t)| work_progress(&r.log, off, t));
+                let context = context_view(crate::server::context_limit(&cfg, &r.model), crate::usage::USAGE.context(&r.name), work.as_ref());
+                RunningView {
                 name: r.name.clone(),
                 format: r.model.format.as_str(),
                 port: r.port,
@@ -256,14 +343,12 @@ impl Manager {
                 load_secs: r.load_secs,
                 expires_in_secs: r.expires_in().map(|d| d.as_secs()),
                 log: r.log.display().to_string(),
-                stale: r.sig != backend_sig(&self.cfg(), &r.model),
+                stale: r.sig != backend_sig(&cfg, &r.model),
                 note: r.note.clone(),
-                device: self.cfg().overrides.get(&r.name).and_then(|o| o.device.clone()).unwrap_or_else(|| "gpu".into()),
-                work: (r.in_flight.load(Ordering::Relaxed) > 0)
-                    .then(|| *r.work_start.lock().unwrap())
-                    .flatten()
-                    .map(|(off, t)| work_progress(&r.log, off, t)),
-            })
+                device: cfg.overrides.get(&r.name).and_then(|o| o.device.clone()).unwrap_or_else(|| "gpu".into()),
+                work,
+                context,
+            }})
             .collect()
     }
 
@@ -848,6 +933,7 @@ impl Manager {
         }
         let pid = child.id().unwrap_or(0);
         let t0 = Instant::now();
+        crate::usage::USAGE.reset_context(&m.name);
         let r = Arc::new(Running {
             name: m.name.clone(),
             model: m.clone(),
@@ -1251,6 +1337,42 @@ mod work_tests {
         std::fs::write(&p, "2026-10-09 00:13:13,000 - INFO - Prompt processing progress: 6000/6000\n").unwrap();
         assert_eq!(super::work_progress(&p, 0, std::time::Instant::now())["phase"], "generating");
         let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn strata_progress_from_its_log() {
+        // Lines as Strata's server writes them (strata_q2_0.log, 2026-10-24).
+        let reading = "[strata] thinking limited to 23022 of max_tokens 30695 so the answer has room\n\
+            [strata] reading the prompt: 19,888 tokens, 10 s so far\n\
+            [strata] reading the prompt: 1,024 of 19,888 tokens, 21 s so far\n\
+            [strata] reading the prompt: 3,072 of 19,888 tokens, 41 s so far\n";
+        let w = super::strata_progress(reading, 41.0).unwrap();
+        assert_eq!(w["phase"], "reading prompt");
+        assert_eq!((w["prompt_done"].as_u64(), w["prompt_tokens"].as_u64()), (Some(3072), Some(19888)));
+        assert_eq!(w["tokens_per_sec"], 102.4);
+        let writing = format!("{reading}[strata] reading the prompt: 19,883 of 19,888 tokens, 190 s so far\n\
+            [strata] thinking: 81 of budget 23022 (max 30695) tokens, 6.7 tok/s, 31 s\n\
+            [strata] writing a tool call: read_file: 90 of max 30695 tokens, 6.8 tok/s, 33 s\n");
+        let w = super::strata_progress(&writing, 200.0).unwrap();
+        assert_eq!((w["phase"].as_str(), w["prompt_tokens"].as_u64(), w["generated"].as_u64()), (Some("generating"), Some(19888), Some(90)));
+        // A finished request leaves nothing in flight to report; other backends' logs are not Strata's.
+        let done = format!("{writing}[strata] done: 155 tokens in 44 s (6.3 tok/s) (stop, cancel=False)\n");
+        assert_eq!(super::strata_progress(&done, 1.0).unwrap()["phase"], "waiting");
+        assert!(super::strata_progress("Prompt processing progress: 1/2\n", 1.0).is_none());
+    }
+
+    #[test]
+    fn context_fill_prefers_the_request_in_flight() {
+        let t = std::time::SystemTime::now();
+        let u = |p, c| crate::usage::CtxUse { prompt: p, completion: c, at: t };
+        let fill = crate::usage::CtxFill { last: u(1500, 500), peak: u(20000, 700) };
+        let v = super::context_view(32768, Some(fill), None);
+        assert_eq!((v["used"].as_u64(), v["peak"].as_u64(), v["live"].as_bool()), (Some(2000), Some(20700), Some(false)));
+        let work = serde_json::json!({"phase": "generating", "prompt_tokens": 24000, "generated": 100});
+        let v = super::context_view(32768, Some(fill), Some(&work));
+        assert_eq!((v["used"].as_u64(), v["peak"].as_u64(), v["live"].as_bool()), (Some(24100), Some(24100), Some(true)));
+        let v = super::context_view(32768, None, None);
+        assert!(v["used"].is_null() && v["last"].is_null());
     }
 }
 

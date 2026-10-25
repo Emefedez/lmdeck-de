@@ -97,7 +97,8 @@ impl Ui {
     pub(super) fn draw_home(&mut self, f: &mut Frame, area: Rect) {
         let narrow = area.width < 100;
         if narrow {
-            let tall = area.height >= 34;
+            // The backends summary goes first when the loaded models need the room.
+            let tall = area.height >= 30 + self.loaded_height(area.width).max(4);
             let [s, l, m, b, u, d] = Layout::vertical([
                 Constraint::Length(8), Constraint::Min(4), Constraint::Length(8),
                 Constraint::Length(if tall { 6 } else { 0 }), Constraint::Length(5), Constraint::Length(4),
@@ -121,6 +122,14 @@ impl Ui {
             self.draw_usage(f, u);
             self.draw_downloads(f, d);
         }
+    }
+
+    /// Rows the Loaded panel needs: borders, load progress, the table, context and work lines.
+    fn loaded_height(&self, width: u16) -> u16 {
+        let running = self.running();
+        let progress = self.status.as_ref().and_then(|s| s.get("load")).is_some_and(|l| !l.is_null());
+        let extra: usize = running.iter().map(|r| context_lines(r, running.len() > 1, width).len()).sum();
+        (2 + if progress { 2 } else { 0 } + 1 + running.len().max(1) + extra) as u16
     }
 
     fn draw_server(&self, f: &mut Frame, area: Rect) {
@@ -178,11 +187,17 @@ impl Ui {
             } else {
                 Cell::from(r["expires_in_secs"].as_u64().map(|s| format!("unloads in {}", dur(s))).unwrap_or_else(|| "stays loaded".into()))
             };
-            Row::new(vec![Cell::from(r["name"].as_str().unwrap_or("").rsplit('/').next().unwrap_or("").to_string()), Cell::from(r["format"].as_str().unwrap_or("").to_string()), Cell::from(human(r["rss"].as_u64().unwrap_or(0))), state])
+            Row::new(vec![Cell::from(short_name(r)), Cell::from(r["format"].as_str().unwrap_or("").to_string()), Cell::from(human(r["rss"].as_u64().unwrap_or(0))), state])
         }).collect();
+        // Under the table: each model's context fill and what its request is doing now.
+        let label = running.len() > 1;
+        let extra: Vec<Line> = running.iter().flat_map(|r| context_lines(r, label, table_area.width)).collect();
+        let n_rows = (running.len() as u16 + 1).min(table_area.height);
+        let [table_rect, extra_rect] = Layout::vertical([Constraint::Length(n_rows), Constraint::Min(0)]).areas(table_area);
         let t = Table::new(rows, [Constraint::Min(16), Constraint::Length(6), Constraint::Length(7), Constraint::Length(22)])
             .header(Row::new(["Model", "Fmt", "RAM", "State"]).style(Style::new().fg(Color::DarkGray)));
-        f.render_widget(t, table_area);
+        f.render_widget(t, table_rect);
+        f.render_widget(Paragraph::new(extra), extra_rect);
     }
 
     fn draw_memory(&self, f: &mut Frame, area: Rect) {
@@ -286,4 +301,68 @@ impl Ui {
             f.render_widget(bar_line(pct, 12, color, label), rows[i]);
         }
     }
+}
+
+/// A context window as people name it: 32768 -> "32k", 262144 -> "256k".
+fn window(n: u64) -> String {
+    if n >= 1024 && n % 1024 == 0 { format!("{}k", n / 1024) } else { compact(n) }
+}
+
+fn short_name(r: &Value) -> String {
+    r["name"].as_str().unwrap_or("").rsplit('/').next().unwrap_or("").to_string()
+}
+
+/// "Context ███░░░ 20.5k of 32k · 64%" for a running model, and while it works a second line:
+/// the prompt being read (tokens, rate, time left) or the reply being written.
+pub(super) fn context_lines(r: &Value, label: bool, width: u16) -> Vec<Line<'static>> {
+    let c = &r["context"];
+    let limit = c["limit"].as_u64().unwrap_or(0);
+    let head = if label { format!("{:<10.10}", short_name(r)) } else { "Context   ".to_string() };
+    let bar_w = ((width as usize).saturating_sub(10 + 26)).clamp(6, 20);
+    let mut out = Vec::new();
+    match c["used"].as_u64() {
+        Some(used) if limit > 0 => {
+            let p = used as f64 / limit as f64;
+            let color = if p >= 0.9 { Color::Red } else if p >= 0.7 { Color::Yellow } else { Color::Green };
+            let mut text = format!("{} of {} · {:.0}%", compact(used), window(limit), p * 100.0);
+            match c["peak"].as_u64() {
+                Some(peak) if peak > used => text.push_str(&format!(" · peak {}", compact(peak))),
+                _ => {}
+            }
+            if c["live"].as_bool() != Some(true) {
+                if let Some(ago) = c["last"]["ago_secs"].as_u64() {
+                    text.push_str(&format!(" · {} ago", dur(ago)));
+                }
+            }
+            let mut l = bar_line(p, bar_w, color, text);
+            l.spans.insert(0, Span::styled(head, Style::new().fg(Color::DarkGray)));
+            out.push(l);
+        }
+        _ if limit > 0 => out.push(Line::from(Span::styled(format!("{head}empty · {} window", window(limit)), Style::new().fg(Color::DarkGray)))),
+        _ => {}
+    }
+    let w = &r["work"];
+    let now = match w["phase"].as_str() {
+        Some("reading prompt") => {
+            let (done, total) = (w["prompt_done"].as_u64().unwrap_or(0), w["prompt_tokens"].as_u64().unwrap_or(0));
+            let mut t = format!("reading prompt {}/{}", compact(done), compact(total));
+            if let Some(rate) = w["tokens_per_sec"].as_f64() {
+                t.push_str(&format!(" · {rate:.0} tok/s"));
+            }
+            if let Some(eta) = w["eta_secs"].as_f64() {
+                t.push_str(&format!(" · {} left", dur(eta.round() as u64)));
+            }
+            Some(t)
+        }
+        Some("generating") => Some(match w["generated"].as_u64() {
+            Some(g) => format!("writing the reply · {} tokens", compact(g)),
+            None => "writing the reply".to_string(),
+        }),
+        Some(_) => Some(format!("waiting for the backend · {}", dur(w["elapsed_secs"].as_f64().unwrap_or(0.0) as u64))),
+        None => None,
+    };
+    if let Some(t) = now {
+        out.push(Line::from(vec![Span::raw("  "), Span::styled(t, Style::new().fg(Color::Cyan))]));
+    }
+    out
 }

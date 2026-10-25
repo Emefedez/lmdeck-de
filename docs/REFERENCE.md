@@ -33,7 +33,7 @@ The Ollama translation covers:
 
 Control endpoints used by the TUI and the bar panel:
 
-- `/lmdeck/status`, plus `/lmdeck/watch?since=<event>` (long-poll)
+- `/lmdeck/status`, plus `/lmdeck/watch?since=<event>` (long-poll). Each `running` entry has `context`: `limit` (the window lmdeck serves), `used` (the request in flight, its prompt plus the reply so far where the backend's log tells, else the last request's prompt + reply), `peak` since the model loaded, `live`, and `last` (`prompt`, `completion`, `ago_secs`). It counts one request: a client that resends its conversation every turn (all chat APIs do) shows that conversation's length. `work` shows the prompt being read (MLX, llama.cpp and Strata logs) and, on Strata, the reply's tokens so far.
 - `/lmdeck/load`, `/lmdeck/unload`, `/lmdeck/restart`
 - `/lmdeck/pull`, `/lmdeck/cancel`, `/lmdeck/downloads`
 - `/lmdeck/config` (GET lists all settings; POST `{key, value}`), `/lmdeck/reload`
