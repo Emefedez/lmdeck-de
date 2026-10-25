@@ -23,6 +23,35 @@ These are untested, so each one comes with the reason to expect it to help.
 7. **Per-layer handshake cost.** Per-part submits cost 85-115 us a layer (~5 ms a window). A GPU-side wait that
    yields the GPU (instead of spinning) would get the 6 us path without holding the GPU.
 
+8. **Keep the GPU awake through short host waits, bounded.** Splash (`DEVELOPMENT.md`, "Host steps") spins one GPU
+   thread only through a host step about as short as the GPU's wake-up, and kapitsa runs a tiny kernel on a second
+   queue while a streamed layer waits (`Gpu::keep_warm`: 26-30 -> 43 tok/s on an M5 Pro, the same tokens, ~3x GPU
+   power). Strata's old in-command-buffer spin (`STRATA_VK_SPIN=1`) froze the desktop, so this needs a cap on the spin
+   and a supervised run with the desktop in use; it targets the 85-115 us per-layer handshake of item 7.
+9. **Re-read the conversation while idle (history prefill).** After a reply, kapitsa renders the conversation as the
+   client will send it back and reads it before the next turn. Strata's turn checkpoint sits at the previous
+   prompt's last `<|im_start|>`, so a follow-up re-reads its own reply (2026-10-24 log: `2983 = 1895 reused + 1088
+   read`, the 1088 including a 307-token reply). Pays in human chat; in an agent's tool loop the next request
+   arrives before there is idle time.
+10. **Prefill groups of chunks layer by layer.** Splash runs up to four 2048-row chunks per command layer by layer, so
+   each layer's streamed experts are read once for 8K tokens instead of once per chunk, and slices a long command into
+   ~500 ms passes so decode steps (and here, the desktop) get the GPU between them. The chunk's buffers stay 2048
+   rows; only the residual rows of the group are kept. The biggest remaining prompt-path win for long editor
+   prompts on 32 GB, where 4096-row chunks cost the decode cache.
+11. **Session files on the SSD automatically**, not only around unloads: Splash and kapitsa write a conversation's
+   restore point ~10 s after a turn when idle (2048+ tokens deep), CRC-checked, and take them back after a restart.
+   lmdeck now saves/restores around its own unloads (`strata.sessions`); per-turn writes would also cover a crash
+   and several conversations.
+12. **Already done in Strata, for the record**: a prompt's streamed experts enter the arena's LRU tail, so decode-hot
+   experts survive a long prompt (`stream.cpp`, the scan-victim rule kapitsa added in its store); and balanced prompt
+   chunks (2026-10-25, `STRATA_METAL_PROMPT_BAL`, after kapitsa's `NI_BAL`).
+
+Splash (incoai/splash, Apache-2.0) serves the same Flash-Next Q2_0 GGUF and reports, on an M5 Pro 64 GB against
+Strata on that Mac: decode 95 tok/s (1.3x), 32K prefill 1,312 tok/s (1.3x), and a cached 32K replay's first token
+in 171 ms (212x). The last number is the prefix cache, not the kernels: it is what items 9-11 and lmdeck's
+`strata.prefix_reuse` / `strata.sessions` go after. LM Studio ships Splash as a downloadable runtime ("Splash
+(Metal)", experimental backends); its integration is LM Studio's closed code, Splash's own server is in the repo.
+
 ## MLX
 
 1. **A split-K bf16 decode attention kernel upstream.** The composed route lmdeck uses is 2-3.6x faster than the
@@ -40,3 +69,15 @@ These are untested, so each one comes with the reason to expect it to help.
 2. **GGUF benchmarks.** llama.cpp on Honeykrisp has never been measured here against the same model in MLX.
 3. **Grader scores from model cards.** Some Hugging Face cards carry evaluation results (`model-index`). Reading
    them when a model is downloaded, not on every grade, could replace the size estimate where they exist.
+4. **Engine status in the Home screen.** Splash's `/status` reports the streamed experts' hit rate, bytes read and
+   host-step round trips per use (prefill / decode), and kapitsa logs how many of a request's experts were in memory.
+   Strata's `/v1/status` and engine log carry similar numbers; showing the hit rate beside the context meter would
+   tell at a glance why a turn was slow.
+5. **Release the weights, keep the caches.** Splash's idle release (`--idle-release`, `POST /v1/memory/release`)
+   frees the weights' memory but keeps the prefix cache, and restores the weights on the next request. lmdeck's
+   keep_alive kills the backend; for Strata a release that keeps the conversation cache would make the 15-17 s
+   reload the only cost of an idle unload.
+6. **A llama.cpp baseline for Flash-Next.** kapitsa measured llama.cpp streaming the Q2_0 GGUF by mmap at ~39 tok/s
+   on an M5 Pro 48 GB (kapitsa 40). On Asahi llama.cpp's Vulkan backend would need the experts on the CPU side
+   (`-ot exps=CPU`); one measured run would say whether Strata's port is ahead. Not run (needs a go-ahead: memory).
+
