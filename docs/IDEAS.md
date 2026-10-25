@@ -33,11 +33,13 @@ These are untested, so each one comes with the reason to expect it to help.
    prompt's last `<|im_start|>`, so a follow-up re-reads its own reply (2026-10-24 log: `2983 = 1895 reused + 1088
    read`, the 1088 including a 307-token reply). Pays in human chat; in an agent's tool loop the next request
    arrives before there is idle time.
-10. **Prefill groups of chunks layer by layer.** Splash runs up to four 2048-row chunks per command layer by layer, so
-   each layer's streamed experts are read once for 8K tokens instead of once per chunk, and slices a long command into
-   ~500 ms passes so decode steps (and here, the desktop) get the GPU between them. The chunk's buffers stay 2048
-   rows; only the residual rows of the group are kept. The biggest remaining prompt-path win for long editor
-   prompts on 32 GB, where 4096-row chunks cost the decode cache.
+10. **One set of expert GEMMs for a group of prompt chunks.** Grouping is in (2026-10-25, strata-asahi
+   `STRATA_METAL_PROMPT_GROUP`, default 4): a group's chunks run layer by layer and a layer's experts are loaded once,
+   storage reads 130 -> 39 GB on a 7.9k prompt with the same answer, but the prompt only 1.5% faster (60.7 vs 61.5 s):
+   the reads were hidden behind the GPU. The fixed ~6-7 s a chunk is GPU work: each chunk's own expert GEMMs decode
+   every routed expert's weights for ~40 rows an expert. One GEMM over the group's rows (as Splash runs it) amortizes
+   that over ~160 rows; XS/HS/YE sized for the group cost ~0.5 GB a chunk. Estimated up to a third off a long prompt;
+   unmeasured.
 11. **Session files on the SSD automatically**, not only around unloads: Splash and kapitsa write a conversation's
    restore point ~10 s after a turn when idle (2048+ tokens deep), CRC-checked, and take them back after a restart.
    lmdeck now saves/restores around its own unloads (`strata.sessions`); per-turn writes would also cover a crash
