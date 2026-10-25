@@ -1,6 +1,6 @@
 # XTreme mode (plan)
 
-Status: planned 2026-10-26, nothing implemented yet. This page is the design and the reasons for it; the numbers
+Status: planned 2026-10-26; the one-time setup is done, the mode itself is not implemented yet. This page is the design and the reasons for it; the numbers
 are measured on this machine (M1 Max, 32 GB, Asahi) unless marked as an estimate.
 
 XTreme mode turns the laptop into a headless model server for a long unattended run (overnight bug fixing, batch
@@ -93,6 +93,85 @@ commits, its check's result and the last notes, plus the run's numbers: arena, d
 
 If anything goes wrong in the night, Ctrl+Alt+F2 gives a text login with the run still going; `lmdeck xtreme stop`
 from there (or a reboot) restores the desktop.
+
+## The wall: one panel, three places
+
+XTreme has one panel, drawn from one source (`GET /lmdeck/xtreme`, the daemon's run state) in three places:
+
+| Where | When | What it is |
+|---|---|---|
+| the **wall**, on the text console | during a run (the desktop is off) | the XTreme tab of lmdeck's TUI, full screen, ASCII-safe |
+| the **XTreme tab** (7) of the lmdeck TUI | any time, any terminal, also over ssh | the same panel with the rest of the TUI around it: plan tasks, start, read the last report |
+| a **card in the bar panel** (`LmdeckSection.qml`) | on the desktop, before and after a run | the last run's summary, and *Start XTreme...*, which opens the TUI's tab (no second implementation) |
+
+When the desktop comes back, a notification gives the night's result and opens the report. So the GUI only starts
+and summarizes; seeing and steering the work live is the TUI, the same code on the console and in a desktop
+terminal.
+
+```
+ __  _______ ____  _____ __  __ _____
+ \ \/ /_   _|  _ \| ____|  \/  | ____|   strata/q2_0          02:14 of 08:00
+  >  <  | | | |_) |  _| | |\/| |  _|     arena 14.8 GB        12.1 tok/s  prompt 128 tok/s
+ /_/\_\ |_| |_| \_\_____|_|  |_|_____|   desktop off          RAM 26.1 / 30.9 GB  SSD 3.1 TB read
+ ----------------------------------------------------------------------------------------------
+ TASKS                        3 of 7 done   | NOW  #4 panel: scroll on hover   session 2, turn 9/40
+ [x] 1 lmdeck: grader NaN       3 commits   | context  [#######...]  21.3k / 32k
+ [x] 2 strata: tail chunk       1 commit    | reading the prompt 4.1k / 6.0k, 15 s left
+ [x] 3 t1code: sidebar width    2 commits   | last tool  cargo test -> 93 passed
+ [>] 4 panel: scroll on hover   ...         |
+ [ ] 5 r2: find the CRC in fw.bin           |
+ ----------------------------------------------------------------------------------------------
+ PROGRESS #4 (last lines)                   | LOG
+ - hover handler is in LmdeckSection.qml    | 02:13 read_file  LmdeckSection.qml
+ - Flickable jumps on resize, try ...       | 02:13 bash       qmllint LmdeckSection.qml
+ ----------------------------------------------------------------------------------------------
+ t tasks  p progress  d diff  l log  e edit  space pause  n skip  s screen off  q leave  X end
+```
+
+### Keys and commands
+
+One key on the wall, one word on the command line, the same action:
+
+| Key | `lmdeck xtreme ...` | Does |
+|---|---|---|
+| `t` | `tasks` | open `tasks.md` in the editor (the run reads it again between sessions: add, reorder, reword freely) |
+| `p` | `progress [N]` | open the current task's `PROGRESS.md` (the next session starts from what is there) |
+| `d` | `diff [N]` | the task branch's diff against its base, in the pager |
+| `l` | `log [N]` | the agent's transcript, followed live |
+| `e` | `edit [N]` | the task's repository in the editor; pauses the task first so the agent and you never edit at once |
+| space | `pause` / `resume` | finish the current turn, then hold (the model stays loaded) |
+| `n` | `skip` | end this task's session and go to the next |
+| `s` | `screen off` | the panel off now; any key on the wall turns it back on |
+| `q` | - | leave the wall; the run goes on (`lmdeck xtreme` brings it back) |
+| `X` | `stop` | end the run and bring the desktop back (asks first) |
+| - | `start`, `status`, `add "task"`, `report` | start a run, one line of state, append a task, the last report |
+
+The editor is lmdeck's (`ui.editor`, then `$VISUAL`, `$EDITOR`, nvim), the pager `$PAGER` or `less`; both run in the
+wall's terminal and give it back when they exit, as the TUI's system-prompt editing does today.
+
+### Light on resources
+
+- The wall is the lmdeck binary (7.7 MB) in the TUI mode it already has: no browser, no compositor, no GPU (the
+  kernel console draws text on the CPU into the framebuffer). Expected around 10-20 MB of memory (to measure).
+- It redraws when something changes: it waits on the daemon's existing long-poll (`/lmdeck/watch`) plus a clock
+  tick every 10 s, instead of the TUI's 1 s poll. With the screen off it draws nothing.
+- The run itself lives in the daemon (a user service, so it survives the desktop going), as a state machine with its
+  state in `~/.local/state/lmdeck/xtreme/state.json`: a daemon restart resumes at the next session.
+- One agent process at a time: Claude Code measured 343 MB here; that is the largest cost after the model, and the
+  reason sessions run one after another, not side by side.
+
+### On the console
+
+- After SDDM stops, the wall needs a terminal of its own on the display. Either the root helper gains a fifth step
+  that opens it on a free console (`openvt` running `lmdeck xtreme` as the user), or the wall is what you get by
+  logging in on a console (Ctrl+Alt+F2) and typing `lmdeck xtreme`. The first is automatic; the second widens nothing.
+- The console has no font set (`/etc/vconsole.conf`), so the kernel's default draws a 3024x1964 panel: at 16x32 that
+  is about 189x61 characters. The wall is laid out for 80x24 and up and uses a bigger font where the
+  `terminus-font` package is installed (`setfont ter-132n`).
+- `TERM=linux` means 16 colours and a limited set of glyphs: the wall picks ASCII borders and bars there, and the
+  Unicode ones in a desktop terminal or over ssh.
+- Waking the screen: the kernel console may not undo a blank done through `fb0/blank` on a keypress, so the wall
+  turns the screen back on itself (`screen-on`) on any key while it is off. To check on the first run.
 
 ## Working on the machine in TUI mode
 
