@@ -127,6 +127,16 @@ A dead-man switch is armed at the start: a separate user timer that brings the s
 minutes after the end even if the run or lmdeck itself has died. You can also go back early with `X` on the wall,
 `lmdeck xtreme stop` (over ssh or on Ctrl+Alt+F2), or a reboot.
 
+**Or no end at all.** Without `--hours` or `--until` a run is open-ended. It works through the tasks, then waits
+with the model unloaded until a task is added (`lmdeck xtreme add`), and stops only when told. `--away` is that
+plus what days without anyone at the machine need:
+- **Remote access:** Tailscale runs only while away, so the machine is reachable from another laptop (ssh into the
+  wall, the shell and nvim), and lmdeck's API is shared with the tailnet only through `tailscale serve`.
+- **Power:** it refuses to start on battery, and the charge limit goes to 80% while away.
+- **Recovery:** the hardware watchdog reboots a hung machine, and after a reboot away mode resumes by itself.
+
+Tailscale isn't installed yet. The four setup commands are in [docs/XTREME.md](docs/XTREME.md#away-mode-the-machine-on-its-own-for-days-reached-over-tailscale).
+
 **The wall.** One panel in three places: full screen on the text console during a run, as tab 7 of the TUI in any
 terminal (also over ssh), and as a summary card with *Start XTreme...* in the bar panel.
 

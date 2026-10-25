@@ -108,6 +108,51 @@ login, so the desktop comes back on time whatever happened in the night.
 **Earlier, by hand:** `X` on the wall (it asks first), `lmdeck xtreme stop` over ssh or on another console
 (Ctrl+Alt+F2), or a reboot (SDDM's autologin starts the desktop as on any boot).
 
+### Runs without an end
+
+`--hours` and `--until` are optional. Without them a run has no end: no countdown, no wind-down, no return timer. It
+works through the tasks, then waits with the model unloaded (its memory free, nothing running) until a task is added
+(`lmdeck xtreme add "..."`, over ssh too), and stops only when told (`X`, `lmdeck xtreme stop`). Liveness replaces the
+timer: systemd restarts lmdeck if it dies, the run reloads the engine if it dies, and the hardware watchdog (below)
+reboots a hung machine.
+
+### Away mode: the machine on its own for days, reached over Tailscale
+
+`lmdeck xtreme start --away` is the open-ended run plus what a week without anyone at the machine needs. Use case: the
+MacBook stays home, plugged in, and is used from another laptop (the ThinkPad) over Tailscale, both as a box to ssh
+into and as a model server.
+
+- **Tailscale only while away.** `tailscaled` stays disabled normally; away mode starts it and a normal stop stops it
+  again (helper steps `remote-on` / `remote-off`). From the other laptop, `ssh m1-max` (the tailnet name) gives the
+  wall (`lmdeck xtreme`, the same panel over ssh), the shell and nvim. `tailscale serve` exposes lmdeck's API
+  (`127.0.0.1:11434`) to the tailnet only, so agents on the ThinkPad can use the MacBook's models; lmdeck itself keeps
+  listening on localhost. ufw lets in only `tailscale0` (`ufw allow in on tailscale0`), nothing from the LAN.
+- **Power.** Away mode refuses to start on battery. It sets the charge limit to 80%
+  (`/sys/class/power_supply/macsmc-battery/charge_control_end_threshold`, now 100) for the week and restores it on
+  stop (helper step `battery-limit 80|100`).
+- **A hung machine reboots.** `/dev/watchdog0` exists, but systemd's runtime watchdog is off (`RuntimeWatchdogSec=0`),
+  so a kernel or GPU hang would stay hung. Away mode needs it on (a drop-in in `/etc/systemd/system.conf.d/`,
+  e.g. 60 s).
+- **After a reboot it comes back by itself.** A marker (`~/.local/state/lmdeck/xtreme/away`) survives the reboot; when
+  lmdeck starts (linger, at boot), it sees the marker and enters away mode again: tailscaled on, SDDM stopped once
+  autologin has started it, the model reloaded, the tasks resumed. A power cut needs the Mac to power on by itself
+  when power returns: an Apple setting (`pmset autorestart` in macOS), not verified under Asahi.
+- **The lid** can stay closed (the lid switch is inhibited); the machine then cools through the keyboard deck, so a
+  hard surface, not a bag or a sofa.
+- **Nothing updates while away**: no system updates, no lmdeck or Strata updates.
+
+**One-time setup** (needs the password, so it is yours to type):
+
+```
+sudo pacman -S tailscale
+sudo systemctl start tailscaled && sudo tailscale up     # prints a login URL: log in once
+sudo systemctl disable --now tailscaled                  # off by default; away mode turns it on
+sudo ufw allow in on tailscale0
+```
+
+The watchdog drop-in and the helper's new steps (`remote-on`, `remote-off`, `battery-limit`, plus `wall`) come with the
+build.
+
 ### Stop
 
 Every way back above ends the same: agents stopped, Strata unloaded, screen on, SDDM started, sleep lock gone. `~/.local/state/lmdeck/xtreme/report.md` lists each task with its
@@ -168,7 +213,7 @@ One key on the wall, one word on the command line, the same action:
 | `!` | - | a shell (niced), `exit` returns |
 | `q` | - | leave the wall; the run goes on (`lmdeck xtreme` brings it back) |
 | `X` | `stop` | end the run and bring the desktop back (asks first) |
-| - | `start`, `status`, `watch`, `add "task"`, `report` | start a run, one line of state, the wall as plain text, append a task, the last report |
+| - | `start [--hours N \| --until HH:MM \| --away]`, `status`, `watch`, `add "task"`, `report` | start a run (no end unless given; `--away` = remote, unattended), one line of state, the wall as plain text, append a task, the last report |
 
 The editor is lmdeck's (`ui.editor`, then `$VISUAL`, `$EDITOR`, nvim), the pager `$PAGER` or `less`; both run in the
 wall's terminal and give it back when they exit, as the TUI's system-prompt editing does today.
