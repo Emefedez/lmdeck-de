@@ -188,6 +188,11 @@ pub struct StrataCfg {
     /// matrix units. Measured on a 10,609-token prompt (2026-10-22): 14.7 / 109.0 / 123.8 /
     /// 134.7 tok/s; the chunk buffers take 0 / 1.60 / 2.55 / 4.46 GB of the arena.
     pub prompt_path: String,
+    /// How the prompt path's chunks share a layer's experts: "group" = 4 chunks a group run layer by
+    /// layer, each layer's experts read from the SSD once per group (130 -> 39 GB on a 7.9k prompt,
+    /// the same answer, 2026-10-25); "merged" = also one set of expert passes for a group of 2
+    /// (Splash-style, ~0.45 GB more while a prompt runs; not yet run); "off" = one chunk at a time.
+    pub prompt_group: String,
     /// "system" = mark the system message (with the tool list the template renders into it) as a
     /// shared prefix (`strata_prefix`): the engine pins its checkpoint, so a new conversation or a
     /// Fix request with the same system prompt and tools reads only what follows. "off" = never.
@@ -210,6 +215,7 @@ impl Default for StrataCfg {
             vk_icd: String::new(),
             system_prompt_mode: "prepend".into(),
             prompt_path: "off".into(),
+            prompt_group: "group".into(),
             prefix_reuse: "system".into(),
             sessions: "keep".into(),
             extra_args: vec![],
@@ -843,6 +849,7 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "Strata", key: "strata.vk_icd", kind: Kind::Text, help: "Vulkan driver for the engine (ICD json; empty = honeykrisp-strata v3)" },
     Setting { section: "Strata", key: "strata.extra_args", kind: Kind::Text, help: "Extra Strata server args" },
     Setting { section: "Strata", key: "strata.env", kind: Kind::Text, help: "Env for the Strata server and engine, K=V,K=V" },
+    Setting { section: "Strata", key: "strata.prompt_group", kind: Kind::Choice(&["group", "merged", "off"]), help: "Prompt chunks: group (4 a group, each layer's experts read once: 3x fewer SSD reads) / merged (one expert pass per group of 2, +0.45 GB, untested) / off" },
     Setting { section: "Strata", key: "strata.prefix_reuse", kind: Kind::Choice(&["system", "off"]), help: "system: pin the system prompt + tools as a shared prefix, so new chats and Fix requests read only what follows / off" },
     Setting { section: "Strata", key: "strata.sessions", kind: Kind::Choice(&["keep", "off"]), help: "keep: save the conversation to the SSD before an unload and restore it after the next load / off" },
     Setting { section: "Strata", key: "strata.prompt_path", kind: Kind::PromptChunk, help: "Strata prompt path: off (decode windows) / 1024 / 2048 / 4096 (GPU chunked path; 2048 best on 32 GB)" },
@@ -959,6 +966,7 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "strata.env" => kv_join(&c.strata.env),
         "strata.prompt_path" => c.strata.prompt_path.clone(),
         "strata.prefix_reuse" => c.strata.prefix_reuse.clone(),
+        "strata.prompt_group" => c.strata.prompt_group.clone(),
         "strata.sessions" => c.strata.sessions.clone(),
         "strata.system_prompt" => crate::sysprompt::to_line(&crate::sysprompt::backend_text(crate::models::Format::Strata)),
         "strata.system_prompt_mode" => c.strata.system_prompt_mode.clone(),
@@ -1096,6 +1104,10 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
             "off" | "1024" | "2048" | "4096" => c.strata.prompt_path = v.into(),
             _ => return Err("use off, 1024, 2048 or 4096".into()),
         },
+        "strata.prompt_group" => match v {
+            "group" | "merged" | "off" => c.strata.prompt_group = v.into(),
+            _ => return Err("group, merged or off".into()),
+        },
         "strata.prefix_reuse" => match v {
             "system" | "off" => c.strata.prefix_reuse = v.into(),
             _ => return Err("system or off".into()),
@@ -1141,7 +1153,7 @@ pub fn needs_reload(key: &str) -> bool {
     }
     key.starts_with("mlx.")
         || (key.starts_with("llama.") && !matches!(key, "llama.git_ref" | "llama.repo"))
-        || matches!(key, "strata.engine" | "strata.vk_icd" | "strata.extra_args" | "strata.env" | "strata.prompt_path" | "strata.sessions")
+        || matches!(key, "strata.engine" | "strata.vk_icd" | "strata.extra_args" | "strata.env" | "strata.prompt_path" | "strata.prompt_group" | "strata.sessions")
         || key == "server.uclamp_boost"
 }
 

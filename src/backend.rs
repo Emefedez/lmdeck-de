@@ -856,6 +856,7 @@ impl Manager {
                     }
                     if let Some(env_obj) = run["env"].as_object_mut() {
                         apply_strata_prompt_env(env_obj, &cfg.strata.prompt_path);
+                        apply_strata_group_env(env_obj, &cfg.strata.prompt_group);
                         modified = true;
                         sys::log(&format!("{}: strata prompt_path {} (lmdeck override)", m.name, cfg.strata.prompt_path));
                     }
@@ -893,7 +894,10 @@ impl Manager {
                     env.push(("VK_DRIVER_FILES".into(), icd.display().to_string()));
                 }
                 let path_val = cfg.strata.prompt_path.trim();
-                env.retain(|(k, _)| k != "STRATA_METAL_PROMPT_GEMM" && k != "STRATA_METAL_PROMPT_CHUNK");
+                env.retain(|(k, _)| !matches!(k.as_str(), "STRATA_METAL_PROMPT_GEMM" | "STRATA_METAL_PROMPT_CHUNK" | "STRATA_METAL_PROMPT_GROUP" | "STRATA_METAL_PROMPT_MERGE"));
+                for (k, v) in strata_group_env(&cfg.strata.prompt_group) {
+                    env.push((k.into(), v.into()));
+                }
                 if path_val.is_empty() || path_val == "off" {
                     env.push(("STRATA_METAL_PROMPT_GEMM".into(), "0".into()));
                 } else {
@@ -1567,9 +1571,41 @@ pub(crate) fn apply_strata_prompt_env(env: &mut serde_json::Map<String, serde_js
     }
 }
 
+/// strata.prompt_group as the engine's variables: group = its default (4 chunks a group), merged =
+/// STRATA_METAL_PROMPT_MERGE=1 (a group of 2), off = STRATA_METAL_PROMPT_GROUP=1.
+fn strata_group_env(group: &str) -> Vec<(&'static str, &'static str)> {
+    match group.trim() {
+        "merged" => vec![("STRATA_METAL_PROMPT_MERGE", "1")],
+        "off" => vec![("STRATA_METAL_PROMPT_GROUP", "1")],
+        _ => vec![],
+    }
+}
+
+pub(crate) fn apply_strata_group_env(env: &mut serde_json::Map<String, serde_json::Value>, group: &str) {
+    env.remove("STRATA_METAL_PROMPT_GROUP");
+    env.remove("STRATA_METAL_PROMPT_MERGE");
+    for (k, v) in strata_group_env(group) {
+        env.insert(k.into(), serde_json::json!(v));
+    }
+}
+
 #[cfg(test)]
 mod strata_stage_tests {
-    use super::{apply_strata_prompt_env, strata_stage};
+    use super::{apply_strata_group_env, apply_strata_prompt_env, strata_stage};
+
+    #[test]
+    fn strata_group_env_follows_the_setting() {
+        let mut env = serde_json::Map::new();
+        env.insert("STRATA_METAL_PROMPT_GROUP".into(), serde_json::json!("1"));
+        apply_strata_group_env(&mut env, "merged");
+        assert_eq!(env.get("STRATA_METAL_PROMPT_MERGE"), Some(&serde_json::json!("1")));
+        assert!(env.get("STRATA_METAL_PROMPT_GROUP").is_none());
+        apply_strata_group_env(&mut env, "off");
+        assert_eq!(env.get("STRATA_METAL_PROMPT_GROUP"), Some(&serde_json::json!("1")));
+        assert!(env.get("STRATA_METAL_PROMPT_MERGE").is_none());
+        apply_strata_group_env(&mut env, "group");
+        assert!(env.is_empty());
+    }
 
     #[test]
     fn strata_prompt_env_transformation() {

@@ -51,6 +51,7 @@ pub(super) enum Field {
     /// Which llama.cpp build runs this GGUF: auto / stock / prism.
     Engine,
     PromptPath,
+    PromptGroup,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +81,13 @@ fn valid_duration(t: &str) -> bool {
     num.parse::<f64>().is_ok() && matches!(unit, "ms" | "s" | "m" | "h")
 }
 
+/// strata.prompt_group's values in their order on the slider.
+pub(super) fn prompt_group_step(cur: &str, dir: i32) -> &'static str {
+    const ORDER: [&str; 3] = ["off", "group", "merged"];
+    let i = ORDER.iter().position(|v| *v == cur).unwrap_or(1) as i32;
+    ORDER[(i + dir).rem_euclid(ORDER.len() as i32) as usize]
+}
+
 fn model_fields(format: Format) -> Vec<Field> {
     let mut f = vec![Field::Context, Field::Device, Field::KeepAlive, Field::Prompt, Field::PromptMode];
     if format == Format::Gguf {
@@ -89,6 +97,7 @@ fn model_fields(format: Format) -> Vec<Field> {
     if format == Format::Strata {
         f.retain(|f| !matches!(f, Field::Device));
         f.push(Field::PromptPath);
+        f.push(Field::PromptGroup);
     }
     f
 }
@@ -279,6 +288,10 @@ impl Ui {
             KeyCode::Down | KeyCode::Char('j') => keep(self, (sel + 1).min(fields.len() - 1)),
             KeyCode::Up | KeyCode::Char('k') => keep(self, sel.saturating_sub(1)),
             KeyCode::Left | KeyCode::Right => {
+                if field == Field::PromptGroup {
+                    let next = prompt_group_step(&crate::config::get_setting(&self.cfg, "strata.prompt_group"), if k.code == KeyCode::Right { 1 } else { -1 });
+                    self.edit_config("strata.prompt_group", |c| crate::config::set_setting(c, "strata.prompt_group", next));
+                }
                 if field == Field::PromptPath {
                     let cur = crate::config::get_setting(&self.cfg, "strata.prompt_path");
                     let dir = if k.code == KeyCode::Right { 1 } else { -1 };
@@ -299,6 +312,9 @@ impl Ui {
                     Field::PromptPath => {
                         self.edit_config("strata.prompt_path", |c| crate::config::set_setting(c, "strata.prompt_path", "off"));
                     }
+                    Field::PromptGroup => {
+                        self.edit_config("strata.prompt_group", |c| crate::config::set_setting(c, "strata.prompt_group", "group"));
+                    }
                     f => {
                         self.edit_override(&name, |o| {
                             match f {
@@ -308,7 +324,7 @@ impl Ui {
                                 Field::PromptMode => o.system_prompt_mode = None,
                                 Field::GpuLayers => o.gpu_layers = None,
                                 Field::Engine => o.engine = None,
-                                Field::Prompt | Field::PromptPath => {}
+                                Field::Prompt | Field::PromptPath | Field::PromptGroup => {}
                             }
                             Ok(())
                         });
@@ -317,6 +333,11 @@ impl Ui {
                 keep(self, sel);
             }
             KeyCode::Enter | KeyCode::Char(' ') => match field {
+                Field::PromptGroup => {
+                    let next = prompt_group_step(&crate::config::get_setting(&self.cfg, "strata.prompt_group"), 1);
+                    self.edit_config("strata.prompt_group", |c| crate::config::set_setting(c, "strata.prompt_group", next));
+                    keep(self, sel);
+                }
                 Field::PromptPath => {
                     let cur = crate::config::get_setting(&self.cfg, "strata.prompt_path");
                     let next = crate::config::prompt_chunk_cycle(&cur);
@@ -649,6 +670,11 @@ impl Ui {
                     }
                 },
                 Field::PromptPath => format!("◂ {} ▸", crate::config::get_setting(&self.cfg, "strata.prompt_path")),
+                Field::PromptGroup => format!("◂ {} ▸", match crate::config::get_setting(&self.cfg, "strata.prompt_group").as_str() {
+                    "merged" => "merged (+0.45 GB, untested)",
+                    "off" => "off (one chunk at a time)",
+                    _ => "group (4 chunks, experts read once)",
+                }),
             }
         };
         let label = |fl: Field| match fl {
@@ -660,6 +686,7 @@ impl Ui {
             Field::GpuLayers => "GPU layers",
             Field::Engine => "Engine",
             Field::PromptPath => "Prompt path",
+            Field::PromptGroup => "Prompt groups",
         };
         let mut l: Vec<Line> = fields.iter().enumerate().map(|(i, fl)| {
             let st = if i == sel { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
@@ -724,6 +751,7 @@ impl Ui {
             Field::GpuLayers => "GGUF layers on the GPU; the rest run on the CPU. auto = as many as fit.",
             Field::Engine => "auto uses the Prism build only for GGUFs its header needs (PQ2_0/PTQ1_0); stock/prism force one.",
             Field::PromptPath => "←/→ or Enter: off (decode windows) / 1024 / 2048 / 4096 (GPU chunked path).",
+            Field::PromptGroup => "group: 4 chunks share each layer's SSD reads (3x fewer, same answer) · merged: Splash-style one expert pass per 2 chunks, ~0.45 GB more while a prompt runs, untested · off.",
         };
         l.push(dim(help));
         l.push(dim("↑↓ select · Enter change · x back to the default · Esc close. Applies on the next load."));

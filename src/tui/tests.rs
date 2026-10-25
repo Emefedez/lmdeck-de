@@ -282,6 +282,30 @@ fn ternary_gguf_shows_the_prism_marker_and_engine_field() {
 }
 
 #[test]
+fn strata_settings_popup_offers_prompt_groups() {
+    let mut ui = ui();
+    ui.tab = Tab::Models;
+    ui.models = vec![LocalModel {
+        name: "strata/q2_0".into(), format: Format::Strata, tools: true, size: 13 << 30, repo: None, path: Default::default(),
+        files: vec![], quant: "Q2_0".into(), qmode: None, arch: "qwen4".into(), unsupported: None, needs_prism: false,
+        params: "125B".into(), ctx_len: Some(32768), mmproj: None, modified: std::time::SystemTime::UNIX_EPOCH, thinking: false,
+        vision: false,
+    }];
+    ui.models_sel.select(Some(0));
+    // Strata fields: Context, KeepAlive, Prompt, PromptMode, PromptPath, PromptGroup (Device is dropped).
+    ui.popup = Some(Popup::ModelSettings("strata/q2_0".into(), 5));
+    let text = draw(&mut ui, 160, 44);
+    assert!(text.contains("Prompt groups") && text.contains("group (4 chunks, experts read once)"), "{text}");
+    assert!(text.contains("untested"), "the help line must say merged is untested: {text}");
+    ui.cfg.strata.prompt_group = "merged".into();
+    let text = draw(&mut ui, 160, 44);
+    assert!(text.contains("merged (+0.45 GB, untested)"), "{text}");
+    assert_eq!(super::popup::prompt_group_step("group", 1), "merged");
+    assert_eq!(super::popup::prompt_group_step("group", -1), "off");
+    assert_eq!(super::popup::prompt_group_step("merged", 1), "off");
+}
+
+#[test]
 fn opened_repo_obeys_format_and_budget_filters() {
     let mut ui = ui();
     ui.tab = Tab::Discover;
