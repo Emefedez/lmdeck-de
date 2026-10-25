@@ -695,7 +695,7 @@ async fn ollama_generate(a: App, b: Value, messages: Vec<Value>, is_chat: bool) 
         Err(e) => return not_found_or_500(e),
     };
     let mut body = openai_body(&b, messages, guard.0.backend_model_id());
-    crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut body);
+    prepare_body(&a.mgr.cfg(), &guard.0.model, &mut body);
     if let Err((est, limit)) = context_check(&a.mgr.cfg(), &guard.0.model, &mut body) {
         sys::log(&format!("{}: refused a ~{est}-token prompt (window {limit})", guard.0.name));
         return err(StatusCode::BAD_REQUEST, format!("prompt is too long: ~{est} tokens > {limit} maximum. {}", too_long_hint(&guard.0.name)));
@@ -888,7 +888,7 @@ async fn anthropic_messages(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         sys_t + msg_t + sent_tools,
     ));
     let mut body = crate::anthropic::to_openai(&b, guard.0.backend_model_id(), mode, &rules);
-    crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut body);
+    prepare_body(&a.mgr.cfg(), &guard.0.model, &mut body);
     if let Err((est, limit)) = context_check(&a.mgr.cfg(), &guard.0.model, &mut body) {
         sys::log(&format!("/v1/messages {}: refused a ~{est}-token prompt (window {limit})", guard.0.name));
         // "prompt is too long" is what Claude Code recognises to offer /compact.
@@ -1016,6 +1016,31 @@ pub fn context_limit(cfg: &Config, m: &LocalModel) -> u64 {
     }
 }
 
+/// What every chat path does to a body before the backend gets it: the system prompt files,
+/// then backend-specific request hints.
+fn prepare_body(cfg: &Config, m: &LocalModel, body: &mut Value) {
+    crate::sysprompt::apply_for(cfg, m, body);
+    strata_prefix(cfg, m, body);
+}
+
+/// `strata.prefix_reuse = system`: mark the system message as a shared prefix. Strata's server
+/// renders it (with the tools the template puts beside it), pins the checkpoint at its end and
+/// reads only the rest, so every new conversation and Fix request with that system prompt and
+/// tool list starts warm. Below ~512 tokens a prefix is quicker to read than to keep.
+fn strata_prefix(cfg: &Config, m: &LocalModel, body: &mut Value) {
+    if m.format != Format::Strata || cfg.strata.prefix_reuse != "system" || cfg.strata.engine == "mock" || body.get("strata_prefix").is_some() {
+        return;
+    }
+    let Some(msgs) = body["messages"].as_array() else { return };
+    if msgs.len() < 2 || msgs[0]["role"] != "system" {
+        return;
+    }
+    let head = json!({"messages": [msgs[0].clone()], "tools": body.get("tools").cloned().unwrap_or(Value::Null)});
+    if estimate_tokens(&head) >= 512 {
+        body["strata_prefix"] = json!({"messages": 1});
+    }
+}
+
 /// Rough token count of a chat body: ~3.8 characters per token over the JSON of the messages
 /// and tools, an inline image as ~1k tokens instead of its base64 text.
 fn estimate_tokens(body: &Value) -> u64 {
@@ -1085,7 +1110,7 @@ async fn openai_responses(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         Ok(c) => c,
         Err(e) => return oai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
     };
-    crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut conv.body);
+    prepare_body(&a.mgr.cfg(), &guard.0.model, &mut conv.body);
     let _ = std::fs::write(crate::config::log_dir().join("last-responses.json"), serde_json::to_vec_pretty(&b).unwrap_or_default());
     if let Err((est, limit)) = context_check(&a.mgr.cfg(), &guard.0.model, &mut conv.body) {
         sys::log(&format!("/v1/responses {}: refused a ~{est}-token prompt (window {limit}, {} tools)", guard.0.name, conv.body["tools"].as_array().map(|t| t.len()).unwrap_or(0)));
@@ -1542,7 +1567,7 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
                     t.extend(crate::toolgroups::meta_tools_openai(&groups));
                 }
                 sys::log(&format!("{}: VS Code request ~{est} -> ~{} tokens, tools {n0} -> {} (groups)", guard.0.name, estimate_tokens(&v), v["tools"].as_array().map(|t| t.len()).unwrap_or(0)));
-                crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut v);
+                prepare_body(&a.mgr.cfg(), &guard.0.model, &mut v);
                 if let Err((est, limit)) = context_check(&a.mgr.cfg(), &guard.0.model, &mut v) {
                     sys::log(&format!("{}: refused a ~{est}-token prompt (window {limit})", guard.0.name));
                     return (StatusCode::BAD_REQUEST, Json(json!({"error": {
@@ -1555,7 +1580,7 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
             let (n0, n1) = crate::anthropic::trim_openai_tools(&mut v, mode, &rules);
             sys::log(&format!("{}: VS Code request ~{est} -> ~{} tokens, tools {n0} -> {n1} (server.local_tools = {})", guard.0.name, estimate_tokens(&v), a.mgr.cfg().server.local_tools));
         }
-        crate::sysprompt::apply_for(&a.mgr.cfg(), &guard.0.model, &mut v);
+        prepare_body(&a.mgr.cfg(), &guard.0.model, &mut v);
         if let Err((est, limit)) = context_check(&a.mgr.cfg(), &guard.0.model, &mut v) {
             sys::log(&format!("{}: refused a ~{est}-token prompt (window {limit})", guard.0.name));
             return (StatusCode::BAD_REQUEST, Json(json!({"error": {
@@ -2204,5 +2229,37 @@ mod context_tests {
         let tail = br#"data: {"choices":[],"usage":{"prompt_tokens":2983,"completion_tokens":207,"prompt_tokens_details":{"cached_tokens":1895}}}"#;
         assert_eq!(extract_cached(tail), Some(1895));
         assert_eq!(extract_usage(tail), Some((2983, 207)));
+    }
+
+    fn model(name: &str, format: Format) -> LocalModel {
+        LocalModel {
+            name: name.into(), format, tools: true, size: 0, repo: None, path: Default::default(), files: vec![],
+            quant: String::new(), qmode: None, arch: String::new(), unsupported: None, needs_prism: false,
+            params: String::new(), ctx_len: None, mmproj: None, modified: std::time::SystemTime::UNIX_EPOCH,
+            thinking: false, vision: false,
+        }
+    }
+
+    #[test]
+    fn strata_requests_mark_a_long_system_prompt_as_shared() {
+        let cfg = Config::default();
+        let strata = model("strata/q2_0", Format::Strata);
+        let long = "rule ".repeat(800);
+        let mut b = json!({"messages": [{"role": "system", "content": long}, {"role": "user", "content": "fix this"}]});
+        strata_prefix(&cfg, &strata, &mut b);
+        assert_eq!(b["strata_prefix"], json!({"messages": 1}));
+        // Short system prompts, a lone message, other backends and prefix_reuse = off are left alone.
+        let mut short = json!({"messages": [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}]});
+        strata_prefix(&cfg, &strata, &mut short);
+        let mut lone = json!({"messages": [{"role": "system", "content": long}]});
+        strata_prefix(&cfg, &strata, &mut lone);
+        let mlx = model("org/m", Format::Mlx);
+        let mut other = json!({"messages": [{"role": "system", "content": long}, {"role": "user", "content": "x"}]});
+        strata_prefix(&cfg, &mlx, &mut other);
+        let mut off_cfg = Config::default();
+        off_cfg.strata.prefix_reuse = "off".into();
+        let mut off = other.clone();
+        strata_prefix(&off_cfg, &strata, &mut off);
+        assert!([short, lone, other, off].iter().all(|v| v.get("strata_prefix").is_none()));
     }
 }

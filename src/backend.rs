@@ -130,6 +130,17 @@ fn context_view(limit: u64, fill: Option<crate::usage::CtxFill>, work: Option<&s
     serde_json::json!({"limit": limit, "used": used, "live": live.is_some(), "peak": peak, "last": last})
 }
 
+/// Strata session files (strata.sessions = keep): one per model, the last conversation kept.
+pub fn strata_sessions_dir() -> std::path::PathBuf {
+    crate::config::state_dir().join("strata-sessions")
+}
+fn strata_session_name(model: &str) -> String {
+    format!("{}.session", model.replace('/', "--"))
+}
+/// A conversation shorter than this is quicker to read again than to keep.
+const STRATA_SESSION_MIN: u64 = 1024;
+const STRATA_SESSION_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
 /// Seconds of day from a "YYYY-MM-DD HH:MM:SS,mmm" log prefix.
 fn log_secs(line: &str) -> Option<f64> {
     let t = line.get(11..23)?;
@@ -828,6 +839,13 @@ impl Manager {
                     if !run["env"].is_object() {
                         run["env"] = serde_json::json!({});
                     }
+                    if cfg.strata.sessions == "keep" {
+                        // Strata's /slots/0 save|restore writes session files here (the server
+                        // restores only files under this directory).
+                        let dir = strata_sessions_dir();
+                        std::fs::create_dir_all(&dir)?;
+                        run["slot_save_path"] = serde_json::json!(dir.display().to_string());
+                    }
                     if let Some(env_obj) = run["env"].as_object_mut() {
                         apply_strata_prompt_env(env_obj, &cfg.strata.prompt_path);
                         modified = true;
@@ -966,6 +984,10 @@ impl Manager {
                 String::new()
             };
             return Err(anyhow!("{} failed to load: {summary}{hint}  [{e:#}; log: {}]", m.name, log.display()));
+        }
+        if m.format == Format::Strata && cfg.strata.engine != "mock" && cfg.strata.sessions == "keep" {
+            self.set_phase("restoring the last conversation");
+            self.strata_restore(&r).await;
         }
         let secs = t0.elapsed().as_secs_f64();
         sys::log(&format!("{} ready in {secs:.1}s", m.name));
@@ -1181,6 +1203,7 @@ impl Manager {
 
     pub async fn stop(&self, r: &Arc<Running>) {
         self.running.lock().unwrap().retain(|x| !Arc::ptr_eq(x, r));
+        self.strata_save(r).await;
         self.kill(r).await;
         EVENTS.bump();
         sys::log(&format!("unloaded {}", r.name));
@@ -1206,6 +1229,82 @@ impl Manager {
     pub async fn unload_all(&self) {
         for r in self.running() {
             self.stop(&r).await;
+        }
+    }
+
+    /// strata.sessions = keep: before an unload, the conversation the engine holds goes to its
+    /// session file (written under a temporary name, kept only when it holds a real conversation,
+    /// so a warm-up or a one-line probe never replaces the last one worth keeping).
+    async fn strata_save(&self, r: &Running) {
+        let cfg = self.cfg();
+        if r.model.format != Format::Strata || cfg.strata.engine == "mock" || cfg.strata.sessions != "keep" || r.in_flight.load(Ordering::Relaxed) > 0 {
+            return;
+        }
+        if r.child.lock().await.try_wait().ok().flatten().is_some() {
+            return; // already gone
+        }
+        let (file, tmp) = (strata_session_name(&r.name), format!("{}.new", strata_session_name(&r.name)));
+        let dir = strata_sessions_dir();
+        let url = format!("{}/slots/0?action=save", r.base());
+        let res = self.http.post(url).json(&serde_json::json!({"filename": tmp})).timeout(Duration::from_secs(120)).send().await;
+        let v: serde_json::Value = match res {
+            Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
+            Ok(resp) => {
+                let code = resp.status();
+                sys::log(&format!("{}: conversation not kept ({code}: {})", r.name, resp.text().await.unwrap_or_default().chars().take(200).collect::<String>()));
+                let _ = std::fs::remove_file(dir.join(&tmp));
+                return;
+            }
+            Err(e) => {
+                sys::log(&format!("{}: conversation not kept ({e})", r.name));
+                let _ = std::fs::remove_file(dir.join(&tmp));
+                return;
+            }
+        };
+        let tokens = v["n_saved"].as_u64().unwrap_or(0);
+        if tokens < STRATA_SESSION_MIN {
+            let _ = std::fs::remove_file(dir.join(&tmp));
+            return;
+        }
+        match std::fs::rename(dir.join(&tmp), dir.join(&file)) {
+            Ok(()) => sys::log(&format!(
+                "{}: kept the conversation ({tokens} tokens, {:.0} MB in {:.1} s) for the next load",
+                r.name, v["n_written"].as_u64().unwrap_or(0) as f64 / 1e6, v["timings"]["save_ms"].as_f64().unwrap_or(0.0) / 1000.0
+            )),
+            Err(e) => sys::log(&format!("{}: conversation not kept ({e})", r.name)),
+        }
+    }
+
+    /// strata.sessions = keep: after a load, the conversation kept at the last unload comes back,
+    /// so the next turn of that chat reads only what is new. A file older than a week goes instead.
+    async fn strata_restore(&self, r: &Running) {
+        let path = strata_sessions_dir().join(strata_session_name(&r.name));
+        let Ok(meta) = std::fs::metadata(&path) else { return };
+        if meta.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > STRATA_SESSION_MAX_AGE) {
+            let _ = std::fs::remove_file(&path);
+            sys::log(&format!("{}: dropped a kept conversation older than a week", r.name));
+            return;
+        }
+        let url = format!("{}/slots/0?action=restore", r.base());
+        let res = self.http.post(url).json(&serde_json::json!({"filename": strata_session_name(&r.name)})).timeout(Duration::from_secs(120)).send().await;
+        match res {
+            Ok(resp) if resp.status().is_success() => {
+                let v: serde_json::Value = resp.json().await.unwrap_or_default();
+                sys::log(&format!(
+                    "{}: restored the last conversation ({} tokens in {:.1} s)",
+                    r.name, v["n_restored"].as_u64().unwrap_or(0), v["timings"]["restore_ms"].as_f64().unwrap_or(0.0) / 1000.0
+                ));
+            }
+            Ok(resp) => {
+                let code = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                sys::log(&format!("{}: last conversation not restored ({code}: {})", r.name, body.chars().take(200).collect::<String>()));
+                // A file this engine cannot read (another model build, another format) only gets in the way.
+                if code.is_client_error() && code != reqwest::StatusCode::NOT_FOUND {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            Err(e) => sys::log(&format!("{}: last conversation not restored ({e})", r.name)),
         }
     }
 
@@ -1409,6 +1508,7 @@ pub fn backend_sig(cfg: &Config, m: &LocalModel) -> String {
         Format::Strata => {
             let mut s = cfg.strata.clone();
             s.system_prompt_mode = String::new();
+            s.prefix_reuse = String::new(); // per request
             serde_json::to_string(&s).unwrap_or_default()
         }
     };

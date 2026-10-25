@@ -1,6 +1,6 @@
 # Working path: Strata usable in the editor chat
 
-Status: adopted 2026-10-23. Steps 1, 2, and 3 are done; steps 4-5 are implemented in the order below, easiest first.
+Status: adopted 2026-10-23. Steps 1, 2, and 3 are done; step 5's lmdeck side is in (2026-10-25, not yet measured); step 4 waits for a captured request.
 `PLAN-strata-in-editors.md` stays as the background plan; where the two disagree, this file wins. All numbers here
 were measured on the M1 Max (32 GB, Asahi) with Q2_0 and are quoted with their source.
 
@@ -51,7 +51,7 @@ worst case, so the path below optimises chat.
 | 2 | split chat/Fix models in the extension (PLAN Part 5) | ~80 lines, no model run; **done** | an escape hatch: chat can leave Strata entirely until 3-5 land |
 | 3 | a Copilot tool drop list (PLAN Part 3.1, extended) | one list + a rule, ~40 lines; **done** | 20.5k -> ~4k; ~166 s -> ~35 s |
 | 4 | a lean Copilot system prompt (PLAN Part 3.2) | needs one captured request, then text | ~4k -> ~3k; ~35 s -> ~25 s |
-| 5 | prefix reuse (PLAN Part 2) | lmdeck sends `strata_prefix` + a memory cap | repeat turn reads only the new part: seconds |
+| 5 | prefix reuse (PLAN Part 2) | lmdeck sends `strata_prefix`, keeps sessions across unloads; **in, unmeasured** | repeat turn reads only the new part: seconds |
 
 Impact and effort do not line up: 3 and 5 are what actually make chat usable with Strata, 2 is what makes it usable
 today. Doing them in the order above keeps a working editor at every step.
@@ -113,6 +113,28 @@ what, so this step waits for the capture rather than guessing.
 Done when: the request is ~3k tokens with the system prompt lean and chat still edits and reads files correctly.
 
 ### Step 5 - reuse the shared start (PLAN Part 2)
+
+**Implemented 2026-10-25, not yet measured.** What the engine log already showed (`strata-q2_0.log`, 2026-10-24):
+
+- a follow-up in the same chat reuses only the previous *prompt*: `prompt 2983 tokens = 1895 reused + 1088 read`,
+  where 1088 includes the 307-token reply it had just written (the engine's turn checkpoint sits at the last
+  `<|im_start|>`, and the re-rendered reply does not match the generated tokens: Qwen's template drops the thinking);
+- a new chat reuses nothing (`prompt 1967 tokens = 0 reused`) although its system prompt and tools are the last one's;
+- a prompt a few tokens past a chunk pays a whole pass: 2065 tokens read in 19.2 s against 1967 in 15.2 s.
+
+What lmdeck does now:
+
+- `strata.prefix_reuse = "system"` (default): a Strata request whose system message (with the tools the template
+  renders beside it) is about 512 tokens or more gets `"strata_prefix": {"messages": 1}` on every chat API
+  (`server::strata_prefix`). New conversations and Fix requests with the same system prompt read only what follows.
+  Pins are never evicted by Strata, so each distinct system prompt holds one checkpoint until the engine unloads.
+- `strata.sessions = "keep"` (default): the server starts with `slot_save_path` = `~/.local/state/lmdeck/strata-sessions`;
+  before lmdeck unloads a Strata model it saves the conversation the engine holds (`/slots/0?action=save`, kept only
+  when 1024+ tokens), and after the next load it restores it, so the 30-minute idle unload does not cost the chat's
+  next turn the whole prompt. Files older than a week are dropped. About 1.2 GB per 63K tokens (Strata's figure).
+
+Still open: the reply part of a follow-up (kapitsa's "history prefill while idle", see IDEAS.md), and the memory a
+pinned prefix holds (measure before relying on many pins).
 
 Strata already supports it: a request sends `"strata_prefix": {"messages": K}` and its server resolves it to
 `{"tokens": N}`, passes `pin=N` to the engine, and pins that checkpoint so "N questions cost one prefix"

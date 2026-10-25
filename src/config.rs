@@ -188,6 +188,14 @@ pub struct StrataCfg {
     /// matrix units. Measured on a 10,609-token prompt (2026-10-22): 14.7 / 109.0 / 123.8 /
     /// 134.7 tok/s; the chunk buffers take 0 / 1.60 / 2.55 / 4.46 GB of the arena.
     pub prompt_path: String,
+    /// "system" = mark the system message (with the tool list the template renders into it) as a
+    /// shared prefix (`strata_prefix`): the engine pins its checkpoint, so a new conversation or a
+    /// Fix request with the same system prompt and tools reads only what follows. "off" = never.
+    pub prefix_reuse: String,
+    /// "keep" = save the conversation the engine holds to a session file before lmdeck unloads it
+    /// and restore it after the next load (Strata's /slots save/restore), so an idle unload does not
+    /// cost the next turn the whole prompt again. "off" = not kept.
+    pub sessions: String,
     pub extra_args: Vec<String>,
     pub env: BTreeMap<String, String>,
 }
@@ -202,6 +210,8 @@ impl Default for StrataCfg {
             vk_icd: String::new(),
             system_prompt_mode: "prepend".into(),
             prompt_path: "off".into(),
+            prefix_reuse: "system".into(),
+            sessions: "keep".into(),
             extra_args: vec![],
             env: BTreeMap::new(),
         }
@@ -833,6 +843,8 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "Strata", key: "strata.vk_icd", kind: Kind::Text, help: "Vulkan driver for the engine (ICD json; empty = honeykrisp-strata v3)" },
     Setting { section: "Strata", key: "strata.extra_args", kind: Kind::Text, help: "Extra Strata server args" },
     Setting { section: "Strata", key: "strata.env", kind: Kind::Text, help: "Env for the Strata server and engine, K=V,K=V" },
+    Setting { section: "Strata", key: "strata.prefix_reuse", kind: Kind::Choice(&["system", "off"]), help: "system: pin the system prompt + tools as a shared prefix, so new chats and Fix requests read only what follows / off" },
+    Setting { section: "Strata", key: "strata.sessions", kind: Kind::Choice(&["keep", "off"]), help: "keep: save the conversation to the SSD before an unload and restore it after the next load / off" },
     Setting { section: "Strata", key: "strata.prompt_path", kind: Kind::PromptChunk, help: "Strata prompt path: off (decode windows) / 1024 / 2048 / 4096 (GPU chunked path; 2048 best on 32 GB)" },
     Setting { section: "System prompts", key: "mlx.system_prompt", kind: Kind::Prompt, help: "System prompt for MLX models (prompts/mlx.md, opens in your editor; {model} {backend} {date} expand). Per model: e in Models" },
     Setting { section: "System prompts", key: "mlx.system_prompt_mode", kind: MODE, help: "MLX: prepend (before the client's) / replace (instead of it) / fallback (only when the client sends none)" },
@@ -946,6 +958,8 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "strata.extra_args" => c.strata.extra_args.join(" "),
         "strata.env" => kv_join(&c.strata.env),
         "strata.prompt_path" => c.strata.prompt_path.clone(),
+        "strata.prefix_reuse" => c.strata.prefix_reuse.clone(),
+        "strata.sessions" => c.strata.sessions.clone(),
         "strata.system_prompt" => crate::sysprompt::to_line(&crate::sysprompt::backend_text(crate::models::Format::Strata)),
         "strata.system_prompt_mode" => c.strata.system_prompt_mode.clone(),
         "llama.system_prompt_mode" => c.llama.system_prompt_mode.clone(),
@@ -1082,6 +1096,14 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
             "off" | "1024" | "2048" | "4096" => c.strata.prompt_path = v.into(),
             _ => return Err("use off, 1024, 2048 or 4096".into()),
         },
+        "strata.prefix_reuse" => match v {
+            "system" | "off" => c.strata.prefix_reuse = v.into(),
+            _ => return Err("system or off".into()),
+        },
+        "strata.sessions" => match v {
+            "keep" | "off" => c.strata.sessions = v.into(),
+            _ => return Err("keep or off".into()),
+        },
         "strata.system_prompt" => crate::sysprompt::set_backend_text(crate::models::Format::Strata, &crate::sysprompt::from_line(v)).map_err(|e| e.to_string())?,
         "strata.system_prompt_mode" => {
             if !crate::sysprompt::MODES.contains(&v) {
@@ -1119,7 +1141,7 @@ pub fn needs_reload(key: &str) -> bool {
     }
     key.starts_with("mlx.")
         || (key.starts_with("llama.") && !matches!(key, "llama.git_ref" | "llama.repo"))
-        || matches!(key, "strata.engine" | "strata.vk_icd" | "strata.extra_args" | "strata.env" | "strata.prompt_path")
+        || matches!(key, "strata.engine" | "strata.vk_icd" | "strata.extra_args" | "strata.env" | "strata.prompt_path" | "strata.sessions")
         || key == "server.uclamp_boost"
 }
 
