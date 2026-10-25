@@ -163,7 +163,9 @@ One key on the wall, one word on the command line, the same action:
 | `e` | `edit [N]` | the task's repository in the editor; pauses the task first so the agent and you never edit at once |
 | space | `pause` / `resume` | finish the current turn, then hold (the model stays loaded) |
 | `n` | `skip` | end this task's session and go to the next |
-| `s` | `screen off` | the panel off now; any key on the wall turns it back on |
+| `s` | `screen off` / `screen on` | toggle the panel fully off and on (also off by itself after 2 min without a key) |
+| `o` / `O` | `open [FILE]` | pick a file from the task repositories and open it in nvim (`O`: with LSP) |
+| `!` | - | a shell (niced), `exit` returns |
 | `q` | - | leave the wall; the run goes on (`lmdeck xtreme` brings it back) |
 | `X` | `stop` | end the run and bring the desktop back (asks first) |
 | - | `start`, `status`, `watch`, `add "task"`, `report` | start a run, one line of state, the wall as plain text, append a task, the last report |
@@ -200,6 +202,44 @@ wall's terminal and give it back when they exit, as the TUI's system-prompt edit
   Unicode ones in a desktop terminal or over ssh.
 - Waking the screen: the kernel console may not undo a blank done through `fb0/blank` on a keypress, so the wall
   turns the screen back on itself (`screen-on`) on any key while it is off. To check on the first run.
+
+## Using the machine during a run (a headless dev box)
+
+XTreme stops only the graphical session. Everything a CLI-only Linux has stays: the network (NetworkManager), sshd
+(enabled and running here), ufw, tmux, systemd user services, the other consoles (Ctrl+Alt+F3...). So the machine can
+be used on its own, without another computer, to vibe-code, review the agents' work and fix things by hand.
+
+- **The editor on demand.** `o` on the wall opens a file picker over the task repositories (git status first, then
+  recent files, typing filters), and the chosen file opens in nvim; quitting nvim gives the wall back. Nothing runs
+  while you do not edit. Measured: nvim with this machine's LazyVim config 35 MB, `nvim --clean` 12 MB; vim is the
+  fallback (`ui.editor`). The cost to watch is language servers: rust-analyzer can take a gigabyte or more on a big
+  crate, so XTreme starts nvim with LSP off unless asked (`O` opens with it).
+- **Colours.** The text console has 16 colours (`TERM=linux`): nvim runs with `notermguicolors` and a 16-colour
+  scheme there, so syntax colouring works, in a smaller palette. If that is too little, an optional console made of
+  `cage` + `foot` (foot is installed, cage is not) gives true colour and the usual fonts for as long as the editor is
+  open, then exits; it draws only when something changes.
+- **A shell.** `!` on the wall opens `$SHELL` (inside tmux when it is there); `exit` comes back.
+- **Hosting.** The wall's header shows the LAN address and the ports your processes listen on (`ss -ltn`), and
+  `lmdeck xtreme ip` prints them. ufw is active, so a port has to be opened (`sudo ufw allow PORT`) before another
+  machine reaches it.
+- **The screen.** `s` toggles the panel fully off (framebuffer powerdown and backlight off) and on. With no key for
+  2 minutes (`--screen-idle`) it goes off by itself; any key brings it back.
+
+### Does it slow the model?
+
+Mostly not, for the reason the arena works the way it does. Strata's expert arena is sized and allocated at load;
+what starts afterwards does not shrink it. An editor, a shell and ssh are a few tens of MB and idle CPU. What does
+compete:
+
+- **Memory beyond the arena.** Strata reads the experts it does not hold through the page cache (the log's "file
+  tier"), and the n-gram table is memory-mapped too. Something large started later (a language server, a big build)
+  takes page cache from it, and decode reads more from the SSD. XTreme therefore keeps an interactive reserve out of
+  the arena when it loads (`--reserve`, default 2 GB), so editing and small builds never press on it.
+- **CPU.** The engine's host turns between layers are short and latency-sensitive. A full-speed `cargo build` while
+  the model writes slows both; the shell from `!` runs with `nice -n 19` and `ionice -c 3`, so a build waits for
+  the model instead of the other way round.
+- **The agents' own builds and tests** do not compete: while an agent runs a tool the model is idle, waiting for
+  the result.
 
 ## Working on the machine in TUI mode
 

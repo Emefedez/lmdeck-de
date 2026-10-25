@@ -151,8 +151,20 @@ terminal (also over ssh), and as a summary card with *Start XTreme...* in the ba
 | `d` / `l` | `diff` / `log` | the task branch's diff / the agent's transcript, live |
 | `e` | `edit` | the task's repository in your editor (the task pauses first) |
 | space / `n` | `pause` / `skip` | hold after this turn / go to the next task |
-| `s` / `q` / `X` | `screen off` / - / `stop` | panel off now / leave the wall (the run goes on) / end the run, desktop back |
+| `s` / `q` / `X` | `screen off\|on` / - / `stop` | toggle the panel fully off / leave the wall (the run goes on) / end the run, desktop back |
+| `o` / `!` | `open [FILE]` / - | pick a file and open it in nvim / a shell |
 | - | `start`, `status`, `watch`, `add "task"`, `report` | start, one line of state, the wall as plain text, append a task, the last report |
+
+**Using the machine during a run.** Only the graphical session stops. The network, sshd, tmux and the other consoles
+stay, so the machine works as a headless dev box on its own:
+- `o` picks a file from the task repositories and opens it in nvim (LazyVim config measured at 35 MB, only while it
+  is open; language servers stay off unless asked with `O`). Syntax colouring works in the console's 16 colours.
+- `!` opens a shell.
+- The wall shows the LAN address and the listening ports for apps you host. ufw is on, so open a port first.
+- `s` toggles the screen fully off; it also turns off after 2 minutes without a key.
+
+It barely slows the model: the expert arena is allocated at load, and XTreme keeps 2 GB out of it for interactive
+work. Large builds started by hand run niced, so they wait for the model.
 
 **Light.** The wall is the same lmdeck binary in its TUI mode. Measured, it holds 9.3 MB, of which 2.8 MB is its own
 and the rest is the binary's code, shared with the daemon (8.4 MB). It redraws only when something changes and
