@@ -330,6 +330,9 @@ pub(super) fn context_lines(r: &Value, label: bool, width: u16) -> Vec<Line<'sta
                 _ => {}
             }
             if c["live"].as_bool() != Some(true) {
+                if let Some(r) = c["last"]["cached"].as_u64().filter(|r| *r > 0) {
+                    text.push_str(&format!(" · {} reused", compact(r)));
+                }
                 if let Some(ago) = c["last"]["ago_secs"].as_u64() {
                     text.push_str(&format!(" · {} ago", dur(ago)));
                 }

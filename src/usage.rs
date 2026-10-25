@@ -173,6 +173,8 @@ pub struct CtxUse {
     pub prompt: u64,
     pub completion: u64,
     pub at: SystemTime,
+    /// Of the prompt, tokens the backend served from its cache (when it says).
+    pub cached: Option<u64>,
 }
 
 impl CtxUse {
@@ -209,7 +211,7 @@ impl Usage {
         }
         // A backend that reported no prompt count says nothing about the context.
         if prompt > 0 {
-            let now = CtxUse { prompt, completion, at: SystemTime::now() };
+            let now = CtxUse { prompt, completion, at: SystemTime::now(), cached: None };
             let mut c = self.ctx.lock().unwrap();
             let e = c.entry(model.to_string()).or_insert(CtxFill { last: now, peak: now });
             e.last = now;
@@ -256,6 +258,14 @@ impl Usage {
     /// How full `model`'s context was on its last request, and at most, since it loaded.
     pub fn context(&self, model: &str) -> Option<CtxFill> {
         self.ctx.lock().unwrap().get(model).copied()
+    }
+
+    /// The backend said how much of the last request's prompt came from its cache.
+    pub fn note_cached(&self, model: &str, cached: u64) {
+        if let Some(f) = self.ctx.lock().unwrap().get_mut(model) {
+            f.last.cached = Some(cached);
+        }
+        EVENTS.bump();
     }
 
     /// A model (re)loaded: its context starts empty.

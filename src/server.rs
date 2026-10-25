@@ -1587,6 +1587,7 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
         let streaming = ctype_s.as_ref().and_then(|c| c.to_str().ok()).is_some_and(|c| c.contains("event-stream") || c.contains("ndjson"));
         let t0 = t_req;
         let mut t_first: Option<Instant> = None;
+        let mut ttft_buf: Vec<u8> = Vec::new();
         let mut deltas = 0u64;
         let mut tail: Vec<u8> = Vec::with_capacity(16 << 10);
         let mut s = resp.bytes_stream();
@@ -1600,7 +1601,11 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
                 }
             };
             if ok {
-                t_first.get_or_insert_with(Instant::now);
+                // The first token, not the first bytes: Strata and llama.cpp open a stream with an empty
+                // role delta (and heartbeats) long before the prompt is read.
+                if t_first.is_none() && (!streaming || has_token(&chunk, &mut ttft_buf)) {
+                    t_first = Some(Instant::now());
+                }
                 deltas += chunk.windows(7).filter(|w| *w == b"\"delta\"").count() as u64;
                 tail.extend_from_slice(&chunk);
                 if tail.len() > 16 << 10 {
@@ -1644,6 +1649,9 @@ async fn v1_proxy(State(a): State<App>, method: Method, uri: Uri, headers: Heade
             } else {
                 // Prefill and decode can't be told apart here: report end-to-end throughput.
                 USAGE.record(&model_name, p, c, 0.0, t0.elapsed().as_secs_f64(), 0.0);
+            }
+            if let Some(cached) = extract_cached(&tail) {
+                USAGE.note_cached(&model_name, cached);
             }
         }
     });
@@ -1873,6 +1881,36 @@ fn record_usage(model: &str, stats: &Value) {
 }
 
 /// Token counts from the tail of an OpenAI/Anthropic/llama.cpp response.
+/// Whether a streamed chunk carries a generated token: a non-empty content, reasoning or tool-call
+/// delta (OpenAI SSE) or message content (Ollama NDJSON). `buf` keeps a line split across chunks.
+fn has_token(chunk: &[u8], buf: &mut Vec<u8>) -> bool {
+    buf.extend_from_slice(chunk);
+    let Some(last_nl) = buf.iter().rposition(|&c| c == b'\n') else { return false };
+    let rest = buf.split_off(last_nl + 1);
+    let lines = std::mem::replace(buf, rest);
+    let nonempty = |v: &Value| v.as_str().is_some_and(|s| !s.is_empty()) || v.as_array().is_some_and(|a| !a.is_empty());
+    String::from_utf8_lossy(&lines).lines().any(|l| {
+        let l = l.trim();
+        let Ok(v) = serde_json::from_str::<Value>(l.strip_prefix("data:").map(str::trim).unwrap_or(l)) else { return false };
+        let d = &v["choices"][0]["delta"];
+        ["content", "reasoning_content", "reasoning", "tool_calls"].iter().any(|k| nonempty(&d[*k]))
+            || nonempty(&v["choices"][0]["text"])
+            || ["content", "thinking", "tool_calls"].iter().any(|k| nonempty(&v["message"][*k]))
+            || nonempty(&v["response"])
+    })
+}
+
+/// Prompt tokens the backend served from its cache, from the last usage block (OpenAI
+/// `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens`).
+fn extract_cached(tail: &[u8]) -> Option<u64> {
+    let s = String::from_utf8_lossy(tail);
+    let (i, _) = s.rmatch_indices("\"usage\"").next()?;
+    let rest = &s[i + 7..];
+    let colon = rest.find(':')?;
+    let v: Value = serde_json::Deserializer::from_str(&rest[colon + 1..]).into_iter::<Value>().next()?.ok()?;
+    v.pointer("/prompt_tokens_details/cached_tokens").or_else(|| v.get("cache_read_input_tokens")).and_then(|x| x.as_u64())
+}
+
 fn extract_usage(tail: &[u8]) -> Option<(u64, u64)> {
     let s = String::from_utf8_lossy(tail);
     for (i, _) in s.rmatch_indices("\"usage\"") {
@@ -2151,5 +2189,20 @@ mod context_tests {
         let img = format!("data:image/png;base64,{}", "A".repeat(2_000_000));
         let b = json!({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": img}}]}]});
         assert!(estimate_tokens(&b) < 1000);
+    }
+
+    #[test]
+    fn first_token_is_the_first_generated_delta() {
+        let mut buf = Vec::new();
+        // Strata's opening role chunk and a heartbeat carry no token.
+        assert!(!has_token(b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n", &mut buf));
+        assert!(!has_token(b": ping\n\n", &mut buf));
+        // A line split across chunks counts once it is whole.
+        assert!(!has_token(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":", &mut buf));
+        assert!(has_token(b"\"Hm\"}}]}\n\n", &mut buf));
+        assert!(has_token(b"{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"done\":false}\n", &mut Vec::new()));
+        let tail = br#"data: {"choices":[],"usage":{"prompt_tokens":2983,"completion_tokens":207,"prompt_tokens_details":{"cached_tokens":1895}}}"#;
+        assert_eq!(extract_cached(tail), Some(1895));
+        assert_eq!(extract_usage(tail), Some((2983, 207)));
     }
 }

@@ -124,7 +124,7 @@ pub struct RunningView {
 fn context_view(limit: u64, fill: Option<crate::usage::CtxFill>, work: Option<&serde_json::Value>) -> serde_json::Value {
     let live = work.and_then(|w| Some(w["prompt_tokens"].as_u64()? + w["generated"].as_u64().unwrap_or(0)));
     let ago = |t: SystemTime| t.elapsed().unwrap_or_default().as_secs();
-    let last = fill.map(|f| serde_json::json!({"prompt": f.last.prompt, "completion": f.last.completion, "ago_secs": ago(f.last.at)}));
+    let last = fill.map(|f| serde_json::json!({"prompt": f.last.prompt, "completion": f.last.completion, "cached": f.last.cached, "ago_secs": ago(f.last.at)}));
     let used = live.or(fill.map(|f| f.last.total()));
     let peak = fill.map(|f| f.peak.total()).into_iter().chain(live).max();
     serde_json::json!({"limit": limit, "used": used, "live": live.is_some(), "peak": peak, "last": last})
@@ -1364,7 +1364,7 @@ mod work_tests {
     #[test]
     fn context_fill_prefers_the_request_in_flight() {
         let t = std::time::SystemTime::now();
-        let u = |p, c| crate::usage::CtxUse { prompt: p, completion: c, at: t };
+        let u = |p, c| crate::usage::CtxUse { prompt: p, completion: c, at: t, cached: None };
         let fill = crate::usage::CtxFill { last: u(1500, 500), peak: u(20000, 700) };
         let v = super::context_view(32768, Some(fill), None);
         assert_eq!((v["used"].as_u64(), v["peak"].as_u64(), v["live"].as_bool()), (Some(2000), Some(20700), Some(false)));
