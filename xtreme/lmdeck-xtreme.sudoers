@@ -1,0 +1,2 @@
+# lmdeck XTreme mode (docs/XTREME.md): stop/start the display manager and blank the panel, nothing else.
+%USER% ALL=(root) NOPASSWD: /usr/local/libexec/lmdeck-xtreme-root ^(desktop-stop|desktop-start|screen-off|screen-on)$

@@ -1,0 +1,14 @@
+#!/bin/sh
+# lmdeck XTreme mode: the only steps it needs root for (sudoers.d/lmdeck-xtreme allows exactly these arguments).
+set -eu
+fb=/sys/class/graphics/fb0/blank
+bl=/sys/class/backlight/apple-panel-bl/bl_power
+case "${1:-}" in
+  desktop-stop)  exec /usr/bin/systemctl stop sddm.service ;;
+  desktop-start) exec /usr/bin/systemctl start sddm.service ;;
+  # panel off through the console's framebuffer (DRM fbdev blank, 4 = powerdown); the backlight too, in case the
+  # blank alone leaves it lit
+  screen-off) echo 4 > "$fb" 2>/dev/null || true; [ -w "$bl" ] && echo 4 > "$bl"; exit 0 ;;
+  screen-on)  [ -w "$bl" ] && echo 0 > "$bl"; echo 0 > "$fb" 2>/dev/null || true; exit 0 ;;
+  *) echo "usage: lmdeck-xtreme-root desktop-stop|desktop-start|screen-off|screen-on" >&2; exit 2 ;;
+esac

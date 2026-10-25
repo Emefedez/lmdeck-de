@@ -106,15 +106,24 @@ another machine):
 - the agents need none of these: they work through their tools, rea's binary-analysis tools included (in lmdeck's
   `groups` tool mode). rea's browser and native-UI capture tools need a desktop and are left out of XTreme runs.
 
-## One-time setup it needs
+## One-time setup (done on this machine 2026-10-26)
 
-- **Linger** (`loginctl enable-linger m1-max`): today linger is off, so the user's services, lmdeck included, end when
-  the last login session ends. Stopping SDDM ends that session.
-- **Root for two steps**: stopping and starting SDDM, and the framebuffer blank. Passwordless sudo is not set up now.
-  Either `lmdeck xtreme start` asks for the password once at the start, or a one-time sudoers entry limited to
-  exactly those commands (`systemctl stop sddm`, `systemctl start sddm`, writing `fb0/blank`). The second is what an
-  unattended stop at the end of `--hours` needs.
-- Optional: `r2ghidra` and `w3m` for TUI work.
+- **Linger** on (`loginctl enable-linger m1-max`): the user's services, lmdeck included, keep running when the last
+  login session ends, which stopping SDDM does.
+- **Root for exactly four steps**, through one root-owned helper, `/usr/local/libexec/lmdeck-xtreme-root`
+  (`desktop-stop`, `desktop-start`, `screen-off`, `screen-on`; anything else is refused), allowed without a password
+  by `/etc/sudoers.d/lmdeck-xtreme` for those arguments only. Sources in `xtreme/` (the sudoers file has `%USER%` for
+  the user name). This is what lets the run restore the desktop by itself at the end of `--hours`.
+  `screen-off` writes `4` to `fb0/blank` and to the panel backlight's `bl_power`; `screen-on` undoes both.
+- **TUI tools**: `w3m` and `r2ghidra` (pacman, extra) installed; `r2` loads the plugin (`pdg` decompiles).
+
+Install elsewhere:
+
+```
+sudo install -Dm755 -o root -g root xtreme/lmdeck-xtreme-root /usr/local/libexec/lmdeck-xtreme-root
+sed "s/%USER%/$USER/" xtreme/lmdeck-xtreme.sudoers > /tmp/x && sudo visudo -cf /tmp/x && sudo install -m440 -o root -g root /tmp/x /etc/sudoers.d/lmdeck-xtreme
+loginctl enable-linger "$USER"
+```
 
 ## Safety rules
 
