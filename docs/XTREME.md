@@ -1,6 +1,6 @@
 # XTreme mode (plan)
 
-Status: planned 2026-10-26; the one-time setup is done, the mode itself is not implemented yet. This page is the design and the reasons for it; the numbers
+Status: planned 2026-10-26; the one-time setup is done (the helper's `wall` step comes with the build), the mode itself is not implemented yet. This page is the design and the reasons for it; the numbers
 are measured on this machine (M1 Max, 32 GB, Asahi) unless marked as an estimate.
 
 XTreme mode turns the laptop into a headless model server for a long unattended run (overnight bug fixing, batch
@@ -85,10 +85,32 @@ compaction loses detail. XTreme does not compact. Each task runs in fresh sessio
 - A watchdog ends a turn that thinks past its cap or a session past its time, reloads the engine if it dies, and moves
   on after two sessions in a row without a commit or a note.
 
-### Stop (the end of `--hours`, `lmdeck xtreme stop`, or a key at the console)
+### Back to the desktop: the timer
 
-The agents stop at the end of their turn, the screen comes back (`fb0/blank` = 0), SDDM starts again and autologin
-brings the desktop back, the sleep lock goes. `~/.local/state/lmdeck/xtreme/report.md` lists each task with its
+A run has an end from the start: `--hours 8` or `--until 07:30`. The wall's header counts down to it
+(`desktop back in 5h12m`).
+
+1. **Wind-down.** 15 minutes before the end no new session starts; the one running may finish its turn.
+2. **The countdown.** At the end the screen comes on and the wall shows `Back to the desktop in 60 s`: any key adds
+   an hour (again and again), Enter or `X` goes now. Nobody there: it goes when the countdown ends.
+3. **The return.** The agents stop at the end of their turn, Strata unloads (its arena was sized for an empty
+   machine; the desktop needs that memory back, and the next request loads it again the normal way), the screen
+   comes on, SDDM starts and autologin brings Omarchy back, the sleep lock goes. Chromium and the other closed apps
+   are not reopened by XTreme; they restore their own sessions when opened.
+4. **The report.** A notification on the desktop gives the night's result and opens
+   `~/.local/state/lmdeck/xtreme/report.md`.
+
+**A dead-man switch.** At the start XTreme also arms a transient user timer, independent of the run
+(`systemd-run --user --on-calendar=<end + 15 min> --unit=lmdeck-xtreme-return`), that turns the screen on and starts
+SDDM even if the daemon or the run has died; a clean return cancels it. Linger keeps user timers running without a
+login, so the desktop comes back on time whatever happened in the night.
+
+**Earlier, by hand:** `X` on the wall (it asks first), `lmdeck xtreme stop` over ssh or on another console
+(Ctrl+Alt+F2), or a reboot (SDDM's autologin starts the desktop as on any boot).
+
+### Stop
+
+Every way back above ends the same: agents stopped, Strata unloaded, screen on, SDDM started, sleep lock gone. `~/.local/state/lmdeck/xtreme/report.md` lists each task with its
 commits, its check's result and the last notes, plus the run's numbers: arena, decode and prompt speed, turns, time.
 
 If anything goes wrong in the night, Ctrl+Alt+F2 gives a text login with the run still going; `lmdeck xtreme stop`
@@ -168,12 +190,12 @@ wall's terminal and give it back when they exit, as the TUI's system-prompt edit
 
 ### On the console
 
-- After SDDM stops, the wall needs a terminal of its own on the display. Either the root helper gains a fifth step
-  that opens it on a free console (`openvt` running `lmdeck xtreme` as the user), or the wall is what you get by
-  logging in on a console (Ctrl+Alt+F2) and typing `lmdeck xtreme`. The first is automatic; the second widens nothing.
-- The console has no font set (`/etc/vconsole.conf`), so the kernel's default draws a 3024x1964 panel: at 16x32 that
-  is about 189x61 characters. The wall is laid out for 80x24 and up and uses a bigger font where the
-  `terminus-font` package is installed (`setfont ter-132n`).
+- **Automatic login onto the wall** (decided 2026-10-26). After SDDM stops, the root helper's fifth step, `wall`,
+  opens a console of its own and switches to it (`openvt -s -c 2`), sets the font, and runs `lmdeck xtreme wall` as
+  the user (`runuser -u m1-max`): no password, no typing, the wall is what the display shows. The sudoers rule gains
+  that one argument when it is built. Logging in by hand (Ctrl+Alt+F2, `lmdeck xtreme`) still works, over ssh too.
+- **Font:** `terminus-font` is installed (4.49.1); the wall's console uses `ter-132n` (16x32), about 189x61 characters
+  on the 3024x1964 panel. Nothing changes in `/etc/vconsole.conf`: the font is set for the wall's console only.
 - `TERM=linux` means 16 colours and a limited set of glyphs: the wall picks ASCII borders and bars there, and the
   Unicode ones in a desktop terminal or over ssh.
 - Waking the screen: the kernel console may not undo a blank done through `fb0/blank` on a keypress, so the wall

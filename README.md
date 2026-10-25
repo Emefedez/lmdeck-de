@@ -107,12 +107,25 @@ The desktop holds about 10 GB (Chromium alone 5.2 GB), and with it gone nothing 
 1. Checks that no Strata request is running.
 2. Blocks sleep, idle and the lid switch for the run's length.
 3. Stops SDDM, so nothing renders, not even the greeter.
-4. Turns the panel off.
-5. Reloads Strata and runs the tasks.
+4. Logs in on a console by itself and opens the wall there (Terminus 16x32 font, ~189x61 characters).
+5. Turns the panel off; any key on the wall turns it back on.
+6. Reloads Strata and runs the tasks.
 
 Each task gets fresh agent sessions (Claude Code or opencode, headless, through lmdeck). The session's memory is the
 task's `PROGRESS.md` and its commits, never a compacted context. Thinking is capped and a watchdog moves past
 stuck turns.
+
+**Back to the desktop, on a timer.** A run has an end from the start (`--hours 8` or `--until 07:30`), and the
+wall counts down to it.
+1. 15 minutes before the end, no new session starts.
+2. At the end the screen comes on with `Back to the desktop in 60 s`. Any key adds an hour; Enter or `X` goes now;
+   nobody there, it goes when the countdown ends.
+3. The agents stop, Strata unloads (the desktop needs that memory back), SDDM starts and autologin brings Omarchy
+   back. A notification opens the night's report.
+
+A dead-man switch is armed at the start: a separate user timer that brings the screen and the desktop back 15
+minutes after the end even if the run or lmdeck itself has died. You can also go back early with `X` on the wall,
+`lmdeck xtreme stop` (over ssh or on Ctrl+Alt+F2), or a reboot.
 
 **The wall.** One panel in three places: full screen on the text console during a run, as tab 7 of the TUI in any
 terminal (also over ssh), and as a summary card with *Start XTreme...* in the bar panel.
@@ -152,7 +165,9 @@ Code: 343 MB), so sessions run one at a time.
 - `/usr/local/libexec/lmdeck-xtreme-root`, a root-owned helper, has four steps: `desktop-stop`, `desktop-start`,
   `screen-off` and `screen-on`. `/etc/sudoers.d/lmdeck-xtreme` allows those four arguments only, without a password.
   Sources and install steps are in `xtreme/` and the plan.
-- `w3m` and `r2ghidra` are installed for working on the text console.
+- `w3m`, `r2ghidra` and `terminus-font` are installed for working on the text console.
+- Still to add with the build: the helper's fifth step, `wall` (open the wall on its own console as the user), and
+  its argument in the sudoers rule.
 
 ## Docs
 
