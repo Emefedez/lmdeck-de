@@ -222,8 +222,15 @@ be used on its own, without another computer, to vibe-code, review the agents' w
 - **Hosting.** The wall's header shows the LAN address and the ports your processes listen on (`ss -ltn`), and
   `lmdeck xtreme ip` prints them. ufw is active, so a port has to be opened (`sudo ufw allow PORT`) before another
   machine reaches it.
-- **The screen.** `s` toggles the panel fully off (framebuffer powerdown and backlight off) and on. With no key for
-  2 minutes (`--screen-idle`) it goes off by itself; any key brings it back.
+- **The screen, and what goes with it.** `s` toggles the panel fully off (framebuffer powerdown and backlight off)
+  and on. With no key for 2 minutes (`--screen-idle`) it goes off by itself; any key brings it back. Off means nothing
+  draws and nothing interactive stays loaded:
+  - nvim saves its session (open files, cursor, window layout: `:mksession`) and keeps unsaved changes in its swap
+    files (`:preserve`), then quits, and its language servers with it; on wake it reopens where you were, unsaved
+    changes included. Nothing is written to your files that you did not save.
+  - an idle shell from `!` is closed; a shell running something (a server you host, a build) is left alone, so
+    hosted apps stay reachable while the screen is off.
+  - the wall stops drawing (it already draws nothing while the screen is off).
 
 ### Does it slow the model?
 

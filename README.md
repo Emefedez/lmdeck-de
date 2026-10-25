@@ -161,7 +161,10 @@ stay, so the machine works as a headless dev box on its own:
   is open; language servers stay off unless asked with `O`). Syntax colouring works in the console's 16 colours.
 - `!` opens a shell.
 - The wall shows the LAN address and the listening ports for apps you host. ufw is on, so open a port first.
-- `s` toggles the screen fully off; it also turns off after 2 minutes without a key.
+- `s` toggles the screen fully off; it also turns off after 2 minutes without a key. Off also unloads the
+  interactive tools: nvim saves its session and its unsaved changes (in its swap files, not your files) and quits,
+  language servers with it, and reopens where you were on wake; idle shells close, while anything running in a
+  shell (a hosted app, a build) keeps going.
 
 It barely slows the model: the expert arena is allocated at load, and XTreme keeps 2 GB out of it for interactive
 work. Large builds started by hand run niced, so they wait for the model.
