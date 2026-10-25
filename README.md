@@ -90,6 +90,8 @@ Details and the formula are in [docs/REFERENCE.md](docs/REFERENCE.md#model-grade
 - [RESULTS.md](docs/RESULTS.md): what was measured, with what
 - [NOT-WORKED.md](docs/NOT-WORKED.md): what was tried and did not help, and why
 - [IDEAS.md](docs/IDEAS.md): what could come next
+- [XTREME.md](docs/XTREME.md): XTreme mode (planned): desktop off, screen off, the freed memory to Strata, and coding
+  agents in fresh bounded sessions for an unattended night
 - [LIMITATIONS.md](docs/LIMITATIONS.md): what does not work, or was never tested
 - [MODELS.md](docs/MODELS.md): what runs, and how to tell before downloading
 - [PLAN-strata-in-editors.md](docs/PLAN-strata-in-editors.md): the plan to make Strata fast in VS Code and coding agents
