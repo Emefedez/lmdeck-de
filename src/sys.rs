@@ -796,7 +796,10 @@ Type=simple
 ExecStart={exe} serve
 Restart=on-failure
 RestartSec=2
-TimeoutStopSec=15
+# lmdeck stops its backends itself (a Strata model first saves its conversation):
+# SIGTERM goes to lmdeck alone, what is left after it exits gets SIGKILL.
+KillMode=mixed
+TimeoutStopSec=60
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
 # The daemon itself is tiny; backends inherit normal priority.
 Nice=0

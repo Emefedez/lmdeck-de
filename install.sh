@@ -10,6 +10,8 @@ command -v cargo >/dev/null || { echo "cargo not found (pacman -S rust)"; exit 1
 cargo build --release
 install -Dm755 target/release/lmdeck "$HOME/.local/bin/lmdeck"
 "$HOME/.local/bin/lmdeck" desktop
+# An installed user service gets the current unit (KillMode and timeouts change with lmdeck).
+if [[ -f "$HOME/.config/systemd/user/lmdeck.service" ]]; then "$HOME/.local/bin/lmdeck" service install >/dev/null; fi
 for arg in "$@"; do
   case "$arg" in
     --service)
