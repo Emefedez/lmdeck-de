@@ -144,7 +144,7 @@ One key on the wall, one word on the command line, the same action:
 | `s` | `screen off` | the panel off now; any key on the wall turns it back on |
 | `q` | - | leave the wall; the run goes on (`lmdeck xtreme` brings it back) |
 | `X` | `stop` | end the run and bring the desktop back (asks first) |
-| - | `start`, `status`, `add "task"`, `report` | start a run, one line of state, append a task, the last report |
+| - | `start`, `status`, `watch`, `add "task"`, `report` | start a run, one line of state, the wall as plain text, append a task, the last report |
 
 The editor is lmdeck's (`ui.editor`, then `$VISUAL`, `$EDITOR`, nvim), the pager `$PAGER` or `less`; both run in the
 wall's terminal and give it back when they exit, as the TUI's system-prompt editing does today.
@@ -152,7 +152,13 @@ wall's terminal and give it back when they exit, as the TUI's system-prompt edit
 ### Light on resources
 
 - The wall is the lmdeck binary (7.7 MB) in the TUI mode it already has: no browser, no compositor, no GPU (the
-  kernel console draws text on the CPU into the framebuffer). Expected around 10-20 MB of memory (to measure).
+  kernel console draws text on the CPU into the framebuffer). Measured 2026-10-26: the TUI holds 9.3 MB, of which
+  2.8 MB its own memory and 6.5 MB the binary's code, which is the same file the daemon (8.4 MB) already has in the
+  page cache. A separate, smaller binary for the wall would save a megabyte or two and duplicate code, so there is
+  one binary.
+- For ssh, scripts and the smallest footprint there is a plain CLI view as well: `lmdeck xtreme status` prints one
+  line, `lmdeck xtreme watch` reprints the wall as plain text when something changes (no full-screen TUI, no key
+  handling), and every key's action is a command (below).
 - It redraws when something changes: it waits on the daemon's existing long-poll (`/lmdeck/watch`) plus a clock
   tick every 10 s, instead of the TUI's 1 s poll. With the screen off it draws nothing.
 - The run itself lives in the daemon (a user service, so it survives the desktop going), as a state machine with its
