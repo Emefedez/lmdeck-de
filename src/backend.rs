@@ -223,7 +223,7 @@ fn strata_progress(text: &str, elapsed: f64) -> Option<serde_json::Value> {
             generated = None;
             seen = true;
             pts.push((secs, done, total));
-        } else if rest.starts_with("thinking:") || rest.starts_with("writing") {
+        } else if rest.starts_with("thinking:") || rest.starts_with("writing") || rest.starts_with("answering:") {
             // "<what>: N of budget|max ...": the number before the last " of " pair.
             if let Some(n) = rest.split(" of ").next().and_then(|h| h.rsplit(':').next()).and_then(num) {
                 generated = Some(n);
@@ -573,6 +573,14 @@ impl Manager {
                         crate::compat::recommend_fitting("chat").map(|r| format!(" (e.g. {r})")).unwrap_or_default()
                     );
                 }
+                // Strata's arena is sized from the heap (STRATA_VK_ARENA_BYTES = heap - floor), so it
+                // gets exactly the safe free memory, below the stock heap too: left to itself the
+                // engine keeps 7 GB back for "macOS" on top of lmdeck's reserves (a 1 GB arena with
+                // 12.6 GiB free, 2026-10-25).
+                if m.format == Format::Strata {
+                    let h = cap.max(want) & !((1u64 << 20) - 1);
+                    return Ok(Some(h));
+                }
                 // The heap is a ceiling, not an allocation: give the backend everything that is
                 // safe (free RAM minus the reserves) so long prompts have room for their KV cache.
                 cap.max(want).max(stock) & !((1u64 << 20) - 1)
@@ -905,7 +913,7 @@ impl Manager {
         if let Some(h) = heap {
             // Per-process GPU heap for this backend only (Honeykrisp HK_SYSMEM).
             env.push(("HK_SYSMEM".into(), h.to_string()));
-            sys::log(&format!("{}: GPU heap raised to {:.1} GiB for this backend", m.name, gib(h)));
+            sys::log(&format!("{}: GPU heap {:.1} GiB for this backend (stock {:.1})", m.name, gib(h), gib(crate::compat::gpu_budget())));
         }
         if cfg.server.uclamp_boost {
             if let Some(u) = which("uclampset") {
@@ -1451,9 +1459,10 @@ mod work_tests {
         assert_eq!(w["tokens_per_sec"], 102.4);
         let writing = format!("{reading}[strata] reading the prompt: 19,883 of 19,888 tokens, 190 s so far\n\
             [strata] thinking: 81 of budget 23022 (max 30695) tokens, 6.7 tok/s, 31 s\n\
-            [strata] writing a tool call: read_file: 90 of max 30695 tokens, 6.8 tok/s, 33 s\n");
+            [strata] writing a tool call: read_file: 90 of max 30695 tokens, 6.8 tok/s, 33 s\n\
+            [strata] answering: 1426 of max 29863 tokens, 4.3 tok/s, 366 s\n");
         let w = super::strata_progress(&writing, 200.0).unwrap();
-        assert_eq!((w["phase"].as_str(), w["prompt_tokens"].as_u64(), w["generated"].as_u64()), (Some("generating"), Some(19888), Some(90)));
+        assert_eq!((w["phase"].as_str(), w["prompt_tokens"].as_u64(), w["generated"].as_u64()), (Some("generating"), Some(19888), Some(1426)));
         // A finished request leaves nothing in flight to report; other backends' logs are not Strata's.
         let done = format!("{writing}[strata] done: 155 tokens in 44 s (6.3 tok/s) (stop, cancel=False)\n");
         assert_eq!(super::strata_progress(&done, 1.0).unwrap()["phase"], "waiting");

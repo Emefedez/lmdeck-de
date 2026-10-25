@@ -262,7 +262,7 @@ async fn ps(State(a): State<App>) -> Json<Value> {
     Json(json!({"models": models}))
 }
 
-async fn show(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
+async fn show(State(a): State<App>, headers: HeaderMap, AnyJson(b): AnyJson) -> Resp {
     let Some(name) = model_field(&b) else { return err(StatusCode::BAD_REQUEST, "model is required") };
     let m = match a.mgr.resolve(&name) {
         Ok(m) => m,
@@ -276,7 +276,7 @@ async fn show(State(a): State<App>, AnyJson(b): AnyJson) -> Resp {
         "general.basename": m.name.clone(),
         "general.size_label": m.params,
     });
-    info[format!("{arch}.context_length")] = json!(context_limit(&a.mgr.cfg(), &m));
+    info[format!("{arch}.context_length")] = json!(advertised_context(&a.mgr.cfg(), &m, &headers));
     Json(json!({
         "license": "",
         "modelfile": format!("# served by lmdeck\nFROM {}\n", m.path.display()),
@@ -1039,6 +1039,24 @@ fn strata_prefix(cfg: &Config, m: &LocalModel, body: &mut Value) {
     if estimate_tokens(&head) >= 512 {
         body["strata_prefix"] = json!({"messages": 1});
     }
+}
+
+/// The window a client is told. VS Code Copilot counts its whole request, the tool schemas lmdeck
+/// drops included, against it and compacts the conversation once that count nears the window: a
+/// ~37k request trimmed to ~4.5k was compacted at 32k. Copilot is told the window plus 90% of what
+/// lmdeck drops; the context guard still holds the trimmed prompt to the real window.
+fn advertised_context(cfg: &Config, m: &LocalModel, headers: &HeaderMap) -> u64 {
+    let limit = context_limit(cfg, m);
+    let ua = headers.get("user-agent").and_then(|u| u.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+    if !(ua.contains("copilot") || ua.contains("vscode")) {
+        return limit;
+    }
+    let extra = crate::toolrules::copilot_dropped_tokens(cfg) * 9 / 10;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if extra > 0 && LAST.swap(limit + extra, std::sync::atomic::Ordering::Relaxed) != limit + extra {
+        sys::log(&format!("{}: VS Code is told a {} -token window ({limit} + {extra} for the tool schemas lmdeck drops)", m.name, limit + extra));
+    }
+    limit + extra
 }
 
 /// Rough token count of a chat body: ~3.8 characters per token over the JSON of the messages

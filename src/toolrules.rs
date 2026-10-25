@@ -117,6 +117,19 @@ pub fn status(client: &str, name: &str, mode: ToolMode, rules: &Rules) -> &'stat
     }
 }
 
+/// Tokens of the tool schemas Copilot sends that lmdeck drops before the model sees them (from
+/// the last tool list VS Code sent, tools-seen.json). Copilot counts them against the context
+/// window it is told, so without them in the advertised window it compacts conversations the
+/// model still has plenty of room for.
+pub fn copilot_dropped_tokens(cfg: &crate::config::Config) -> u64 {
+    let mode = ToolMode::parse(&cfg.server.local_tools);
+    let rules = Rules::from_cfg(cfg);
+    seen()["copilot"]["tools"].as_array().into_iter().flatten()
+        .filter(|t| matches!(status("copilot", t["name"].as_str().unwrap_or(""), mode, &rules), "dropped" | "denied" | "group"))
+        .map(|t| t["tokens"].as_u64().unwrap_or(0))
+        .sum()
+}
+
 fn seen_path() -> std::path::PathBuf {
     crate::config::state_dir().join("tools-seen.json")
 }
