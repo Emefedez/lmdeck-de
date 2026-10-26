@@ -35,11 +35,13 @@ case "$*" in
         "$exe" xtreme wall
     fi
     exec /usr/bin/chvt "$vt" ;;
-  # away mode: Tailscale only while away, lmdeck's API to the tailnet only (it keeps listening on localhost)
+  # away mode: Tailscale only while away, and to the tailnet only the model APIs (Ollama /api, OpenAI and Anthropic
+  # /v1); lmdeck's control API (/lmdeck/*, which can change settings and run hooks) stays on localhost
   remote-on)
     /usr/bin/systemctl start tailscaled.service
     /usr/bin/tailscale up >/dev/null 2>&1 || true
-    exec /usr/bin/tailscale serve --bg --tcp=11434 tcp://127.0.0.1:11434 ;;
+    /usr/bin/tailscale serve --bg --http=11434 --set-path=/v1 http://127.0.0.1:11434/v1
+    exec /usr/bin/tailscale serve --bg --http=11434 --set-path=/api http://127.0.0.1:11434/api ;;
   remote-off)
     /usr/bin/tailscale serve reset 2>/dev/null || true
     exec /usr/bin/systemctl stop tailscaled.service ;;

@@ -692,6 +692,10 @@ pub fn resume(mgr: Arc<Manager>) {
         });
         let cfg = mgr.cfg();
         RESERVE.store((cfg.xtreme.reserve_gib.max(0.0) * (1u64 << 30) as f64) as u64, Ordering::Relaxed);
+        // The sleep lock went with the last daemon.
+        if !st.dry_run && !rebooted {
+            *XT.inhibit.lock().unwrap() = take_sleep_lock();
+        }
     }
     spawn_driver(mgr);
 }
@@ -1701,6 +1705,10 @@ pub fn view() -> Value {
         .unwrap_or_default();
     let (ac, charge) = power();
     let mut state = serde_json::to_value(&st).unwrap_or_default();
+    // The agent's PATH stays in state.json; /lmdeck/status does not need it.
+    if let Some(o) = state.as_object_mut() {
+        o.remove("path_env");
+    }
     if let Some(l) = state["log"].as_array_mut() {
         let n = l.len();
         l.drain(..n.saturating_sub(40));

@@ -169,9 +169,9 @@ into and as a model server.
 
 - **Tailscale only while away.** `tailscaled` stays disabled normally; away mode starts it and a normal stop stops it
   again (helper steps `remote-on` / `remote-off`). From the other laptop, `ssh m1-max` (the tailnet name) gives the
-  wall (`lmdeck xtreme`, the same panel over ssh), the shell and nvim. `tailscale serve` exposes lmdeck's API
-  (`127.0.0.1:11434`) to the tailnet only, so agents on the ThinkPad can use the MacBook's models; lmdeck itself keeps
-  listening on localhost. ufw lets in only `tailscale0` (`ufw allow in on tailscale0`), nothing from the LAN.
+  wall (`lmdeck xtreme`, the same panel over ssh), the shell and nvim. `tailscale serve` exposes lmdeck's model
+  APIs (`/v1`, `/api` on port 11434) to the tailnet only, so agents on the ThinkPad can use the MacBook's models;
+  lmdeck itself keeps listening on localhost, and its control API stays local (steer the run over ssh). ufw lets in only `tailscale0` (`ufw allow in on tailscale0`), nothing from the LAN.
 - **Power.** Away mode refuses to start on battery. It sets the charge limit to 80%
   (`/sys/class/power_supply/macsmc-battery/charge_control_end_threshold`, now 100) for the week and restores it on
   stop (helper step `battery-limit 80|100`).
@@ -196,8 +196,9 @@ sudo ufw allow in on tailscale0
 ```
 
 The helper's steps for it (`remote-on`, `remote-off`, `battery-limit 80|100`, `watchdog-on|off`) are in `xtreme/`;
-reinstall the helper and the sudoers rule once (below). `tailscale serve --tcp` forwards port 11434 on the tailnet
-to lmdeck; not tried yet (Tailscale is not installed here).
+reinstall the helper and the sudoers rule once (below). `tailscale serve` forwards only `/v1` and `/api` (the
+model APIs) on port 11434 of the tailnet; lmdeck's control API (`/lmdeck/*`, which can change settings, run hooks
+and start runs) is not forwarded. Not tried yet (Tailscale is not installed here).
 
 ### Stop
 
