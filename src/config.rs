@@ -18,6 +18,7 @@ pub struct Config {
     pub usage: UsageCfg,
     pub vscode: VscodeCfg,
     pub ui: UiCfg,
+    pub xtreme: XtremeCfg,
     /// Short names: `alias = "org/repo[:tag]"`.
     pub aliases: BTreeMap<String, String>,
     /// Per-model overrides keyed by full model name.
@@ -282,6 +283,63 @@ pub struct UiCfg {
     pub favorites: Vec<String>,
 }
 
+/// XTreme mode (docs/XTREME.md): the desktop off, the model in the freed memory, coding agents
+/// working through a task list in fresh, bounded sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct XtremeCfg {
+    /// The task list (a `## title` section per task); empty = ~/.config/lmdeck/xtreme/tasks.md.
+    pub tasks: String,
+    /// The model a run loads; empty = the first Strata model, else the first local one.
+    pub model: String,
+    /// The headless agent: "claude" (Claude Code, -p) or "opencode" (opencode run).
+    pub agent: String,
+    /// Extra arguments for the agent, e.g. ["--strict-mcp-config"] to leave the MCP servers out.
+    pub agent_args: Vec<String>,
+    /// Agent turns per session.
+    pub max_turns: u32,
+    /// Wall time per session.
+    pub session_minutes: u32,
+    /// Sessions per task before the run moves on.
+    pub max_sessions: u32,
+    /// Thinking tokens per reply during a run (Strata's reasoning_budget_tokens; 0 = the engine's).
+    pub thinking_budget: u32,
+    /// Memory kept out of the model's arena for editing and builds during a run (GiB); replaces
+    /// server.mem_reserve_gib while the run holds.
+    pub reserve_gib: f64,
+    /// "off" = the panel off from the start (a key brings it back), "on" = the wall stays visible.
+    pub screen: String,
+    /// Seconds without a key before the wall turns the panel off (0 = never).
+    pub screen_idle_secs: u32,
+    /// Minutes before the end in which no new session starts.
+    pub wind_down_minutes: u32,
+    /// Minutes a task's check command may take.
+    pub check_minutes: u32,
+    /// Refuse to start on battery below this charge (%); away mode refuses on battery at all.
+    pub min_battery: u32,
+}
+
+impl Default for XtremeCfg {
+    fn default() -> Self {
+        Self {
+            tasks: String::new(),
+            model: String::new(),
+            agent: "claude".into(),
+            agent_args: vec![],
+            max_turns: 40,
+            session_minutes: 45,
+            max_sessions: 6,
+            thinking_budget: 3072,
+            reserve_gib: 2.0,
+            screen: "off".into(),
+            screen_idle_secs: 120,
+            wind_down_minutes: 15,
+            check_minutes: 10,
+            min_battery: 50,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UsageCfg {
@@ -332,6 +390,7 @@ impl Default for Config {
             usage: UsageCfg::default(),
             vscode: VscodeCfg::default(),
             ui: UiCfg::default(),
+            xtreme: XtremeCfg::default(),
             aliases: BTreeMap::new(),
             overrides: BTreeMap::new(),
         }
@@ -878,6 +937,17 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "Integration", key: "vscode.inline_model", kind: Kind::ToolModel, help: "Model for VS Code inline chat / Fix (empty = vscode.model)" },
     Setting { section: "Integration", key: "vscode.chat_model", kind: Kind::ToolModel, help: "Model for VS Code chat (empty = vscode.model)" },
     Setting { section: "Integration", key: "usage.omarchy_record", kind: Kind::Bool, help: "Show lmdeck token usage in the Omarchy agents bar panel" },
+    Setting { section: "XTreme", key: "xtreme.tasks", kind: Kind::Text, help: "Task list for XTreme runs (empty = ~/.config/lmdeck/xtreme/tasks.md)" },
+    Setting { section: "XTreme", key: "xtreme.model", kind: Kind::Text, help: "Model an XTreme run loads (empty = the first Strata model)" },
+    Setting { section: "XTreme", key: "xtreme.agent", kind: Kind::Choice(&["claude", "opencode"]), help: "Headless agent for XTreme sessions" },
+    Setting { section: "XTreme", key: "xtreme.agent_args", kind: Kind::Text, help: "Extra agent arguments (space separated), e.g. --strict-mcp-config" },
+    Setting { section: "XTreme", key: "xtreme.max_turns", kind: Kind::Number, help: "Agent turns per session" },
+    Setting { section: "XTreme", key: "xtreme.session_minutes", kind: Kind::Number, help: "Wall time per session (minutes)" },
+    Setting { section: "XTreme", key: "xtreme.max_sessions", kind: Kind::Number, help: "Sessions per task before the run moves on" },
+    Setting { section: "XTreme", key: "xtreme.thinking_budget", kind: Kind::Number, help: "Thinking tokens per reply during a run (0 = the engine's)" },
+    Setting { section: "XTreme", key: "xtreme.reserve_gib", kind: Kind::Gib, help: "Memory kept out of the arena for editing and builds during a run (GiB)" },
+    Setting { section: "XTreme", key: "xtreme.screen", kind: Kind::Choice(&["off", "on"]), help: "Panel at the start of a run: off (a key brings it back) / on" },
+    Setting { section: "XTreme", key: "xtreme.screen_idle_secs", kind: Kind::Number, help: "Seconds without a key before the wall turns the panel off (0 = never)" },
     Setting { section: "Integration", key: "usage.perf", kind: Kind::Bool, help: "Record each model's speed and system power while it generates, for the grader (off: the grader estimates them). Costs one sensor read every 2 s while a request runs and ~10 KB" },
 ];
 
@@ -958,6 +1028,17 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "mlx.system_prompt_mode" => c.mlx.system_prompt_mode.clone(),
         "llama.system_prompt" => crate::sysprompt::to_line(&crate::sysprompt::backend_text(crate::models::Format::Gguf)),
         "ui.editor" => c.ui.editor.clone(),
+        "xtreme.tasks" => c.xtreme.tasks.clone(),
+        "xtreme.model" => c.xtreme.model.clone(),
+        "xtreme.agent" => c.xtreme.agent.clone(),
+        "xtreme.agent_args" => c.xtreme.agent_args.join(" "),
+        "xtreme.max_turns" => c.xtreme.max_turns.to_string(),
+        "xtreme.session_minutes" => c.xtreme.session_minutes.to_string(),
+        "xtreme.max_sessions" => c.xtreme.max_sessions.to_string(),
+        "xtreme.thinking_budget" => c.xtreme.thinking_budget.to_string(),
+        "xtreme.reserve_gib" => c.xtreme.reserve_gib.to_string(),
+        "xtreme.screen" => c.xtreme.screen.clone(),
+        "xtreme.screen_idle_secs" => c.xtreme.screen_idle_secs.to_string(),
         "strata.dir" => c.strata.dir.clone(),
         "strata.git_ref" => c.strata.git_ref.clone(),
         "strata.engine" => c.strata.engine.clone(),
@@ -1091,6 +1172,23 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
             crate::sysprompt::set_backend_text(f, &crate::sysprompt::from_line(v)).map_err(|e| e.to_string())?
         }
         "ui.editor" => c.ui.editor = v.into(),
+        "xtreme.tasks" => c.xtreme.tasks = v.into(),
+        "xtreme.model" => c.xtreme.model = v.into(),
+        "xtreme.agent" => match v {
+            "claude" | "opencode" => c.xtreme.agent = v.into(),
+            _ => return Err("claude or opencode".into()),
+        },
+        "xtreme.agent_args" => c.xtreme.agent_args = v.split_whitespace().map(str::to_string).collect(),
+        "xtreme.max_turns" => c.xtreme.max_turns = (num(v)? as u32).clamp(1, 500),
+        "xtreme.session_minutes" => c.xtreme.session_minutes = (num(v)? as u32).clamp(1, 24 * 60),
+        "xtreme.max_sessions" => c.xtreme.max_sessions = (num(v)? as u32).clamp(1, 100),
+        "xtreme.thinking_budget" => c.xtreme.thinking_budget = num(v)? as u32,
+        "xtreme.reserve_gib" => c.xtreme.reserve_gib = v.parse::<f64>().map_err(|_| "not a number".to_string())?.clamp(0.0, 16.0),
+        "xtreme.screen" => match v {
+            "off" | "on" => c.xtreme.screen = v.into(),
+            _ => return Err("off or on".into()),
+        },
+        "xtreme.screen_idle_secs" => c.xtreme.screen_idle_secs = num(v)? as u32,
         "strata.dir" => c.strata.dir = v.into(),
         "strata.git_ref" => c.strata.git_ref = v.into(),
         "strata.engine" => match v {
@@ -1148,8 +1246,8 @@ pub fn applies(key: &str) -> &'static str {
 }
 
 pub fn needs_reload(key: &str) -> bool {
-    if key.ends_with(".system_prompt") || key.ends_with(".system_prompt_mode") || key.starts_with("ui.") {
-        return false; // applied per request
+    if key.ends_with(".system_prompt") || key.ends_with(".system_prompt_mode") || key.starts_with("ui.") || key.starts_with("xtreme.") {
+        return false; // applied per request (xtreme.*: at the next run or session)
     }
     key.starts_with("mlx.")
         || (key.starts_with("llama.") && !matches!(key, "llama.git_ref" | "llama.repo"))

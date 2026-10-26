@@ -84,13 +84,25 @@ Nothing polls, and no model names are hardcoded:
 
 Details and the formula are in [docs/REFERENCE.md](docs/REFERENCE.md#model-grader).
 
-## XTreme mode (planned)
+## XTreme mode
 
 For long unattended runs (a night of bug fixing, batches of reverse-engineering questions), XTreme mode turns the
 laptop into a headless model server. The graphical desktop stops and the panel turns off. Strata reloads into the
 freed memory, and coding agents work through a task list in fresh, bounded sessions. At the end the desktop comes
-back with a report. The design is [docs/XTREME.md](docs/XTREME.md). The one-time setup is done on this machine;
-the mode itself is not implemented yet.
+back with a report. Details in [docs/XTREME.md](docs/XTREME.md). Implemented; checked with dry runs (the loop with a
+fake agent), not yet run for real with the desktop off.
+
+```
+lmdeck xtreme tasks              # write the task list: a "## title" section a task (repo:, check:, turns:, minutes:)
+lmdeck xtreme start --hours 8    # or --until 07:30, or no end; --dry-run leaves the desktop, screen and model alone
+lmdeck xtreme                    # the wall, in any terminal or over ssh; tab 7 of the TUI is the same panel
+lmdeck xtreme stop               # agents stop, the model unloads, the desktop comes back, report.md is written
+```
+
+Each task works on its own branch (`xtreme/<task>`) in a worktree, so your checkout is never touched; the agent
+commits what works and keeps its notes in the task's `PROGRESS.md`, which is all the next session knows. A task ends
+as done (its notes say `STATUS: done` and its `check:` passes), blocked, stuck (two sessions with no commit and no
+note) or out of sessions.
 
 **Why.** Strata keeps as many experts in memory as are free when it loads, and that sets decode speed:
 
@@ -163,7 +175,8 @@ terminal (also over ssh), and as a summary card with *Start XTreme...* in the ba
 | space / `n` | `pause` / `skip` | hold after this turn / go to the next task |
 | `s` / `q` / `X` | `screen off\|on` / - / `stop` | toggle the panel fully off / leave the wall (the run goes on) / end the run, desktop back |
 | `o` / `!` | `open [FILE]` / - | pick a file and open it in nvim / a shell |
-| - | `start`, `status`, `watch`, `add "task"`, `report` | start, one line of state, the wall as plain text, append a task, the last report |
+| `+` | `extend` | one more hour before the desktop comes back |
+| - | `start`, `status`, `watch`, `add "task"`, `report`, `plan`, `ip` | start, one line of state, the wall as plain text, append a task, the last report, the TUI on its XTreme tab, addresses and ports |
 
 **Using the machine during a run.** Only the graphical session stops. The network, sshd, tmux and the other consoles
 stay, so the machine works as a headless dev box on its own:
@@ -191,8 +204,9 @@ Code: 343 MB), so sessions run one at a time.
   `screen-off` and `screen-on`. `/etc/sudoers.d/lmdeck-xtreme` allows those four arguments only, without a password.
   Sources and install steps are in `xtreme/` and the plan.
 - `w3m`, `r2ghidra` and `terminus-font` are installed for working on the text console.
-- Still to add with the build: the helper's fifth step, `wall` (open the wall on its own console as the user), and
-  its argument in the sudoers rule.
+- The helper now has more steps (`wall`, and for away mode `remote-on|off`, `battery-limit 80|100`,
+  `watchdog-on|off`): install it and the sudoers rule again (commands in [docs/XTREME.md](docs/XTREME.md#one-time-setup-done-on-this-machine-2026-10-26)).
+  `lmdeck xtreme start` checks each step with `sudo -n -l` and refuses before touching anything if one is missing.
 
 ## Docs
 
@@ -200,8 +214,8 @@ Code: 343 MB), so sessions run one at a time.
 - [RESULTS.md](docs/RESULTS.md): what was measured, with what
 - [NOT-WORKED.md](docs/NOT-WORKED.md): what was tried and did not help, and why
 - [IDEAS.md](docs/IDEAS.md): what could come next
-- [XTREME.md](docs/XTREME.md): XTreme mode (planned): desktop off, screen off, the freed memory to Strata, and coding
-  agents in fresh bounded sessions for an unattended night
+- [XTREME.md](docs/XTREME.md): XTreme mode: desktop off, screen off, the freed memory to Strata, and coding agents in
+  fresh bounded sessions for an unattended night
 - [LIMITATIONS.md](docs/LIMITATIONS.md): what does not work, or was never tested
 - [MODELS.md](docs/MODELS.md): what runs, and how to tell before downloading
 - [PLAN-strata-in-editors.md](docs/PLAN-strata-in-editors.md): the plan to make Strata fast in VS Code and coding agents

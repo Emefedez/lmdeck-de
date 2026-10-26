@@ -3,12 +3,50 @@
 set -eu
 fb=/sys/class/graphics/fb0/blank
 bl=/sys/class/backlight/apple-panel-bl/bl_power
-case "${1:-}" in
+bat=/sys/class/power_supply/macsmc-battery/charge_control_end_threshold
+# The wall's console: above the six that logind gives gettys (NAutoVTs), so nothing else claims it.
+vt=8
+# sudo passes the arguments one by one; the rule matches them as one string, and so does this
+case "$*" in
   desktop-stop)  exec /usr/bin/systemctl stop sddm.service ;;
-  desktop-start) exec /usr/bin/systemctl start sddm.service ;;
+  desktop-start)
+    # SDDM takes its own VT; the wall's console goes with the run.
+    /usr/bin/systemctl stop lmdeck-xtreme-wall.service 2>/dev/null || true
+    exec /usr/bin/systemctl start sddm.service ;;
   # panel off through the console's framebuffer (DRM fbdev blank, 4 = powerdown); the backlight too, in case the
   # blank alone leaves it lit
   screen-off) echo 4 > "$fb" 2>/dev/null || true; [ -w "$bl" ] && echo 4 > "$bl"; exit 0 ;;
   screen-on)  [ -w "$bl" ] && echo 0 > "$bl"; echo 0 > "$fb" 2>/dev/null || true; exit 0 ;;
-  *) echo "usage: lmdeck-xtreme-root desktop-stop|desktop-start|screen-off|screen-on" >&2; exit 2 ;;
+  # the wall on a console of its own, as the user who ran sudo, with the Terminus 16x32 font (that console only)
+  wall)
+    u="${SUDO_USER:?run through sudo}"
+    h=$(getent passwd "$u" | cut -d: -f6)
+    exe="$h/.local/bin/lmdeck"
+    [ -x "$exe" ] || exe=/usr/bin/lmdeck
+    /usr/bin/setfont -C "/dev/tty$vt" ter-132n 2>/dev/null || true
+    # a system unit of its own, so the wall outlives whoever started it (lmdeck's service restarting included)
+    if ! /usr/bin/systemctl is-active --quiet lmdeck-xtreme-wall.service; then
+      /usr/bin/systemd-run --quiet --unit=lmdeck-xtreme-wall --collect --uid="$u" --gid="$(id -g "$u")" \
+        -p TTYPath="/dev/tty$vt" -p StandardInput=tty-force -p StandardOutput=tty -p StandardError=journal \
+        -p TTYReset=yes -p TTYVHangup=yes -p WorkingDirectory="$h" \
+        -E HOME="$h" -E USER="$u" -E LOGNAME="$u" -E TERM=linux -E LANG="${LANG:-C.UTF-8}" \
+        -E PATH="$h/.local/bin:/usr/local/bin:/usr/bin" -E XDG_RUNTIME_DIR="/run/user/$(id -u "$u")" \
+        -E DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u "$u")/bus" \
+        "$exe" xtreme wall
+    fi
+    exec /usr/bin/chvt "$vt" ;;
+  # away mode: Tailscale only while away, lmdeck's API to the tailnet only (it keeps listening on localhost)
+  remote-on)
+    /usr/bin/systemctl start tailscaled.service
+    /usr/bin/tailscale up >/dev/null 2>&1 || true
+    exec /usr/bin/tailscale serve --bg --tcp=11434 tcp://127.0.0.1:11434 ;;
+  remote-off)
+    /usr/bin/tailscale serve reset 2>/dev/null || true
+    exec /usr/bin/systemctl stop tailscaled.service ;;
+  "battery-limit 80") echo 80 > "$bat" ;;
+  "battery-limit 100") echo 100 > "$bat" ;;
+  # systemd's runtime watchdog (/dev/watchdog0): a hung machine reboots after 60 s; off again on stop
+  watchdog-on)  exec /usr/bin/busctl set-property org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RuntimeWatchdogUSec t 60000000 ;;
+  watchdog-off) exec /usr/bin/busctl set-property org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RuntimeWatchdogUSec t 0 ;;
+  *) echo "usage: lmdeck-xtreme-root desktop-stop|desktop-start|screen-off|screen-on|wall|remote-on|remote-off|'battery-limit 80|100'|watchdog-on|watchdog-off" >&2; exit 2 ;;
 esac

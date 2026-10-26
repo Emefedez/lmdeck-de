@@ -248,8 +248,8 @@ Item {
   Timer { id: retryReset; interval: 8000; onTriggered: lm._retryFast = false }
   Timer { id: pendingTimeout; interval: 15000; onTriggered: lm.pending = false }
 
-  function openTui() {
-    Quickshell.execDetached(["omarchy-launch-or-focus-tui", "lmdeck"])
+  function openTui(args) {
+    Quickshell.execDetached(["omarchy-launch-or-focus-tui", "lmdeck"].concat(args || []))
   }
 
   // ---- formatting ----

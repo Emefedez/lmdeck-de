@@ -13,6 +13,7 @@ mod models;
 mod popup;
 mod settings;
 mod widgets;
+mod xtreme;
 
 use crate::client::{self, Daemon};
 use crate::config::Config;
@@ -33,6 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 pub use widgets::load_label;
+pub use xtreme::wall_text;
 use widgets::Act;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,8 +45,9 @@ enum Tab {
     Backends,
     Settings,
     Logs,
+    Xtreme,
 }
-const TABS: [Tab; 6] = [Tab::Home, Tab::Models, Tab::Discover, Tab::Backends, Tab::Settings, Tab::Logs];
+const TABS: [Tab; 7] = [Tab::Home, Tab::Models, Tab::Discover, Tab::Backends, Tab::Settings, Tab::Logs, Tab::Xtreme];
 impl Tab {
     fn title(self) -> &'static str {
         match self {
@@ -54,13 +57,14 @@ impl Tab {
             Tab::Backends => "Backends",
             Tab::Settings => "Settings",
             Tab::Logs => "Logs",
+            Tab::Xtreme => "XTreme",
         }
     }
 }
 
 /// Keys that work on every screen (shown in the Keys popup).
 const GLOBAL_KEYS: &[(&str, &str)] = &[
-    ("1-6, Tab", "switch screens"),
+    ("1-7, Tab", "switch screens"),
     ("g", "recommend a model (Models sorted by the grader; again: next goal)"),
     ("?", "keys of this screen"),
     ("q", "quit (the server keeps running)"),
@@ -93,6 +97,8 @@ enum Action {
     Exec(String, Vec<String>),
     /// An editor: runs in the terminal and returns straight to lmdeck (no "press Enter").
     Edit(Vec<String>),
+    /// XTreme: an editor, shell or pager from the wall (closed when the panel goes off).
+    Job(xtreme::Job),
 }
 
 #[derive(Clone, Copy)]
@@ -151,9 +157,28 @@ struct Ui {
     logs_model: bool,
     logs_scroll: u16,
     logs: String,
+    // XTreme
+    xt: xtreme::XtUi,
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
+    run_ui(cfg, false).await
+}
+
+/// The TUI opened on its XTreme tab (the bar panel's "Start XTreme…").
+pub async fn run_xtreme_tab(cfg: Config) -> Result<()> {
+    START_XTREME.store(true, Ordering::Relaxed);
+    run_ui(cfg, false).await
+}
+static START_XTREME: AtomicBool = AtomicBool::new(false);
+
+/// The XTreme wall: the XTreme screen full screen, redrawn on the daemon's long-poll and a 10 s
+/// clock tick instead of the TUI's 1 s poll.
+pub async fn run_wall(cfg: Config) -> Result<()> {
+    run_ui(cfg, true).await
+}
+
+async fn run_ui(cfg: Config, wall: bool) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     let pause = Arc::new(AtomicBool::new(false));
     spawn_input(tx.clone(), pause.clone());
@@ -161,15 +186,41 @@ pub async fn run(cfg: Config) -> Result<()> {
         let tx = tx.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_secs(if wall { 10 } else { 1 })).await;
                 if tx.send(Msg::Tick).is_err() {
                     break;
                 }
             }
         });
     }
+    if wall {
+        let tx = tx.clone();
+        let d = Daemon::new(cfg.base_url());
+        tokio::spawn(async move {
+            let mut since = 0u64;
+            loop {
+                let url = format!("{}/lmdeck/watch?since={since}&timeout=55", d.base);
+                match d.http().get(url).timeout(Duration::from_secs(70)).send().await {
+                    Ok(r) => {
+                        let v: Option<Value> = r.json().await.ok();
+                        since = v.as_ref().and_then(|v| v["event"].as_u64()).unwrap_or(since);
+                        if tx.send(Msg::Status(v)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_secs(5)).await,
+                }
+            }
+        });
+    }
     let mut ui = Ui::new(cfg, tx.clone());
-    ui.refresh_versions();
+    if wall || START_XTREME.load(Ordering::Relaxed) {
+        ui.tab = Tab::Xtreme;
+        ui.xt.wall = wall;
+    }
+    if !wall {
+        ui.refresh_versions();
+    }
     ui.poll_status();
 
     let mut term = ratatui::init();
@@ -240,6 +291,11 @@ fn suspend_run(term: &mut DefaultTerminal, pause: &AtomicBool, a: Action) {
             restore(term);
             return;
         }
+        Action::Job(job) => {
+            xtreme::run_job(job);
+            restore(term);
+            return;
+        }
         Action::Script(t, s) => {
             let mut c = std::process::Command::new("bash");
             c.arg("-c").arg(s);
@@ -300,6 +356,7 @@ impl Ui {
             logs_model: false,
             logs_scroll: 0,
             logs: String::new(),
+            xt: Default::default(),
         }
     }
 
@@ -408,8 +465,11 @@ impl Ui {
             }
         }
         self.cfg = Config::load().unwrap_or_else(|_| self.cfg.clone());
-        self.refresh_versions();
-        self.rescan();
+        self.xtreme_after_job();
+        if !self.xt.wall {
+            self.refresh_versions();
+            self.rescan();
+        }
         self.poll_status();
     }
 
@@ -417,6 +477,7 @@ impl Ui {
         match m {
             Msg::Tick => {
                 self.poll_status();
+                self.xtreme_tick();
                 if self.tab == Tab::Logs {
                     self.load_logs();
                 }
@@ -502,6 +563,7 @@ impl Ui {
             Tab::Backends => self.backends_actions(),
             Tab::Settings => self.settings_actions(),
             Tab::Logs => self.logs_actions(),
+            Tab::Xtreme => self.xtreme_actions(),
         }
     }
 
@@ -513,11 +575,14 @@ impl Ui {
         if self.popup.is_some() {
             return self.popup_key(k);
         }
+        if self.xtreme_wants() {
+            return self.xtreme_key(k);
+        }
         match k.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.popup = Some(Popup::Keys(0)),
             KeyCode::Char('g') => self.recommend(),
-            KeyCode::Char(c @ '1'..='6') => self.set_tab(TABS[(c as u8 - b'1') as usize]),
+            KeyCode::Char(c @ '1'..='7') => self.set_tab(TABS[(c as u8 - b'1') as usize]),
             KeyCode::Tab | KeyCode::BackTab => {
                 let i = TABS.iter().position(|t| *t == self.tab).unwrap();
                 let n = TABS.len();
@@ -546,6 +611,7 @@ impl Ui {
             Tab::Backends => self.backends_act(key),
             Tab::Settings => self.settings_act(key),
             Tab::Logs => self.logs_act(key),
+            Tab::Xtreme => self.xtreme_act(key),
         }
     }
 
@@ -561,7 +627,7 @@ impl Ui {
             _ => return,
         };
         match self.tab {
-            Tab::Home => {}
+            Tab::Home | Tab::Xtreme => {}
             Tab::Models => {
                 let n = self.models.len();
                 widgets::move_sel(&mut self.models_sel, n, d);
@@ -681,6 +747,10 @@ impl Ui {
 
     fn draw(&mut self, f: &mut Frame) {
         self.clicks.clear();
+        if self.xt.wall {
+            self.draw_xtreme(f, f.area());
+            return;
+        }
         let [top, body, foot] = Layout::vertical([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)]).areas(f.area());
         self.draw_tabs(f, top);
         let acts = self.actions();
@@ -694,6 +764,7 @@ impl Ui {
             Tab::Backends => self.draw_backends(f, content),
             Tab::Settings => self.draw_settings(f, content),
             Tab::Logs => self.draw_logs(f, content),
+            Tab::Xtreme => self.draw_xtreme(f, content),
         }
         let foot_line = match &self.toast {
             Some((t, _)) => Line::from(Span::styled(t.clone(), Style::new().fg(Color::Yellow))),

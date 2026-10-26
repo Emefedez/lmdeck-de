@@ -16,6 +16,7 @@ mod toolrules;
 mod tui;
 mod usage;
 mod vscode;
+mod xtreme;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -120,6 +121,12 @@ enum Cmd {
         value: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// XTreme mode: desktop off, the model in the freed memory, agents on a task list (docs/XTREME.md);
+    /// without a command, the wall
+    Xtreme {
+        #[command(subcommand)]
+        cmd: Option<xtreme::XtCmd>,
     },
     /// Run a coding agent on a local model (like `ollama launch`):
     /// claude | codex | opencode | t3 (registers a T3 Code provider, opens t1code)
@@ -382,6 +389,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Some(Cmd::Xtreme { cmd }) => xtreme::cli(&cfg, &d, cmd).await,
         Some(Cmd::Launch { app, model, args }) => launch::run(&cfg, &d, &app, model, args).await,
         Some(Cmd::Vscode) => {
             if vscode::reset_settings_lines()? {

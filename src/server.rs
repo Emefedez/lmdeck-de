@@ -116,8 +116,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/lmdeck/plan", get(lm_plan))
         .route("/lmdeck/vscode", get(lm_vscode))
         .route("/lmdeck/vscode/state", post(lm_vscode_state))
+        .route("/lmdeck/xtreme", get(lm_xtreme))
+        .route("/lmdeck/xtreme/{action}", post(lm_xtreme_action))
         .layer(axum::middleware::from_fn(log_requests))
         .with_state(app.clone());
+
+    // An XTreme run the last daemon left carries on (or ends, after a reboot).
+    crate::xtreme::resume(app.mgr.clone());
 
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| anyhow::anyhow!("binding {addr}: {e} (is Ollama or another lmdeck running?)"))?;
     sys::log(&format!("lmdeck {} listening on http://{addr}", env!("CARGO_PKG_VERSION")));
@@ -1021,6 +1026,7 @@ pub fn context_limit(cfg: &Config, m: &LocalModel) -> u64 {
 fn prepare_body(cfg: &Config, m: &LocalModel, body: &mut Value) {
     crate::sysprompt::apply_for(cfg, m, body);
     strata_prefix(cfg, m, body);
+    crate::xtreme::request_hints(m, body);
 }
 
 /// `strata.prefix_reuse = system`: mark the system message as a shared prefix. Strata's server
@@ -1755,6 +1761,7 @@ fn status_value(a: &App) -> Value {
         "usage": USAGE.summary(),
         "settings": quick,
         "vscode_active": a.vscode_active.lock().unwrap().clone(),
+        "xtreme": crate::xtreme::view(),
     })
 }
 
@@ -2124,6 +2131,27 @@ async fn lm_vscode_state(State(a): State<App>, AnyJson(b): AnyJson) -> Json<Valu
     *a.vscode_active.lock().unwrap() = active;
     EVENTS.bump();
     Json(json!({"ok": true}))
+}
+
+async fn lm_xtreme() -> Json<Value> {
+    Json(crate::xtreme::view())
+}
+
+/// XTreme mode: start (the checks, then the run in the background), stop, pause, resume, skip,
+/// extend, screen, add.
+async fn lm_xtreme_action(State(a): State<App>, Path(action): Path<String>, AnyJson(b): AnyJson) -> Resp {
+    let r = if action == "start" {
+        match serde_json::from_value::<crate::xtreme::StartReq>(b) {
+            Ok(req) => crate::xtreme::start(a.mgr.clone(), req),
+            Err(e) => Err(e.to_string()),
+        }
+    } else {
+        crate::xtreme::control(a.mgr.clone(), &action, &b)
+    };
+    match r {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
 }
 
 async fn lm_compat(State(a): State<App>) -> Json<Value> {

@@ -109,7 +109,7 @@ pub async fn run(cfg: &Config, d: &Daemon, app: &str, model: Option<String>, arg
     Err(err).context(format!("launching {app}"))
 }
 
-fn opencode_config(cfg: &Config, model: &str) -> Value {
+pub fn opencode_config(cfg: &Config, model: &str) -> Value {
     let models: serde_json::Map<String, Value> = crate::models::scan(cfg)
         .into_iter()
         .map(|m| (m.name.clone(), json!({"name": format!("{} (lmdeck)", m.name)})))

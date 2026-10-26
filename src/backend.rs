@@ -517,7 +517,7 @@ impl Manager {
         let need = self.gpu_need(m);
         let stock = crate::compat::gpu_budget();
         let gi = |b: u64| gib(b);
-        let reserve = (cfg.server.mem_reserve_gib * (1u64 << 30) as f64) as u64
+        let reserve = crate::xtreme::reserve_bytes(&cfg)
             + if crate::sys::muvm_rss().is_some() { (cfg.server.vm_reserve_gib.max(0.0) * (1u64 << 30) as f64) as u64 } else { 0 };
         let (total, avail) = sys::mem();
         let policy = cfg.server.gpu_heap.trim().to_lowercase();
@@ -676,7 +676,7 @@ impl Manager {
                 m.name,
                 gib(need),
                 gib(avail),
-                cfg.server.mem_reserve_gib
+                gib(crate::xtreme::reserve_bytes(&cfg))
             );
         }
         Ok(())
@@ -693,7 +693,7 @@ impl Manager {
         } else {
             m.size + m.size / 10 + (ctx * 128 * 1024).min(8 << 30) + (512 << 20)
         };
-        let avail = sys::mem().1.saturating_sub((cfg.server.mem_reserve_gib * (1u64 << 30) as f64) as u64);
+        let avail = sys::mem().1.saturating_sub(crate::xtreme::reserve_bytes(&cfg));
         (need, avail)
     }
 

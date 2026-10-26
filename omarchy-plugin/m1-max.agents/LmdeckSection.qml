@@ -285,6 +285,51 @@ Column {
     }
   }
 
+  // ======================= XTreme =======================
+  // Only a summary and a way in: planning, starting and steering a run is the TUI's XTreme tab
+  // (the same panel the wall shows on the console during a run).
+  Card {
+    id: xtCard
+    visible: lm.up
+    readonly property var x: lm.status ? lm.status.xtreme : null
+    readonly property var st: x ? x.state : null
+    readonly property bool active: !!(x && x.active)
+    title: "XTREME"
+    badge: active ? x.phase_label : (st && st.ended ? "last run " + lm.duration(x.elapsed_secs) : "")
+    badgeColor: active ? Commons.Color.accent : sec.dim
+
+    Text {
+      width: parent.width
+      textFormat: Text.PlainText
+      text: xtCard.active
+        ? xtCard.st.model + " · " + xtCard.x.summary
+        : (xtCard.st && xtCard.st.ended
+            ? "Last run (" + xtCard.st.end_reason + "): " + xtCard.x.summary
+            : "Desktop off, the model in the freed memory, agents on a task list through the night.")
+      color: xtCard.active ? sec.foreground : sec.dim
+      font.family: sec.fontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
+    }
+    Caption {
+      visible: !xtCard.active && !!xtCard.x && xtCard.x.planned.length > 0
+      text: xtCard.x ? xtCard.x.planned.length + " task(s) planned" : ""
+      color: sec.dim
+    }
+
+    Gap {}
+
+    Row {
+      spacing: Style.spacing.sm
+      SmallButton { text: xtCard.active ? "Open XTreme" : "Start XTreme…"; onClicked: lm.openTui(["xtreme", "plan"]) }
+      SmallButton {
+        visible: !xtCard.active && !!xtCard.st && !!xtCard.st.ended
+        text: "Report"
+        onClicked: Quickshell.execDetached(["xdg-open", xtCard.x.report])
+      }
+    }
+  }
+
   // ======================= Downloads =======================
   Card {
     visible: lm.downloads.length > 0

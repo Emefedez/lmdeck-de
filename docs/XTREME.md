@@ -1,7 +1,10 @@
-# XTreme mode (plan)
+# XTreme mode
 
-Status: planned 2026-10-26; the one-time setup is done (the helper's `wall` step comes with the build), the mode itself is not implemented yet. This page is the design and the reasons for it; the numbers
-are measured on this machine (M1 Max, 32 GB, Asahi) unless marked as an estimate.
+Status: implemented 2026-10-26 (`src/xtreme.rs`, `src/tui/xtreme.rs`, the helper in `xtreme/`). The task loop, the
+controls, the countdown and the report are checked with dry runs (a fake agent, no desktop or model changes; see
+[Checked so far](#checked-so-far)). Not yet run for real: stopping the desktop, the panel off, the wall on its console,
+a model load into the freed memory, away mode. The numbers on this page are measured on this machine (M1 Max, 32 GB,
+Asahi) unless marked as an estimate.
 
 XTreme mode turns the laptop into a headless model server for a long unattended run (overnight bug fixing, batch
 reverse-engineering questions): the graphical desktop stops, the panel turns off, Strata gets the memory and the GPU
@@ -9,10 +12,41 @@ the desktop was using, and a task loop runs coding agents in fresh, bounded sess
 back as it was.
 
 ```
-lmdeck xtreme start --tasks tasks.md --hours 8      # desktop off, screen off, model loaded, task loop running
-lmdeck xtreme status                                 # from a text console or over ssh
+lmdeck xtreme tasks                                  # write the task list (~/.config/lmdeck/xtreme/tasks.md)
+lmdeck xtreme start --hours 8                        # desktop off, screen off, model loaded, task loop running
+lmdeck xtreme start --dry-run --hours 1              # the same loop with the desktop, screen and model left alone
+lmdeck xtreme status                                 # one line, from a text console or over ssh
 lmdeck xtreme stop                                   # tasks stop, desktop back (also at the end of --hours)
 ```
+
+## The task list
+
+`lmdeck xtreme tasks` opens it (`xtreme.tasks`, default `~/.config/lmdeck/xtreme/tasks.md`; written from a template
+the first time). One task a `## title` section; the lines right under the title set its options, the rest is what
+the agent reads:
+
+```
+## lmdeck: grader shows NaN for MoE models
+repo: ~/Work/lmdeck
+check: cargo test grade
+turns: 30
+minutes: 30
+
+The grader's intelligence column is NaN for strata/q2_0. Look at src/grade.rs ...
+```
+
+| Option | Means |
+|---|---|
+| `repo:` | a git repository: the task gets its own branch `xtreme/<task>` in a worktree under `~/.local/state/lmdeck/xtreme/worktrees/`, so the agent never touches your checkout or its uncommitted work. A directory that is not git is worked in place; no repo, a scratch directory. |
+| `check:` | the command that proves the task is done (run niced in the worktree after a session that committed or claimed done; `xtreme.check_minutes`, 10) |
+| `turns:`, `minutes:` | per session (default `xtreme.max_turns` 40, `xtreme.session_minutes` 45) |
+
+`lmdeck xtreme add "title" [--repo DIR]` appends a task (the repository defaults to the git checkout you are in); the
+first line of the text is the title, the rest its body. The run reads the file again between sessions, so tasks can
+be added, reordered and reworded during a run, from the wall (`t`) or over ssh.
+
+Each task keeps its notes in `~/.local/state/lmdeck/xtreme/tasks/<task>/PROGRESS.md`, and its sessions' transcripts
+next to it (`session-N.log` readable, `session-N.jsonl` as the agent wrote it).
 
 ## Why: free memory is decode speed
 
@@ -73,27 +107,37 @@ A 32k window at ~6-15 tok/s makes compaction the worst part of a long run: summa
 (~4 min) and writes the summary at decode speed (a Copilot compaction took over 10 minutes on 2026-10-25), and every
 compaction loses detail. XTreme does not compact. Each task runs in fresh sessions that keep their memory in files:
 
-- `tasks.md`: one task a section (what to fix or find, where, how to check it: the test or command that proves it).
-- For each task, a headless agent through lmdeck (`lmdeck launch claude -p --max-turns N`, or opencode), whose prompt is
-  the task, the task's `PROGRESS.md` and fixed rules: work on a branch, run the check, commit what works, append what
-  was learned and what is left to `PROGRESS.md`, stop.
-- Each session is bounded by turns and wall time. Reaching the context window just ends the session; the next one
-  starts from `PROGRESS.md` and the commits.
+- `tasks.md`: one task a section (above).
+- For each task, a headless agent through lmdeck: Claude Code (`claude -p --output-format stream-json --max-turns N
+  --dangerously-skip-permissions`, with lmdeck's endpoint and model as `lmdeck launch claude` sets them) or opencode
+  (`opencode run --auto`; `xtreme.agent`). It runs in the task's worktree with the PATH of the shell that started the
+  run. Its prompt is the task, where it works, the check, the session's limits and the notes so far; the fixed rules
+  go in the system prompt (`--append-system-prompt`, the same text every session): work only here, commit each step
+  that works, never push or switch branches, run the check, append `## Session N` notes before stopping, and end the
+  notes with `STATUS: done` or `STATUS: blocked: <why>`.
+- Each session is bounded by turns and wall time (paused time does not count). Reaching the context window just ends
+  the session; the next one starts from `PROGRESS.md` and the commits.
+- After a session: a task is **done** when the notes say `STATUS: done` and the check (if any) passes; a failed check
+  is written into the notes and the task goes on. `STATUS: blocked` ends it as **blocked**; two sessions in a row
+  without a commit or a note, **stuck**; `xtreme.max_sessions` (6) sessions, **out of sessions**. Then the next task.
 - Restarts are cheap: every session shares one system prompt and tool list, and `strata.prefix_reuse = system` pins
   that prefix, so a new session reads only its task and notes.
-- Thinking is capped for the run (2-4k tokens; Strata's default allows ~15-23k, an hour at decode speed).
-- A watchdog ends a turn that thinks past its cap or a session past its time, reloads the engine if it dies, and moves
-  on after two sessions in a row without a commit or a note.
+- Thinking is capped for the run: lmdeck adds `reasoning_budget_tokens` (`xtreme.thinking_budget`, 3072) to every
+  Strata request that does not set its own (Strata's default allows ~15-23k, an hour at decode speed).
+- If the engine dies, the next session loads it again first; if lmdeck restarts, the run resumes from `state.json`
+  at the next session (the session cut short goes back to pending).
 
 ### Back to the desktop: the timer
 
 A run has an end from the start: `--hours 8` or `--until 07:30`. The wall's header counts down to it
 (`desktop back in 5h12m`).
 
-1. **Wind-down.** 15 minutes before the end no new session starts; the one running may finish its turn.
+1. **Wind-down.** 15 minutes before the end (`xtreme.wind_down_minutes`, at most a quarter of the run) no new session
+   starts; the one running goes on.
 2. **The countdown.** At the end the screen comes on and the wall shows `Back to the desktop in 60 s`: any key adds
    an hour (again and again), Enter or `X` goes now. Nobody there: it goes when the countdown ends.
-3. **The return.** The agents stop at the end of their turn, Strata unloads (its arena was sized for an empty
+   A timed run whose tasks have all ended goes back early, the same way.
+3. **The return.** The agents stop at the end of their turn (up to 2 minutes, then they are stopped), Strata unloads (its arena was sized for an empty
    machine; the desktop needs that memory back, and the next request loads it again the normal way), the screen
    comes on, SDDM starts and autologin brings Omarchy back, the sleep lock goes. Chromium and the other closed apps
    are not reopened by XTreme; they restore their own sessions when opened.
@@ -101,8 +145,9 @@ A run has an end from the start: `--hours 8` or `--until 07:30`. The wall's head
    `~/.local/state/lmdeck/xtreme/report.md`.
 
 **A dead-man switch.** At the start XTreme also arms a transient user timer, independent of the run
-(`systemd-run --user --on-calendar=<end + 15 min> --unit=lmdeck-xtreme-return`), that turns the screen on and starts
-SDDM even if the daemon or the run has died; a clean return cancels it. Linger keeps user timers running without a
+(`systemd-run --user --on-active=<end + 15 min> --unit=lmdeck-xtreme-return`): it asks lmdeck to stop the run, and two
+minutes later turns the screen on and starts SDDM whatever happened, even if the daemon or the run has died. `+`
+(one more hour) moves it; a clean return cancels it. Linger keeps user timers running without a
 login, so the desktop comes back on time whatever happened in the night.
 
 **Earlier, by hand:** `X` on the wall (it asks first), `lmdeck xtreme stop` over ssh or on another console
@@ -131,11 +176,11 @@ into and as a model server.
   (`/sys/class/power_supply/macsmc-battery/charge_control_end_threshold`, now 100) for the week and restores it on
   stop (helper step `battery-limit 80|100`).
 - **A hung machine reboots.** `/dev/watchdog0` exists, but systemd's runtime watchdog is off (`RuntimeWatchdogSec=0`),
-  so a kernel or GPU hang would stay hung. Away mode needs it on (a drop-in in `/etc/systemd/system.conf.d/`,
-  e.g. 60 s).
-- **After a reboot it comes back by itself.** A marker (`~/.local/state/lmdeck/xtreme/away`) survives the reboot; when
-  lmdeck starts (linger, at boot), it sees the marker and enters away mode again: tailscaled on, SDDM stopped once
-  autologin has started it, the model reloaded, the tasks resumed. A power cut needs the Mac to power on by itself
+  so a kernel or GPU hang would stay hung. Away mode turns it on for the run (60 s, set live on systemd's
+  `RuntimeWatchdogUSec` through D-Bus: helper step `watchdog-on`, `watchdog-off` on stop; no config file changes).
+- **After a reboot it comes back by itself.** The run's `state.json` survives the reboot; when lmdeck starts (linger,
+  at boot) it sees an away run and enters it again: tailscaled on, SDDM stopped once autologin has started it, the
+  model reloaded, the tasks resumed. (A run that is not away ends with a reboot: that is one of the ways back.) A power cut needs the Mac to power on by itself
   when power returns: an Apple setting (`pmset autorestart` in macOS), not verified under Asahi.
 - **The lid** can stay closed (the lid switch is inhibited); the machine then cools through the keyboard deck, so a
   hard surface, not a bag or a sofa.
@@ -150,8 +195,9 @@ sudo systemctl disable --now tailscaled                  # off by default; away 
 sudo ufw allow in on tailscale0
 ```
 
-The watchdog drop-in and the helper's new steps (`remote-on`, `remote-off`, `battery-limit`, plus `wall`) come with the
-build.
+The helper's steps for it (`remote-on`, `remote-off`, `battery-limit 80|100`, `watchdog-on|off`) are in `xtreme/`;
+reinstall the helper and the sudoers rule once (below). `tailscale serve --tcp` forwards port 11434 on the tailnet
+to lmdeck; not tried yet (Tailscale is not installed here).
 
 ### Stop
 
@@ -237,10 +283,12 @@ wall's terminal and give it back when they exit, as the TUI's system-prompt edit
 
 ### On the console
 
-- **Automatic login onto the wall** (decided 2026-10-26). After SDDM stops, the root helper's fifth step, `wall`,
-  opens a console of its own and switches to it (`openvt -s -c 2`), sets the font, and runs `lmdeck xtreme wall` as
-  the user (`runuser -u m1-max`): no password, no typing, the wall is what the display shows. The sudoers rule gains
-  that one argument when it is built. Logging in by hand (Ctrl+Alt+F2, `lmdeck xtreme`) still works, over ssh too.
+- **Automatic login onto the wall.** After SDDM stops, the root helper's step `wall` sets the font on VT 8, starts
+  `lmdeck xtreme wall` there as the user who ran sudo, as a system unit of its own (`systemd-run
+  --unit=lmdeck-xtreme-wall --uid=<user> -p TTYPath=/dev/tty8`, so it outlives a restart of lmdeck's service), and
+  switches to it (`chvt 8`): no password, no typing, the wall is what the display shows. VT 8 is above the six that
+  logind gives gettys, so nothing else claims it. `desktop-start` stops the unit. Logging in by hand (Ctrl+Alt+F2,
+  `lmdeck xtreme`) still works, over ssh too. On the console, the wall leaves by itself once the run has ended.
 - **Font:** `terminus-font` is installed (4.49.1); the wall's console uses `ter-132n` (16x32), about 189x61 characters
   on the 3024x1964 panel. Nothing changes in `/etc/vconsole.conf`: the font is set for the wall's console only.
 - `TERM=linux` means 16 colours and a limited set of glyphs: the wall picks ASCII borders and bars there, and the
@@ -263,7 +311,8 @@ be used on its own, without another computer, to vibe-code, review the agents' w
   scheme there, so syntax colouring works, in a smaller palette. If that is too little, an optional console made of
   `cage` + `foot` (foot is installed, cage is not) gives true colour and the usual fonts for as long as the editor is
   open, then exits; it draws only when something changes.
-- **A shell.** `!` on the wall opens `$SHELL` (inside tmux when it is there); `exit` comes back.
+- **A shell.** `!` on the wall opens `$SHELL` in the current task's directory, under `nice -n 19` and `ionice -c 3`;
+  `exit` comes back.
 - **Hosting.** The wall's header shows the LAN address and the ports your processes listen on (`ss -ltn`), and
   `lmdeck xtreme ip` prints them. ufw is active, so a port has to be opened (`sudo ufw allow PORT`) before another
   machine reaches it.
@@ -271,8 +320,10 @@ be used on its own, without another computer, to vibe-code, review the agents' w
   and on. With no key for 2 minutes (`--screen-idle`) it goes off by itself; any key brings it back. Off means nothing
   draws and nothing interactive stays loaded:
   - nvim saves its session (open files, cursor, window layout: `:mksession`) and keeps unsaved changes in its swap
-    files (`:preserve`), then quits, and its language servers with it; on wake it reopens where you were, unsaved
-    changes included. Nothing is written to your files that you did not save.
+    files (`:preserve`), then is killed (a clean quit would delete the swap files), and its language servers with it;
+    the next key reopens it on that session, and nvim offers to recover the unsaved changes from the swap files
+    (`R`). Nothing is written to your files that you did not save. (The wall talks to nvim over the socket it opens
+    with `--listen`; it notices "no key" from the console's access time, as `w` does.)
   - an idle shell from `!` is closed; a shell running something (a server you host, a build) is left alone, so
     hosted apps stay reachable while the screen is off.
   - the wall stops drawing (it already draws nothing while the screen is off).
@@ -309,14 +360,17 @@ another machine):
 
 - **Linger** on (`loginctl enable-linger m1-max`): the user's services, lmdeck included, keep running when the last
   login session ends, which stopping SDDM does.
-- **Root for exactly four steps**, through one root-owned helper, `/usr/local/libexec/lmdeck-xtreme-root`
-  (`desktop-stop`, `desktop-start`, `screen-off`, `screen-on`; anything else is refused), allowed without a password
-  by `/etc/sudoers.d/lmdeck-xtreme` for those arguments only. Sources in `xtreme/` (the sudoers file has `%USER%` for
+- **Root for a fixed list of steps**, through one root-owned helper, `/usr/local/libexec/lmdeck-xtreme-root`, allowed
+  without a password by `/etc/sudoers.d/lmdeck-xtreme` for exactly these arguments: `desktop-stop`, `desktop-start`,
+  `screen-off`, `screen-on`, `wall`, and for away mode `remote-on`, `remote-off`, `battery-limit 80|100`,
+  `watchdog-on`, `watchdog-off`; anything else is refused. Sources in `xtreme/` (the sudoers file has `%USER%` for
   the user name). This is what lets the run restore the desktop by itself at the end of `--hours`.
   `screen-off` writes `4` to `fb0/blank` and to the panel backlight's `bl_power`; `screen-on` undoes both.
+  The installed copy (2026-10-26) has only the first four steps: **install it again** with the commands below, then
+  `lmdeck xtreme start` checks every step it needs with `sudo -n -l` before touching anything.
 - **TUI tools**: `w3m` and `r2ghidra` (pacman, extra) installed; `r2` loads the plugin (`pdg` decompiles).
 
-Install elsewhere:
+Install (again) or elsewhere:
 
 ```
 sudo install -Dm755 -o root -g root xtreme/lmdeck-xtreme-root /usr/local/libexec/lmdeck-xtreme-root
@@ -331,6 +385,40 @@ loginctl enable-linger "$USER"
 - Everything it changes it records first and restores on stop, including after a crash of the run (the next
   `lmdeck` start sees the record and offers to restore).
 - It never kills apps one by one: it stops the display manager, the way logging out does.
+
+## Settings
+
+`[xtreme]` in the config (also in the TUI's Settings, section XTreme, and `lmdeck config xtreme.<key>`):
+
+| Key | Default | Means |
+|---|---|---|
+| `tasks` | `~/.config/lmdeck/xtreme/tasks.md` | the task list |
+| `model` | the first Strata model | what a run loads |
+| `agent`, `agent_args` | `claude`, none | the headless agent (`opencode` also works) and extra arguments, e.g. `--strict-mcp-config` to leave the MCP servers out |
+| `max_turns`, `session_minutes`, `max_sessions` | 40, 45, 6 | the bounds of a session, and sessions per task |
+| `thinking_budget` | 3072 | thinking tokens per Strata reply during a run (0 = the engine's) |
+| `reserve_gib` | 2.0 | memory kept out of the arena for editing and builds; replaces `server.mem_reserve_gib` while a run holds |
+| `screen`, `screen_idle_secs` | `off`, 120 | the panel at the start, and the idle time before the wall turns it off |
+| `wind_down_minutes`, `check_minutes`, `min_battery` | 15, 10, 50 | (config file only) |
+
+## Checked so far
+
+2026-10-26, with dry runs (`--dry-run`: the root steps are only logged, the model is not loaded) on a second daemon
+(its own port and state directories) and a fake agent that writes Claude Code's stream-json:
+
+- a task that commits, passes its check and writes `STATUS: done` ends **done**, with its branch, worktree, commit,
+  check and notes in the report; a task that leaves nothing twice ends **stuck**; a timed run whose tasks have all
+  ended returns early;
+- pause stops the agent's whole process group (`T`) between model requests and resume continues it; skip ends the
+  session (SIGTERM to the group); an open-ended run with no task left waits, and `lmdeck xtreme add` (from inside a
+  repository) gives it the next one; stop returns;
+- a timed run winds down, counts down 60 s, `extend` adds the time and re-arms the countdown, and the return runs the
+  steps in order (screen on, desktop start);
+- the wall in a 150x44 terminal with `TERM=linux` (ASCII only): blank while the panel is "off", the first key turns
+  it on, `X` asks, `X` again ends the run; tab 7 and its start form.
+
+Not checked yet: anything the root helper does (the installed helper predates the `wall` and away-mode steps), the
+model load into the freed memory, nvim's session save on screen-off, opencode as the agent, away mode.
 
 ## What the first run measures
 
