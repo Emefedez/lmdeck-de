@@ -1956,7 +1956,7 @@ pub fn status_line(v: &Value) -> String {
     if let Some(a) = st.arena_gb {
         m.push_str(&format!(" arena {a:.1} GB"));
     }
-    if let Some(r) = v["decode_tps"].as_f64() {
+    if let Some(r) = v["decode_tps"].as_f64().filter(|_| st.arena_gb.is_some()) {
         m.push_str(&format!(" {r:.1} tok/s"));
     }
     parts.push(m);

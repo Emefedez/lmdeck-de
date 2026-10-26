@@ -149,7 +149,8 @@ pub fn wall_text(x: &Value, s: Option<&Value>, w: usize, h: usize, ascii: bool, 
     };
     let model = if st.model.is_empty() { "XTreme".to_string() } else { st.model.clone() };
     let mut speed = vec![st.arena_gb.map(|a| format!("arena {a:.1} GB")).unwrap_or_else(|| "arena -".into())];
-    if let Some(r) = x["decode_tps"].as_f64().filter(|_| active) {
+    // Only once this run has loaded the model: the log line may be from an older request.
+    if let Some(r) = x["decode_tps"].as_f64().filter(|_| active && st.arena_gb.is_some()) {
         speed.push(format!("{r:.1} tok/s"));
     }
     if let Some(r) = running.as_ref().and_then(|r| r["work"]["tokens_per_sec"].as_f64()) {
