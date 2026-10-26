@@ -45,10 +45,22 @@ case "$*" in
   remote-off)
     /usr/bin/tailscale serve reset 2>/dev/null || true
     exec /usr/bin/systemctl stop tailscaled.service ;;
+  # a server run: let other computers reach lmdeck's network listener (model APIs only, behind its token)
+  "lan-on "[0-9]*|"lan-off "[0-9]*)
+    port="${2:-}"
+    case "$port" in ''|*[!0-9]*) echo "bad port" >&2; exit 2 ;; esac
+    if [ -x /usr/bin/ufw ] && /usr/bin/ufw status | grep -q "^Status: active"; then
+      if [ "$1" = lan-on ]; then
+        exec /usr/bin/ufw allow in proto tcp to any port "$port" comment "lmdeck xtreme"
+      else
+        exec /usr/bin/ufw delete allow in proto tcp to any port "$port"
+      fi
+    fi
+    exit 0 ;;
   "battery-limit 80") echo 80 > "$bat" ;;
   "battery-limit 100") echo 100 > "$bat" ;;
   # systemd's runtime watchdog (/dev/watchdog0): a hung machine reboots after 60 s; off again on stop
   watchdog-on)  exec /usr/bin/busctl set-property org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RuntimeWatchdogUSec t 60000000 ;;
   watchdog-off) exec /usr/bin/busctl set-property org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RuntimeWatchdogUSec t 0 ;;
-  *) echo "usage: lmdeck-xtreme-root desktop-stop|desktop-start|screen-off|screen-on|wall|remote-on|remote-off|'battery-limit 80|100'|watchdog-on|watchdog-off" >&2; exit 2 ;;
+  *) echo "usage: lmdeck-xtreme-root desktop-stop|desktop-start|screen-off|screen-on|wall|remote-on|remote-off|'battery-limit 80|100'|watchdog-on|watchdog-off|'lan-on|lan-off PORT'" >&2; exit 2 ;;
 esac

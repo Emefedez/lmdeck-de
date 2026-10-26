@@ -28,6 +28,7 @@ impl Ui {
             a.push(Act::new(KeyCode::Char('r'), "Reload to apply settings"));
         }
         a.push(Act::new(KeyCode::Char('f'), "Free memory"));
+        a.push(Act::new(KeyCode::Char('X'), "XTreme…"));
         if active {
             a.push(Act::new(KeyCode::Char('x'), "Cancel download"));
         }
@@ -49,6 +50,7 @@ impl Ui {
     pub(super) fn home_act(&mut self, key: KeyCode) -> Option<Action> {
         let pid = self.status.as_ref().and_then(|s| s["pid"].as_u64()).map(|p| p as u32);
         match key {
+            KeyCode::Char('X') => self.set_tab(super::Tab::Xtreme),
             KeyCode::Char('s') => {
                 if self.status.is_some() {
                     let _ = client::stop_daemon(pid);

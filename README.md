@@ -99,6 +99,11 @@ lmdeck xtreme                    # the wall, in any terminal or over ssh; tab 7 
 lmdeck xtreme stop               # agents stop, the model unloads, the desktop comes back, report.md is written
 ```
 
+No tasks needed: `lmdeck xtreme start --serve` (or a start with no task list) turns the laptop into a headless model
+server. The model stays loaded in the freed memory, and other computers reach its Ollama, OpenAI and Anthropic APIs
+on port 11435 with a token (`lmdeck xtreme ip` prints the client settings); lmdeck's control API stays local. Tasks
+can still be added during the run.
+
 Each task works on its own branch (`xtreme/<task>`) in a worktree, so your checkout is never touched; the agent
 commits what works and keeps its notes in the task's `PROGRESS.md`, which is all the next session knows. A task ends
 as done (its notes say `STATUS: done` and its `check:` passes), blocked, stuck (two sessions with no commit and no
@@ -175,7 +180,7 @@ terminal (also over ssh), and as a summary card with *Start XTreme...* in the ba
 | space / `n` | `pause` / `skip` | hold after this turn / go to the next task |
 | `s` / `q` / `X` | `screen off\|on` / - / `stop` | toggle the panel fully off / leave the wall (the run goes on) / end the run, desktop back |
 | `o` / `!` | `open [FILE]` / - | pick a file and open it in nvim / a shell |
-| `+` | `extend` | one more hour before the desktop comes back |
+| `a` / `i` / `+` | `add` / `ip` / `extend` | add a task / where other computers connect (server runs) / one more hour |
 | - | `start`, `status`, `watch`, `add "task"`, `report`, `plan`, `ip` | start, one line of state, the wall as plain text, append a task, the last report, the TUI on its XTreme tab, addresses and ports |
 
 **Using the machine during a run.** Only the graphical session stops. The network, sshd, tmux and the other consoles

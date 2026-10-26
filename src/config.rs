@@ -317,6 +317,10 @@ pub struct XtremeCfg {
     pub check_minutes: u32,
     /// Refuse to start on battery below this charge (%); away mode refuses on battery at all.
     pub min_battery: u32,
+    /// Port of the network listener a run opens for other computers (the model APIs only).
+    pub lan_port: u16,
+    /// "token" = every request on it carries the run's token (Bearer / x-api-key); "none" = open.
+    pub lan_auth: String,
 }
 
 impl Default for XtremeCfg {
@@ -336,6 +340,8 @@ impl Default for XtremeCfg {
             wind_down_minutes: 15,
             check_minutes: 10,
             min_battery: 50,
+            lan_port: 11435,
+            lan_auth: "token".into(),
         }
     }
 }
@@ -947,6 +953,8 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "XTreme", key: "xtreme.thinking_budget", kind: Kind::Number, help: "Thinking tokens per reply during a run (0 = the engine's)" },
     Setting { section: "XTreme", key: "xtreme.reserve_gib", kind: Kind::Gib, help: "Memory kept out of the arena for editing and builds during a run (GiB)" },
     Setting { section: "XTreme", key: "xtreme.screen", kind: Kind::Choice(&["off", "on"]), help: "Panel at the start of a run: off (a key brings it back) / on" },
+    Setting { section: "XTreme", key: "xtreme.lan_port", kind: Kind::Number, help: "Port other computers reach the model APIs on during a run (--lan; not the control API)" },
+    Setting { section: "XTreme", key: "xtreme.lan_auth", kind: Kind::Choice(&["token", "none"]), help: "Network listener: token (clients send it as their API key) / none (open to the network)" },
     Setting { section: "XTreme", key: "xtreme.screen_idle_secs", kind: Kind::Number, help: "Seconds without a key before the wall turns the panel off (0 = never)" },
     Setting { section: "Integration", key: "usage.perf", kind: Kind::Bool, help: "Record each model's speed and system power while it generates, for the grader (off: the grader estimates them). Costs one sensor read every 2 s while a request runs and ~10 KB" },
 ];
@@ -1039,6 +1047,8 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "xtreme.reserve_gib" => c.xtreme.reserve_gib.to_string(),
         "xtreme.screen" => c.xtreme.screen.clone(),
         "xtreme.screen_idle_secs" => c.xtreme.screen_idle_secs.to_string(),
+        "xtreme.lan_port" => c.xtreme.lan_port.to_string(),
+        "xtreme.lan_auth" => c.xtreme.lan_auth.clone(),
         "strata.dir" => c.strata.dir.clone(),
         "strata.git_ref" => c.strata.git_ref.clone(),
         "strata.engine" => c.strata.engine.clone(),
@@ -1189,6 +1199,11 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
             _ => return Err("off or on".into()),
         },
         "xtreme.screen_idle_secs" => c.xtreme.screen_idle_secs = num(v)? as u32,
+        "xtreme.lan_port" => c.xtreme.lan_port = (num(v)?).clamp(1024, 65535) as u16,
+        "xtreme.lan_auth" => match v {
+            "token" | "none" => c.xtreme.lan_auth = v.into(),
+            _ => return Err("token or none".into()),
+        },
         "strata.dir" => c.strata.dir = v.into(),
         "strata.git_ref" => c.strata.git_ref = v.into(),
         "strata.engine" => match v {

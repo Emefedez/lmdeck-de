@@ -25,7 +25,7 @@ const LOGO: [&str; 4] = [
     r"  >  <  | | | |_) |  _| | |\/| |  _|",
     r" /_/\_\ |_| |_| \_\_____|_|  |_|_____|",
 ];
-const WALL_KEYS: &str = "t tasks  p progress  d diff  l log  e edit  space pause  n skip  s screen  o open  ! shell  q leave  X end";
+const WALL_KEYS: &str = "a add  t tasks  p progress  d diff  l log  e edit  space pause  n skip  s screen  o open  ! shell  q leave  X end";
 const HOURS: [u32; 6] = [0, 1, 2, 4, 8, 12];
 
 #[derive(Default)]
@@ -35,6 +35,8 @@ pub(super) struct XtUi {
     pub picker: Option<Picker>,
     pub start: Option<StartForm>,
     pub confirm_stop: bool,
+    /// `a`: a task typed in: (title, repo, which field has the cursor: 0 title, 1 repo).
+    pub add: Option<(String, String, usize)>,
     pub last_key: Option<Instant>,
     /// The run was paused for `e`; resume when the editor exits.
     pub resume_after: bool,
@@ -47,11 +49,19 @@ pub(super) struct Picker {
     pub lsp: bool,
 }
 
-#[derive(Default)]
 pub(super) struct StartForm {
     pub hours: usize,
     pub away: bool,
     pub dry: bool,
+    pub serve: bool,
+    pub lan: bool,
+}
+
+impl StartForm {
+    /// Server mode is the default when there is no task to do.
+    fn new(planned: usize) -> Self {
+        Self { hours: 0, away: false, dry: false, serve: planned == 0, lan: planned == 0 }
+    }
 }
 
 /// Something the wall runs in its terminal: an editor (whose session it may save and close when
@@ -174,11 +184,15 @@ pub fn wall_text(x: &Value, s: Option<&Value>, w: usize, h: usize, ascii: bool, 
         (Some(false), Some(c)) => format!("on battery {c}%"),
         _ => String::new(),
     };
+    let lan = &x["lan"];
+    let lan_line = lan["urls"].as_array().and_then(|u| u.first()).and_then(|u| u.as_str()).filter(|_| lan["open"] == true && active).map(|url| {
+        format!("network {url}{}", lan["token"].as_str().map(|t| format!("   token {t}")).unwrap_or_else(|| "   (no token)".into()))
+    });
     let info = [
         String::new(), // the model and the time, spread to the width below
         speed.join("   "),
         format!("desktop {}   screen {}   RAM {:.1} / {:.1} GB   {state}", if st.desktop_stopped && !st.dry_run { "off" } else { "on" }, if st.screen.is_empty() { "on" } else { &st.screen }, gb(total.saturating_sub(avail)), gb(total)),
-        format!("{}{}   {power}", if ips.is_empty() { "no network".into() } else { format!("IP {}", ips.join(" ")) }, if ports.is_empty() { String::new() } else { format!("   ports {}", ports.join(" ")) }),
+        lan_line.clone().unwrap_or_else(|| format!("{}{}   {power}", if ips.is_empty() { "no network".into() } else { format!("IP {}", ips.join(" ")) }, if ports.is_empty() { String::new() } else { format!("   ports {}", ports.join(" ")) })),
     ];
     let mut out: Vec<String> = Vec::new();
     let logo = w >= 90 && h >= 22;
@@ -197,7 +211,11 @@ pub fn wall_text(x: &Value, s: Option<&Value>, w: usize, h: usize, ascii: bool, 
     // Tasks | now. (After a run, no task is current.)
     let cur = x["current"].as_str().filter(|_| active);
     let mut left: Vec<String> = Vec::new();
-    if active || !st.tasks.is_empty() {
+    if active && st.tasks.is_empty() {
+        left.push("TASKS".into());
+        left.push("none: serving only. a adds one; the agent".into());
+        left.push("starts on it, the model stays loaded.".into());
+    } else if active || !st.tasks.is_empty() {
         let done = st.tasks.iter().filter(|t| t.status == "done").count();
         left.push(spread("TASKS", &format!("{done} of {} done", st.tasks.len()), lw));
         for (i, t) in st.tasks.iter().enumerate() {
@@ -232,6 +250,18 @@ pub fn wall_text(x: &Value, s: Option<&Value>, w: usize, h: usize, ascii: bool, 
             right.push(format!("session {}, turn {}/{}, {} left", sess.n, sess.turns, sess.max_turns, xt::span(left_s)));
         }
         None => right.push(format!("NOW  {}", if active { st.phase.label() } else { "no run" })),
+    }
+    if active && st.serve {
+        let u = s.map(|s| &s["usage"]);
+        if let Some(l) = u.map(|u| &u["last"]).filter(|l| l.is_object()) {
+            right.push(format!("last request  {}: {:.1} tok/s, prompt {:.0} tok/s, first token {:.1} s", l["model"].as_str().unwrap_or(""), l["gen_tps"].as_f64().unwrap_or(0.0), l["prompt_tps"].as_f64().unwrap_or(0.0), l["ttft_secs"].as_f64().unwrap_or(0.0)));
+        }
+        if let Some(t) = u.map(|u| &u["today"]).filter(|t| t["requests"].as_u64().is_some()) {
+            right.push(format!("today  {} requests, {} in, {} out", t["requests"], k(t["prompt"].as_u64().unwrap_or(0)), k(t["completion"].as_u64().unwrap_or(0))));
+        }
+        if lan["open"] != true && st.lan {
+            right.push("network listener not open (see LOG)".into());
+        }
     }
     if let Some(r) = &running {
         let c = &r["context"];
@@ -317,6 +347,7 @@ impl Ui {
         if !st.phase.active() {
             let mut a = vec![
                 Act::new(KeyCode::Char('S'), "Start XTreme…").when(up, "the server is not running (s on Home)"),
+                Act::new(KeyCode::Char('a'), "Add a task"),
                 Act::new(KeyCode::Char('t'), "Edit the tasks"),
             ];
             if xt::report_path().exists() {
@@ -327,6 +358,7 @@ impl Ui {
         let cur = st.current().cloned();
         let has_cur = cur.is_some();
         let mut a = vec![
+            Act::new(KeyCode::Char('a'), "Add a task"),
             Act::new(KeyCode::Char('t'), "Tasks"),
             Act::new(KeyCode::Char('p'), "Progress").when(has_cur, "no task"),
             Act::new(KeyCode::Char('d'), "Diff").when(cur.as_ref().is_some_and(|t| t.base.is_some()), "this task has no branch yet"),
@@ -341,6 +373,9 @@ impl Ui {
         ];
         if st.ends_at.is_some() {
             a.push(Act::new(KeyCode::Char('+'), "One more hour"));
+        }
+        if st.lan {
+            a.push(Act::new(KeyCode::Char('i'), "Connect info"));
         }
         a.push(Act::new(KeyCode::Char('X'), if self.xt.confirm_stop { "End: press X again" } else { "End the run" }));
         a
@@ -389,7 +424,30 @@ impl Ui {
         }
         let cur = st.current().cloned();
         match key {
-            KeyCode::Char('S') => self.xt.start = Some(StartForm::default()),
+            KeyCode::Char('S') => {
+                let planned = if st.phase.active() { st.tasks.iter().filter(|t| !t.finished()).count() } else { self.xview()["planned"].as_array().map(|p| p.len()).unwrap_or(0) };
+                self.xt.start = Some(StartForm::new(planned));
+            }
+            KeyCode::Char('a') => {
+                // The repository of the current task, else none (a scratch directory).
+                let repo = cur.as_ref().and_then(|t| t.repo.clone()).unwrap_or_default();
+                self.xt.add = Some((String::new(), repo, 0));
+            }
+            KeyCode::Char('i') => {
+                let lan = &self.xview()["lan"];
+                let token = lan["token"].as_str();
+                let mut text = String::from("Model APIs for other computers (lmdeck xtreme ip prints this too)\n\n");
+                for url in lan["urls"].as_array().into_iter().flatten().filter_map(|u| u.as_str()) {
+                    text.push_str(&format!("{url}\n"));
+                    for l in xt::client_snippets(url, token, &st.model) {
+                        text.push_str(&format!("  {l}\n"));
+                    }
+                    text.push('\n');
+                }
+                let p = xt::dir().join("connect.txt");
+                let _ = std::fs::write(&p, text);
+                return Some(self.job(vec!["less".into(), p.display().to_string()], JobKind::Plain));
+            }
             KeyCode::Char('t') => {
                 let p = xt::ensure_tasks_file(&self.cfg, &st);
                 return Some(self.editor_job(&p, false));
@@ -435,7 +493,7 @@ impl Ui {
 
     /// Whether this key belongs to the XTreme screen before the global keys see it.
     pub(super) fn xtreme_wants(&self) -> bool {
-        self.tab == Tab::Xtreme && (self.xt.wall || self.xt.picker.is_some() || self.xt.start.is_some() || self.xt.confirm_stop || {
+        self.tab == Tab::Xtreme && (self.xt.wall || self.xt.picker.is_some() || self.xt.start.is_some() || self.xt.add.is_some() || self.xt.confirm_stop || {
             let st = self.xstate();
             st.phase == Phase::Countdown || (st.phase.active() && st.screen == "off")
         })
@@ -482,6 +540,36 @@ impl Ui {
             }
             return None;
         }
+        if let Some((title, repo, field)) = &mut self.xt.add {
+            let cur = if *field == 0 { title } else { repo };
+            match k.code {
+                KeyCode::Esc => self.xt.add = None,
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => *field = 1 - *field,
+                KeyCode::Backspace => {
+                    cur.pop();
+                }
+                KeyCode::Char(c) => cur.push(c),
+                KeyCode::Enter => {
+                    let (title, repo, _) = self.xt.add.take().unwrap();
+                    if title.trim().is_empty() {
+                        self.toast("a task needs a title");
+                        return None;
+                    }
+                    let repo = Some(repo.trim().to_string()).filter(|r| !r.is_empty());
+                    if let Some(r) = &repo {
+                        if !crate::config::expand(r).is_dir() {
+                            self.toast(format!("{r} is not a directory"));
+                            self.xt.add = Some((title, r.clone(), 1));
+                            return None;
+                        }
+                    }
+                    self.post_xt("add", json!({"text": title.trim(), "repo": repo}));
+                    self.toast(format!("added: {} (t edits the details)", title.trim()));
+                }
+                _ => {}
+            }
+            return None;
+        }
         if let Some(f) = &mut self.xt.start {
             match k.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.xt.start = None,
@@ -489,12 +577,16 @@ impl Ui {
                 KeyCode::Left => f.hours = (f.hours + HOURS.len() - 1) % HOURS.len(),
                 KeyCode::Char('a') => f.away = !f.away,
                 KeyCode::Char('d') => f.dry = !f.dry,
+                KeyCode::Char('s') => f.serve = !f.serve,
+                KeyCode::Char('l') => f.lan = !f.lan,
                 KeyCode::Enter => {
                     let hours = HOURS[f.hours];
                     let body = json!({
                         "hours": (hours > 0 && !f.away).then_some(hours as f64),
                         "away": f.away,
                         "dry_run": f.dry,
+                        "serve": f.serve,
+                        "lan": f.lan,
                         "agent_bin": crate::config::which(&self.cfg.xtreme.agent).map(|p| p.display().to_string()),
                         "path_env": std::env::var("PATH").unwrap_or_default(),
                     });
@@ -561,7 +653,7 @@ impl Ui {
         } else if st.phase == Phase::Countdown {
             "any key: one more hour   Enter / X: back to the desktop now"
         } else if !st.phase.active() {
-            "S start   t tasks   r report   q leave"
+            "S start   a add a task   t tasks   r report   q leave"
         } else {
             WALL_KEYS
         };
@@ -613,15 +705,31 @@ impl Ui {
             f.render_widget(Clear, r);
             f.render_widget(Paragraph::new(lines).block(block(&title)), r);
         }
+        if let Some((title, repo, field)) = &self.xt.add {
+            let w = area.width.saturating_sub(4).min(90);
+            let r = Rect::new(area.x + (area.width - w) / 2, area.y + area.height.saturating_sub(8) / 2, w, 8.min(area.height));
+            let caret = |i: usize| if *field == i { "_" } else { "" };
+            let lines = vec![
+                Line::from(format!("  title  {title}{}", caret(0))),
+                Line::from(format!("  repo   {repo}{}", caret(1))),
+                Line::from(""),
+                Line::styled("  repo: a directory (git: the task gets its own branch); empty = none", Style::new().fg(Color::DarkGray)),
+                Line::styled("Enter adds   Tab: next field   Esc cancels", Style::new().fg(Color::Green)),
+            ];
+            f.render_widget(Clear, r);
+            f.render_widget(Paragraph::new(lines).block(block(" Add a task ")), r);
+        }
         if let Some(form) = &self.xt.start {
             let w = area.width.saturating_sub(4).min(76);
-            let r = Rect::new(area.x + (area.width - w) / 2, area.y + area.height.saturating_sub(12) / 2, w, 12.min(area.height));
+            let r = Rect::new(area.x + (area.width - w) / 2, area.y + area.height.saturating_sub(14) / 2, w, 14.min(area.height));
             let hours = HOURS[form.hours];
             let lines = vec![
                 Line::from("The desktop stops, the screen turns off, the model reloads into the freed"),
                 Line::from("memory, and the agent works through the tasks. Ctrl+Alt+F2 or ssh reach it."),
                 Line::from(""),
                 Line::from(format!("  end (h, ←/→)   {}", if form.away { "none (away mode)".to_string() } else if hours == 0 { "none: lmdeck xtreme stop ends it".to_string() } else { format!("after {hours} h, then the desktop comes back") })),
+                Line::from(format!("  server (s)     {}", if form.serve { "yes: the model stays loaded; tasks optional" } else { "no: the agent works through the tasks" })),
+                Line::from(format!("  network (l)    {}", if form.lan { format!("yes: model APIs on port {}, with a token", self.cfg.xtreme.lan_port) } else { "no: this machine only (and ssh)".into() })),
                 Line::from(format!("  away (a)       {}", if form.away { "yes: Tailscale, 80% charge limit, watchdog" } else { "no" })),
                 Line::from(format!("  dry run (d)    {}", if form.dry { "yes: desktop, screen and model left alone" } else { "no" })),
                 Line::from(format!("  tasks          {}", super::widgets::tilde(&xt::tasks_path(&self.cfg).display().to_string()))),
@@ -798,6 +906,23 @@ mod tests {
         for want in ["strata/q2_0", "2h13m of 8h00m", "arena 14.8 GB", "12.1 tok/s", "prompt 128 tok/s", "desktop off", "IP 192.168.1.20", "ports 22",
                      "2 of 4 done", "[x] 1 lmdeck: grader NaN", "[>] 3 panel: scroll on hover", "NOW  #3 panel: scroll on hover", "session 2, turn 9/40, 30m left",
                      "context  [", "21.3k / 32.8k", "reading the prompt 4.1k / 6.0k, 15s left", "last tool  bash", "PROGRESS #3", "Flickable jumps", "qmllint", "X end"] {
+            assert!(text.contains(want), "missing {want:?} in\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_server_run_shows_where_to_connect() {
+        let mut v = view();
+        v["state"]["serve"] = json!(true);
+        v["state"]["lan"] = json!(true);
+        v["state"]["tasks"] = json!([]);
+        v["state"]["session"] = Value::Null;
+        v["state"]["phase"] = json!("serving");
+        v["lan"] = json!({"open": true, "urls": ["http://192.168.1.20:11435"], "token": "lmx-abc"});
+        let mut s = status();
+        s["usage"] = json!({"today": {"requests": 3, "prompt": 12000, "completion": 800}, "last": {"model": "strata/q2_0", "gen_tps": 11.5, "prompt_tps": 120.0, "ttft_secs": 40.0}});
+        let text = wall_text(&v, Some(&s), 140, 30, true, WALL_KEYS).join("\n");
+        for want in ["network http://192.168.1.20:11435   token lmx-abc", "none: serving only", "NOW  serving", "today  3 requests, 12.0k in", "last request  strata/q2_0: 11.5 tok/s"] {
             assert!(text.contains(want), "missing {want:?} in\n{text}");
         }
     }

@@ -19,6 +19,36 @@ lmdeck xtreme status                                 # one line, from a text con
 lmdeck xtreme stop                                   # tasks stop, desktop back (also at the end of --hours)
 ```
 
+## Server mode: no tasks, a model server for other computers
+
+A run does not need tasks. `lmdeck xtreme start --serve`, or any start without a task list (or with an empty one),
+is a server run: the desktop and the screen go off as usual, the model loads into the freed memory and **stays
+loaded** for whoever connects, and nothing ends the run early. Tasks can still come later (`a` on the wall,
+`lmdeck xtreme add`, or the task list): the agent works on them and the run goes back to serving. In server mode
+thinking is not capped (the clients set their own budget).
+
+**Other computers** reach the model APIs on a second listener, `0.0.0.0:11435` (`xtreme.lan_port`), opened for the
+run and closed when it ends (`--lan` / `--no-lan`; on by default in server mode):
+
+- only the model APIs: Ollama (`/api/chat`, `/api/generate`, `/api/tags`, ...), OpenAI (`/v1/...`) and Anthropic
+  (`/v1/messages`). Nothing that changes lmdeck is on it: no `/lmdeck/*` (settings, hooks, runs), no pull, delete or
+  copy. lmdeck's own listener stays on localhost; steer the run over ssh.
+- a token (`xtreme.lan_auth = token`, the default): every request carries it as its API key, `Authorization: Bearer
+  <token>` or `x-api-key: <token>`; anything else gets 401. It is kept in `~/.local/state/lmdeck/xtreme/lan-token`
+  (0600) and reused from run to run, so the other computer's settings keep working. `xtreme.lan_auth = none` drops it.
+- the firewall: ufw is active here, so the run opens the port (helper step `lan-on PORT`) and closes it again on
+  stop (`lan-off PORT`).
+
+`lmdeck xtreme ip` (and `i` on the wall) prints the addresses, the token and ready-made client settings:
+
+```
+Claude Code:  ANTHROPIC_BASE_URL=http://192.168.0.36:11435 ANTHROPIC_AUTH_TOKEN=lmx-... ANTHROPIC_MODEL=strata/q2_0 claude
+OpenAI API:   OPENAI_BASE_URL=http://192.168.0.36:11435/v1 OPENAI_API_KEY=lmx-...
+```
+
+The wall's header shows the address and the token; its NOW pane, the request in flight, the last request's speed
+and today's requests.
+
 ## The task list
 
 `lmdeck xtreme tasks` opens it (`xtreme.tasks`, default `~/.config/lmdeck/xtreme/tasks.md`; written from a template
@@ -215,7 +245,7 @@ XTreme has one panel, drawn from one source (`GET /lmdeck/xtreme`, the daemon's 
 | Where | When | What it is |
 |---|---|---|
 | the **wall**, on the text console | during a run (the desktop is off) | the XTreme tab of lmdeck's TUI, full screen, ASCII-safe |
-| the **XTreme tab** (7) of the lmdeck TUI | any time, any terminal, also over ssh | the same panel with the rest of the TUI around it: plan tasks, start, read the last report |
+| the **XTreme tab** (7) of the lmdeck TUI | any time, any terminal, also over ssh | the same panel with the rest of the TUI around it: add and plan tasks, start (end, server, network, away, dry run), read the last report. `X` on Home and *lmdeck XTreme* in the Omarchy menu open it. |
 | a **card in the bar panel** (`LmdeckSection.qml`) | on the desktop, before and after a run | the last run's summary, and *Start XTreme...*, which opens the TUI's tab (no second implementation) |
 
 When the desktop comes back, a notification gives the night's result and opens the report. So the GUI only starts
@@ -260,7 +290,10 @@ One key on the wall, one word on the command line, the same action:
 | `!` | - | a shell (niced), `exit` returns |
 | `q` | - | leave the wall; the run goes on (`lmdeck xtreme` brings it back) |
 | `X` | `stop` | end the run and bring the desktop back (asks first) |
-| - | `start [--hours N \| --until HH:MM \| --away]`, `status`, `watch`, `add "task"`, `report` | start a run (no end unless given; `--away` = remote, unattended), one line of state, the wall as plain text, append a task, the last report |
+| `a` | `add "task"` | add a task (title and repository), typed in on the wall or the TUI tab |
+| `i` | `ip` | where other computers connect, with the token and client settings (server runs) |
+| `+` | `extend` | one more hour before the desktop comes back |
+| - | `start [--hours N \| --until HH:MM \| --away \| --serve \| --lan/--no-lan \| --dry-run]`, `status`, `watch`, `report`, `plan` | start a run (no end unless given; `--away` = remote, unattended; `--serve` = a model server, tasks optional), one line of state, the wall as plain text, the last report, the TUI on its XTreme tab |
 
 The editor is lmdeck's (`ui.editor`, then `$VISUAL`, `$EDITOR`, nvim), the pager `$PAGER` or `less`; both run in the
 wall's terminal and give it back when they exit, as the TUI's system-prompt editing does today.
@@ -363,8 +396,9 @@ another machine):
   login session ends, which stopping SDDM does.
 - **Root for a fixed list of steps**, through one root-owned helper, `/usr/local/libexec/lmdeck-xtreme-root`, allowed
   without a password by `/etc/sudoers.d/lmdeck-xtreme` for exactly these arguments: `desktop-stop`, `desktop-start`,
-  `screen-off`, `screen-on`, `wall`, and for away mode `remote-on`, `remote-off`, `battery-limit 80|100`,
-  `watchdog-on`, `watchdog-off`; anything else is refused. Sources in `xtreme/` (the sudoers file has `%USER%` for
+  `screen-off`, `screen-on`, `wall`, for away mode `remote-on`, `remote-off`, `battery-limit 80|100`,
+  `watchdog-on`, `watchdog-off`, and for the network listener `lan-on PORT`, `lan-off PORT` (a ufw rule for that
+  port, only when ufw is active); anything else is refused. Sources in `xtreme/` (the sudoers file has `%USER%` for
   the user name). This is what lets the run restore the desktop by itself at the end of `--hours`.
   `screen-off` writes `4` to `fb0/blank` and to the panel backlight's `bl_power`; `screen-on` undoes both.
   The installed copy (2026-10-26) has only the first four steps: **install it again** with the commands below, then
@@ -389,7 +423,8 @@ loginctl enable-linger "$USER"
 
 ## Settings
 
-`[xtreme]` in the config (also in the TUI's Settings, section XTreme, and `lmdeck config xtreme.<key>`):
+`[xtreme]` in the config (also in the TUI's Settings, section XTreme, and `lmdeck config xtreme.<key>`). `lan_port`
+(11435) and `lan_auth` (`token` / `none`) set the network listener of server runs.
 
 | Key | Default | Means |
 |---|---|---|
@@ -417,6 +452,10 @@ loginctl enable-linger "$USER"
   steps in order (screen on, desktop start);
 - the wall in a 150x44 terminal with `TERM=linux` (ASCII only): blank while the panel is "off", the first key turns
   it on, `X` asks, `X` again ends the run; tab 7 and its start form.
+
+Server mode (same day, dry run, test port 11536): a start with no task list serves; without the token or with a
+wrong one the network port answers 401, with it (Bearer or `x-api-key`) 200; `/lmdeck/status` and `/api/pull` are
+404 there; a task added while serving runs and the run goes back to serving; stop closes the port.
 
 Not checked yet: anything the root helper does (the installed helper predates the `wall` and away-mode steps), the
 model load into the freed memory, nvim's session save on screen-off, opencode as the agent, away mode.

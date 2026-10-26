@@ -38,6 +38,70 @@ pub struct App {
     pub vscode_active: Arc<std::sync::Mutex<Option<String>>>,
 }
 
+/// The daemon's state, for the XTreme LAN listener (opened and closed by a run).
+static APP: std::sync::OnceLock<App> = std::sync::OnceLock::new();
+/// The open LAN listener: ends when this is dropped or sent.
+static LAN: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>> = std::sync::Mutex::new(None);
+
+/// The model APIs only (Ollama, OpenAI, Anthropic), for other computers during an XTreme run.
+/// Nothing that changes lmdeck (/lmdeck/*, pull, delete, copy) is on it, and with a token every
+/// request must carry it (`Authorization: Bearer <token>` or `x-api-key: <token>`).
+fn lan_router(app: App, token: Option<String>) -> Router {
+    Router::new()
+        .route("/", get(root).head(root))
+        .route("/api/version", get(version))
+        .route("/api/tags", get(tags))
+        .route("/api/ps", get(ps))
+        .route("/api/show", post(show))
+        .route("/api/chat", post(chat))
+        .route("/api/generate", post(generate))
+        .route("/api/embed", post(embed))
+        .route("/api/embeddings", post(embeddings_legacy))
+        .route("/v1/models", get(v1_models))
+        .route("/v1/models/{*id}", get(v1_model))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/messages/count_tokens", post(anthropic_count))
+        .route("/v1/responses", post(openai_responses))
+        .route("/v1/{*rest}", any(v1_proxy))
+        .layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let token = token.clone();
+            async move {
+                if let Some(t) = token.as_deref() {
+                    let h = req.headers();
+                    let given = h.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim)
+                        .or_else(|| h.get("x-api-key").and_then(|v| v.to_str().ok()).map(str::trim));
+                    if given != Some(t) {
+                        return err(StatusCode::UNAUTHORIZED, "lmdeck XTreme: this endpoint needs its token (Authorization: Bearer <token>; lmdeck xtreme ip shows it)");
+                    }
+                }
+                log_requests(req, next).await
+            }
+        }))
+        .with_state(app)
+}
+
+/// Open the LAN listener on 0.0.0.0:`port` (again: the old one closes first).
+pub async fn lan_open(port: u16, token: Option<String>) -> Result<(), String> {
+    let app = APP.get().cloned().ok_or("the server is not up")?;
+    lan_close();
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.map_err(|e| format!("binding 0.0.0.0:{port}: {e}"))?;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    *LAN.lock().unwrap() = Some(tx);
+    let router = lan_router(app, token);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).with_graceful_shutdown(async move { let _ = rx.await; }).await;
+    });
+    sys::log(&format!("xtreme: model APIs open to the network on 0.0.0.0:{port}"));
+    Ok(())
+}
+
+pub fn lan_close() {
+    if let Some(tx) = LAN.lock().unwrap().take() {
+        let _ = tx.send(());
+        sys::log("xtreme: network listener closed");
+    }
+}
+
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let app = App {
@@ -122,6 +186,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .with_state(app.clone());
 
     // An XTreme run the last daemon left carries on (or ends, after a reboot).
+    let _ = APP.set(app.clone());
     crate::xtreme::resume(app.mgr.clone());
 
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| anyhow::anyhow!("binding {addr}: {e} (is Ollama or another lmdeck running?)"))?;

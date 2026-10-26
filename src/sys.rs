@@ -868,6 +868,7 @@ pub fn install_menu() -> anyhow::Result<PathBuf> {
     let block = format!(
         r#"  // lmdeck-menu-start
   "apps.lmdeck": {{"icon":"󰧑","label":"lmdeck","aliases":["lmdeck","llm","models","mlx","ollama","gguf","strata"],"description":"Local models on the Apple GPU: MLX, GGUF and Strata; Ollama/OpenAI-compatible server","action":"{launch} {exe}"}},
+  "apps.lmdeck-xtreme": {{"icon":"󱐋","label":"lmdeck XTreme","aliases":["xtreme","headless","overnight","lmdeck-xtreme"],"description":"Desktop off, the model in the freed memory: agents on a task list, or a model server for other computers","action":"{launch} {exe} xtreme plan"}},
   "setup.lmdeck-server": {{"icon":"󰒋","label":"Local LLM Server","aliases":["llm-server","lmdeck-server"],"description":"Toggle the lmdeck model server (port 11434)","action":"{exe} service toggle","checked":"systemctl --user is-active --quiet lmdeck"}},
   // lmdeck-menu-end
 "#

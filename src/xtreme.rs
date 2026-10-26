@@ -224,6 +224,8 @@ pub enum Phase {
     Running,
     /// No task left (an open-ended run): the model unloaded until one is added.
     Waiting,
+    /// A server run with nothing to do: the model stays loaded for whoever connects.
+    Serving,
     /// Close to the end: no new session starts.
     WindDown,
     /// The end: the desktop comes back when it runs out (a key adds an hour).
@@ -243,6 +245,7 @@ impl Phase {
             Phase::Loading => "loading the model",
             Phase::Running => "running",
             Phase::Waiting => "waiting for tasks",
+            Phase::Serving => "serving",
             Phase::WindDown => "winding down",
             Phase::Countdown => "back to the desktop soon",
             Phase::Returning => "returning to the desktop",
@@ -317,6 +320,15 @@ pub struct State {
     pub agent_bin: String,
     /// PATH of the shell that started the run: the agent's tools (cargo, git, ...) come from it.
     pub path_env: String,
+    /// A server run: the model stays loaded with or without tasks, nothing ends it early, and
+    /// thinking is not capped (the clients set their own).
+    pub serve: bool,
+    /// The model APIs open to the network on `lan_port` (`lan_open`: the listener is up,
+    /// `lan_firewall`: the firewall lets the port in).
+    pub lan: bool,
+    pub lan_port: u16,
+    pub lan_open: bool,
+    pub lan_firewall: bool,
     /// "on" | "off": the panel now.
     pub screen: String,
     pub screen_start: String,
@@ -447,7 +459,8 @@ async fn helper(dry: bool, args: &[&str]) -> Result<(), String> {
 /// Whether the helper may run without a password (`sudo -n -l` lists the command when allowed).
 fn helper_allowed(arg: &str) -> bool {
     std::process::Command::new("sudo")
-        .args(["-n", "-l", HELPER, arg])
+        .args(["-n", "-l", HELPER])
+        .args(arg.split(' '))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -512,6 +525,10 @@ pub struct StartReq {
     pub path_env: Option<String>,
     pub screen: Option<String>,
     pub reserve_gib: Option<f64>,
+    /// Server mode (also when there are no tasks).
+    pub serve: bool,
+    /// Open the model APIs to the network (default: on for a server run).
+    pub lan: Option<bool>,
 }
 
 /// The model a run loads: given, else xtreme.model, else the first Strata model, else the first local one.
@@ -547,11 +564,14 @@ pub fn start(mgr: Arc<Manager>, req: StartReq) -> Result<Value, String> {
         return Err("--away runs have no end; leave out --hours/--until".into());
     }
     let tasks_file = req.tasks.clone().map(|p| expand(&p)).unwrap_or_else(|| tasks_path(&cfg));
-    let text = std::fs::read_to_string(&tasks_file).map_err(|e| format!("{}: {e} (lmdeck xtreme tasks writes one)", tasks_file.display()))?;
-    let specs = parse_tasks(&text);
-    if specs.is_empty() && ends_at.is_some() {
-        return Err(format!("{}: no tasks (a `## title` section each)", tasks_file.display()));
-    }
+    // No task list, or an empty one, is a server run: tasks can come later (lmdeck xtreme add).
+    let specs = match std::fs::read_to_string(&tasks_file) {
+        Ok(text) => parse_tasks(&text),
+        Err(_) if req.tasks.is_none() => vec![],
+        Err(e) => return Err(format!("{}: {e}", tasks_file.display())),
+    };
+    let serve = req.serve || specs.is_empty();
+    let lan = req.lan.unwrap_or(serve);
     for s in &specs {
         if let Some(r) = &s.repo {
             if !expand(r).is_dir() {
@@ -581,12 +601,18 @@ pub fn start(mgr: Arc<Manager>, req: StartReq) -> Result<Value, String> {
         if !Path::new(HELPER).exists() {
             return Err(format!("{HELPER} is not installed (docs/XTREME.md, one-time setup)"));
         }
-        let mut need = vec!["desktop-stop", "desktop-start", "screen-off", "screen-on", "wall"];
+        let mut need = vec!["desktop-stop".to_string(), "desktop-start".into(), "screen-off".into(), "screen-on".into(), "wall".into()];
         if req.away {
-            need.extend(["remote-on", "remote-off", "watchdog-on", "watchdog-off"]);
+            need.extend(["remote-on", "remote-off", "watchdog-on", "watchdog-off"].map(String::from));
+        }
+        if lan {
+            need.extend([format!("lan-on {}", cfg.xtreme.lan_port), format!("lan-off {}", cfg.xtreme.lan_port)]);
         }
         if let Some(missing) = need.iter().find(|a| !helper_allowed(a)) {
-            return Err(format!("sudo does not allow `{HELPER} {missing}` without a password: install the sudoers rule from xtreme/ (docs/XTREME.md)"));
+            return Err(format!(
+                "sudo does not allow `{HELPER} {missing}` without a password: install the helper and the sudoers rule from xtreme/ again (docs/XTREME.md){}",
+                if missing.starts_with("lan-") { ", or start with --no-lan" } else { "" }
+            ));
         }
         if req.away && !Path::new("/usr/bin/tailscale").exists() {
             return Err("away mode needs Tailscale (docs/XTREME.md, away mode setup)".into());
@@ -608,6 +634,9 @@ pub fn start(mgr: Arc<Manager>, req: StartReq) -> Result<Value, String> {
         path_env: req.path_env.clone().unwrap_or_else(|| std::env::var("PATH").unwrap_or_default()),
         screen: "on".into(),
         screen_start: screen,
+        serve,
+        lan,
+        lan_port: cfg.xtreme.lan_port,
         ..Default::default()
     };
     {
@@ -620,6 +649,9 @@ pub fn start(mgr: Arc<Manager>, req: StartReq) -> Result<Value, String> {
             ends_at.map(|e| format!(", until {}", clock(e))).unwrap_or_else(|| ", no end".into()),
             if req.dry_run { " (dry run)" } else if req.away { " (away)" } else { "" }
         ));
+        if serve {
+            cur.note(format!("server mode{}", if lan { format!(": the model APIs on port {} for other computers", cfg.xtreme.lan_port) } else { String::new() }));
+        }
         save(&cur);
     }
     RESERVE.store((reserve.max(0.0) * (1u64 << 30) as f64) as u64, Ordering::Relaxed);
@@ -686,15 +718,24 @@ pub fn resume(mgr: Arc<Manager>) {
                 s.screen = "on".into();
                 s.remote = false;
                 s.watchdog = false;
+                s.lan_open = false;
             } else if matches!(s.phase, Phase::Running | Phase::Loading | Phase::WindDown) {
                 s.phase = Phase::Loading;
             }
         });
         let cfg = mgr.cfg();
         RESERVE.store((cfg.xtreme.reserve_gib.max(0.0) * (1u64 << 30) as f64) as u64, Ordering::Relaxed);
-        // The sleep lock went with the last daemon.
+        // The sleep lock and the network listener went with the last daemon.
         if !st.dry_run && !rebooted {
             *XT.inhibit.lock().unwrap() = take_sleep_lock();
+        }
+        if st.lan_open && !rebooted {
+            let (port, token) = (st.lan_port, lan_token(&cfg));
+            tokio::spawn(async move {
+                if let Err(e) = crate::server::lan_open(port, token).await {
+                    XT.with(|s| s.note(format!("the network listener did not open again: {e}")));
+                }
+            });
         }
     }
     spawn_driver(mgr);
@@ -877,13 +918,27 @@ async fn enter(mgr: &Manager, st: &State) {
     if st.screen_start == "off" && helper(dry, &["screen-off"]).await.is_ok() {
         XT.with(|s| s.screen = "off".into());
     }
+    if st.lan && !st.lan_open {
+        let port = st.lan_port.to_string();
+        let fw = helper(dry, &["lan-on", &port]).await;
+        let open = crate::server::lan_open(st.lan_port, lan_token(&mgr.cfg())).await;
+        XT.with(|s| {
+            s.lan_firewall = fw.is_ok() && !dry;
+            s.lan_open = open.is_ok();
+            match (&fw, &open) {
+                (_, Err(e)) => s.note(format!("the network listener did not open: {e}")),
+                (Err(e), _) => s.note(format!("the firewall step failed ({e}): other computers may not get in")),
+                _ => s.note(format!("model APIs open to the network on port {}", s.lan_port)),
+            }
+        });
+    }
     XT.with(|s| s.phase = Phase::Loading);
 }
 
 /// Unload what the busy desktop sized, wait for the freed memory to settle, load the model.
 async fn load(mgr: &Manager, st: &State) {
     let cfg = mgr.cfg();
-    THINKING_BUDGET.store(cfg.xtreme.thinking_budget, Ordering::Relaxed);
+    THINKING_BUDGET.store(if st.serve { 0 } else { cfg.xtreme.thinking_budget }, Ordering::Relaxed);
     if st.stop_requested {
         XT.with(|s| s.phase = Phase::Running);
         return;
@@ -1027,6 +1082,19 @@ async fn tick(mgr: &Arc<Manager>, st: &State) {
     }
     let st = XT.state();
     let Some(next) = st.tasks.iter().find(|t| !t.finished()).cloned() else {
+        if st.serve {
+            // The model stays loaded for whoever connects (loaded again if its engine died).
+            if !st.dry_run && !mgr.running().iter().any(|r| r.name == st.model) && !mgr.busy() && mgr.loading().is_none() {
+                XT.with(|s| {
+                    s.note(format!("{} is not loaded: loading it again", s.model));
+                    s.arena_gb = None;
+                    s.phase = Phase::Loading;
+                });
+            } else if st.phase != Phase::Serving {
+                XT.with(|s| s.phase = Phase::Serving);
+            }
+            return;
+        }
         if st.ends_at.is_some() {
             // A timed run with everything done gives the machine back early.
             XT.with(|s| {
@@ -1056,7 +1124,7 @@ async fn tick(mgr: &Arc<Manager>, st: &State) {
         });
         return;
     }
-    if st.phase == Phase::Waiting {
+    if matches!(st.phase, Phase::Waiting | Phase::Serving) {
         XT.with(|s| s.phase = Phase::Running);
     }
     let spec = specs.into_iter().find(|s| s.slug == next.slug).unwrap_or_default();
@@ -1545,6 +1613,10 @@ async fn go_back(mgr: &Manager) {
     if !dry {
         mgr.unload_all().await;
     }
+    crate::server::lan_close();
+    if st.lan_firewall {
+        let _ = helper(dry, &["lan-off", &st.lan_port.to_string()]).await;
+    }
     let _ = helper(dry, &["screen-on"]).await;
     if st.away {
         if st.remote {
@@ -1575,6 +1647,8 @@ async fn go_back(mgr: &Manager) {
         s.desktop_stopped = false;
         s.screen = "on".into();
         s.battery_limited = false;
+        s.lan_open = false;
+        s.lan_firewall = false;
         s.remote = false;
         s.watchdog = false;
         s.stop_requested = false;
@@ -1726,6 +1800,7 @@ pub fn view() -> Value {
         "ports": listening_ports(),
         "power": {"ac": ac, "charge": charge},
         "summary": summary_line(&st),
+        "lan": lan_view(&st),
         // Before a run: the titles in the task list, for the wall and the TUI tab.
         "planned": if st.phase.active() { vec![] } else {
             parse_tasks(&std::fs::read_to_string(tasks_path(&Config::load().unwrap_or_default())).unwrap_or_default()).into_iter().map(|t| t.title).collect::<Vec<_>>()
@@ -1734,6 +1809,49 @@ pub fn view() -> Value {
         "tasks_file": if st.tasks_file.is_empty() { tasks_path(&Config::load().unwrap_or_default()).display().to_string() } else { st.tasks_file.clone() },
         "report": report_path(),
     })
+}
+
+/// The run's token for the network listener: kept in the state dir (0600) and reused, so the
+/// other computer's settings survive from run to run. None with `xtreme.lan_auth = none`.
+pub fn lan_token(cfg: &Config) -> Option<String> {
+    if cfg.xtreme.lan_auth == "none" {
+        return None;
+    }
+    let p = dir().join("lan-token");
+    if let Some(t) = std::fs::read_to_string(&p).ok().map(|t| t.trim().to_string()).filter(|t| t.len() >= 16) {
+        return Some(t);
+    }
+    let mut b = [0u8; 16];
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).ok()?;
+    let t: String = format!("lmx-{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>());
+    let _ = std::fs::create_dir_all(dir());
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&p).ok()?;
+    use std::io::Write;
+    f.write_all(t.as_bytes()).ok()?;
+    Some(t)
+}
+
+/// Where other computers reach the run's model APIs, and with what.
+fn lan_view(st: &State) -> Value {
+    if !st.lan {
+        return Value::Null;
+    }
+    let cfg = Config::load().unwrap_or_default();
+    let urls: Vec<String> = sys::lan_ips().into_iter().map(|(_, ip)| format!("http://{ip}:{}", st.lan_port)).collect();
+    json!({"open": st.lan_open, "port": st.lan_port, "urls": urls, "token": lan_token(&cfg), "firewall": st.lan_firewall})
+}
+
+/// Settings for a client on another computer: Claude Code, OpenAI-compatible tools, Ollama clients.
+pub fn client_snippets(url: &str, token: Option<&str>, model: &str) -> Vec<String> {
+    let key = token.unwrap_or("lmdeck");
+    vec![
+        format!("Claude Code:  ANTHROPIC_BASE_URL={url} ANTHROPIC_AUTH_TOKEN={key} ANTHROPIC_MODEL={model} claude"),
+        format!("OpenAI API:   OPENAI_BASE_URL={url}/v1 OPENAI_API_KEY={key}   (model {model})"),
+        format!("Ollama API:   {url}  (OLLAMA_HOST={url}{})", if token.is_some() { "; the client must send the token as a Bearer key" } else { "" }),
+        format!("check:        curl -H 'Authorization: Bearer {key}' {url}/v1/models"),
+    ]
 }
 
 /// Request hints while a run holds: Strata's thinking capped (unless the client set its own).
@@ -1852,6 +1970,14 @@ pub enum XtCmd {
         /// GiB kept out of the arena for editing and builds (default xtreme.reserve_gib)
         #[arg(long)]
         reserve: Option<f64>,
+        /// Server mode: the model stays loaded for other computers, tasks optional (also without a task list)
+        #[arg(long)]
+        serve: bool,
+        /// Open the model APIs to the network on xtreme.lan_port (default with --serve)
+        #[arg(long, overrides_with = "no_lan")]
+        lan: bool,
+        #[arg(long)]
+        no_lan: bool,
     },
     /// One line of state
     Status {
@@ -1946,7 +2072,13 @@ pub fn status_line(v: &Value) -> String {
         None => format!("{el}, no end"),
     });
     let done = st.tasks.iter().filter(|t| t.status == "done").count();
-    parts.push(format!("{done} of {} done", st.tasks.len()));
+    if !st.tasks.is_empty() || !st.serve {
+        parts.push(format!("{done} of {} done", st.tasks.len()));
+    }
+    if st.lan {
+        let url = v["lan"]["urls"].as_array().and_then(|u| u.first()).and_then(|u| u.as_str()).unwrap_or("");
+        parts.push(format!("network {}", if v["lan"]["open"] == true { url } else { "not open" }));
+    }
     if let Some(sess) = &st.session {
         let i = st.tasks.iter().position(|t| t.slug == sess.slug).map(|i| i + 1).unwrap_or(0);
         let title = st.task(&sess.slug).map(|t| t.title.clone()).unwrap_or_default();
@@ -1989,7 +2121,7 @@ pub async fn cli(cfg: &Config, d: &crate::client::Daemon, cmd: Option<XtCmd>) ->
         Some(c) => c,
     };
     match cmd {
-        XtCmd::Start { hours, until, away, dry_run, tasks, model, agent, screen, reserve } => {
+        XtCmd::Start { hours, until, away, dry_run, tasks, model, agent, screen, reserve, serve, lan, no_lan } => {
             if !d.up().await {
                 crate::client::start_daemon()?;
                 for _ in 0..50 {
@@ -2006,10 +2138,14 @@ pub async fn cli(cfg: &Config, d: &crate::client::Daemon, cmd: Option<XtCmd>) ->
                 "model": model, "agent": agent,
                 "agent_bin": crate::config::which(&agent_name).map(|p| p.display().to_string()),
                 "path_env": std::env::var("PATH").unwrap_or_default(),
-                "screen": screen, "reserve_gib": reserve,
+                "screen": screen, "reserve_gib": reserve, "serve": serve,
+                "lan": if lan { Some(true) } else if no_lan { Some(false) } else { None },
             });
             let v = post(d, "start", body).await?;
             let st = view_state(&v);
+            if st.serve {
+                println!("server mode: {} stays loaded{}", st.model, if st.lan { "; other computers connect as `lmdeck xtreme ip` shows" } else { " (this machine only; --lan opens it to the network)" });
+            }
             println!("XTreme run started: {}, {} task(s){}", st.model, st.tasks.len(), st.ends_at.map(|e| format!(", the desktop comes back at {}", clock(e))).unwrap_or_else(|| ", no end (lmdeck xtreme stop ends it)".into()));
             if dry_run {
                 println!("dry run: the desktop, the screen and the model are left alone; `lmdeck xtreme watch` follows it");
@@ -2072,9 +2208,27 @@ pub async fn cli(cfg: &Config, d: &crate::client::Daemon, cmd: Option<XtCmd>) ->
             for (i, ip) in sys::lan_ips() {
                 println!("{i}: {ip}");
             }
+            let v = get_view(d).await.unwrap_or_default();
+            let st = view_state(&v);
+            let lan = &v["lan"];
+            if st.phase.active() && st.lan {
+                let token = lan["token"].as_str();
+                println!("\nmodel APIs for other computers{}:", if lan["open"] == true { "" } else { " (not open yet)" });
+                for url in lan["urls"].as_array().into_iter().flatten().filter_map(|u| u.as_str()) {
+                    println!("  {url}");
+                    for l in client_snippets(url, token, &st.model) {
+                        println!("    {l}");
+                    }
+                }
+                if token.is_some() {
+                    println!("  token: {} (xtreme.lan_auth = none turns it off)", token.unwrap_or(""));
+                }
+            } else {
+                println!("\nno run with the network listener (lmdeck xtreme start --serve)");
+            }
             let ports = listening_ports();
             println!("listening (not localhost): {}", if ports.is_empty() { "none".into() } else { ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ") });
-            println!("ufw is active here: another machine reaches a port after `sudo ufw allow PORT`");
+            println!("ufw is active here: a run with the network listener opens its own port; for anything else `sudo ufw allow PORT`");
             Ok(())
         }
         XtCmd::Open { file, lsp } => run(&editor_argv(cfg, Path::new(&file), lsp, None)),
