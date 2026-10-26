@@ -456,15 +456,44 @@ async fn helper(dry: bool, args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// Whether the helper may run without a password (`sudo -n -l` lists the command when allowed).
+/// Whether the helper may run with `arg` without a password. `sudo -n -l <cmd>` is no test: it
+/// succeeds for any command the user may run at all, with a password too (`(ALL : ALL) ALL`), so
+/// this reads the NOPASSWD rules and matches the argument against the rule's pattern (sudoers
+/// patterns `^...$` are POSIX extended regexes: grep -E).
 fn helper_allowed(arg: &str) -> bool {
-    std::process::Command::new("sudo")
-        .args(["-n", "-l", HELPER])
-        .args(arg.split(' '))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    let Ok(o) = std::process::Command::new("sudo").args(["-n", "-l"]).stderr(std::process::Stdio::null()).output() else { return false };
+    nopasswd_allows(&String::from_utf8_lossy(&o.stdout), HELPER, arg, |pat, arg| {
+        std::process::Command::new("grep")
+            .args(["-Eqx", "--", pat.trim_start_matches('^').trim_end_matches('$')])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.take().map(|mut i| i.write_all(arg.as_bytes()));
+                c.wait()
+            })
+            .is_ok_and(|s| s.success())
+    })
+}
+
+/// The rule check behind `helper_allowed`, on `sudo -l`'s listing.
+fn nopasswd_allows(listing: &str, cmd: &str, arg: &str, matches: impl Fn(&str, &str) -> bool) -> bool {
+    listing.lines().filter_map(|l| l.split_once("NOPASSWD:").map(|x| x.1)).any(|cmds| {
+        cmds.split(", ").map(str::trim).any(|c| {
+            if c == "ALL" {
+                return true;
+            }
+            match c.strip_prefix(cmd) {
+                Some("") => true,
+                Some(rest) if rest.starts_with(' ') => {
+                    let pat = rest.trim();
+                    if pat.starts_with('^') { matches(pat, arg) } else { pat == arg }
+                }
+                _ => false,
+            }
+        })
+    })
 }
 
 fn user_name() -> String {
@@ -2354,6 +2383,27 @@ mod tests {
         assert!(transcript_event(&r).text.unwrap().contains("93 passed"));
         let done = json!({"type": "result", "subtype": "success", "num_turns": 9, "duration_ms": 61000});
         assert_eq!(transcript_event(&done).text.as_deref(), Some("== result: success after 9 turn(s), 61 s"));
+    }
+
+    #[test]
+    fn nopasswd_rules_not_password_rules() {
+        let listing = "User u may run the following commands on h:\n    (ALL : ALL) ALL\n    (root) NOPASSWD: /usr/local/libexec/lmdeck-xtreme-root ^(desktop-stop|wall|battery-limit (80|100))$\n    (root) NOPASSWD: /usr/bin/x a, /usr/bin/x b\n";
+        // A stand-in for grep -E: the alternatives of the rule.
+        let m = |pat: &str, arg: &str| pat.trim_start_matches("^(").trim_end_matches(")$").replace("battery-limit (80|100)", "battery-limit 80|battery-limit 100").split('|').any(|a| a == arg);
+        assert!(nopasswd_allows(listing, HELPER, "desktop-stop", m));
+        assert!(nopasswd_allows(listing, HELPER, "battery-limit 80", m));
+        assert!(!nopasswd_allows(listing, HELPER, "lan-on 11435", m), "allowed only with a password");
+        assert!(nopasswd_allows(listing, "/usr/bin/x", "b", m));
+        assert!(nopasswd_allows("    (ALL) NOPASSWD: ALL\n", HELPER, "anything", m));
+    }
+
+    /// `cargo test helper_rules_here -- --ignored --nocapture`: what this machine's sudo rules allow.
+    #[test]
+    #[ignore]
+    fn helper_rules_here() {
+        for a in ["desktop-stop", "wall", "battery-limit 80", "battery-limit 90", "lan-on 11435", "bogus"] {
+            println!("{a}: {}", helper_allowed(a));
+        }
     }
 
     #[test]
