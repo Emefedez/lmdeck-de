@@ -33,6 +33,34 @@ const DEADMAN_SECS: u64 = 15 * 60;
 pub static THINKING_BUDGET: AtomicU32 = AtomicU32::new(0);
 /// Memory kept free at load while a run holds, in bytes (0 = server.mem_reserve_gib).
 pub static RESERVE: AtomicU64 = AtomicU64::new(0);
+/// The run's profile while one holds: (the run's model, Strata's context; 0 = its own).
+static PROFILE: std::sync::RwLock<Option<(String, u32)>> = std::sync::RwLock::new(None);
+
+/// While a run holds, the settings go to their maximum for one model on an empty machine:
+/// resident for good, all the GPU heap that is safe, every cache and conversation kept, and
+/// Strata's context grown. Applied over the config in memory (Manager::cfg), never written to the
+/// file. The prompt path, prompt groups and system prompts stay as set.
+pub fn overlay(c: &mut Config) {
+    let Some((model, context)) = PROFILE.read().unwrap().clone() else { return };
+    c.server.keep_alive = "-1".into();
+    c.server.max_loaded = 1;
+    c.server.gpu_heap = "auto".into();
+    c.server.uclamp_boost = true;
+    c.strata.sessions = "keep".into();
+    c.strata.prefix_reuse = "system".into();
+    c.mlx.prefix_checkpoints = true;
+    c.mlx.prompt_cache_size = c.mlx.prompt_cache_size.max(16);
+    c.mlx.prompt_cache_gib = 0.0;
+    c.mlx.cache_limit_gib = c.mlx.cache_limit_gib.max(2.0);
+    c.llama.cache_reuse = c.llama.cache_reuse.max(256);
+    if context > 0 && model.starts_with("strata/") {
+        c.overrides.entry(model).or_default().ctx_size = Some(context);
+    }
+}
+
+fn set_profile(p: Option<(String, u32)>) {
+    *PROFILE.write().unwrap() = p;
+}
 
 pub fn dir() -> PathBuf {
     state_dir().join("xtreme")
@@ -346,6 +374,9 @@ pub struct State {
     pub session: Option<Session>,
     pub sessions: u32,
     pub turns: u32,
+    /// The online model the agent may ask ("off" = none), and how many questions it asked.
+    pub delegate: String,
+    pub delegations: u32,
     /// What happened, newest last ("HH:MM text").
     pub log: Vec<String>,
     pub ended: Option<u64>,
@@ -496,6 +527,38 @@ fn nopasswd_allows(listing: &str, cmd: &str, arg: &str, matches: impl Fn(&str, &
     })
 }
 
+/// Panel or keyboard brightness without a desktop session: `sudo -n brightnessctl` (logind only
+/// lets a session's own user set it). `step`: up, down (a tenth) or a percentage. Returns the new
+/// percentage.
+pub fn brightness(target: &str, step: &str) -> Result<u64, String> {
+    let dev = match target {
+        "screen" => "apple-panel-bl",
+        "kbd" | "keyboard" => "kbd_backlight",
+        _ => return Err("screen or kbd".into()),
+    };
+    let value = match step {
+        "up" => "10%+".to_string(),
+        "down" => "10%-".to_string(),
+        p => match p.trim_end_matches('%').parse::<u64>() {
+            Ok(n) if n <= 100 => format!("{n}%"),
+            _ => return Err("up, down or 0-100".into()),
+        },
+    };
+    // The panel never goes to 0 here (that is screen off).
+    let min = if dev == "apple-panel-bl" { "1" } else { "0" };
+    let o = std::process::Command::new("sudo")
+        .args(["-n", "/usr/bin/brightnessctl", "-q", "-m", "-n", min, "-d", dev, "set", &value])
+        .output()
+        .map_err(|e| format!("sudo: {e}"))?;
+    if !o.status.success() {
+        return Err(format!("brightnessctl: {} (the sudoers rule from xtreme/ allows it without a password)", String::from_utf8_lossy(&o.stderr).trim()));
+    }
+    // -m: "device,class,current,percent,max"
+    let o = std::process::Command::new("brightnessctl").args(["-m", "-d", dev, "info"]).output().map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&o.stdout);
+    Ok(text.split(',').nth(3).and_then(|p| p.trim().trim_end_matches('%').parse().ok()).unwrap_or(0))
+}
+
 fn user_name() -> String {
     std::env::var("USER").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| {
         let pw = unsafe { libc::getpwuid(libc::getuid()) };
@@ -558,6 +621,8 @@ pub struct StartReq {
     pub serve: bool,
     /// Open the model APIs to the network (default: on for a server run).
     pub lan: Option<bool>,
+    /// Online help for the agent: off | claude | codex | custom (default xtreme.delegate).
+    pub delegate: Option<String>,
 }
 
 /// The model a run loads: given, else xtreme.model, else the first Strata model, else the first local one.
@@ -666,6 +731,7 @@ pub fn start(mgr: Arc<Manager>, req: StartReq) -> Result<Value, String> {
         serve,
         lan,
         lan_port: cfg.xtreme.lan_port,
+        delegate: req.delegate.clone().unwrap_or_else(|| cfg.xtreme.delegate.clone()),
         ..Default::default()
     };
     {
@@ -754,6 +820,7 @@ pub fn resume(mgr: Arc<Manager>) {
         });
         let cfg = mgr.cfg();
         RESERVE.store((cfg.xtreme.reserve_gib.max(0.0) * (1u64 << 30) as f64) as u64, Ordering::Relaxed);
+        set_profile(Some((st.model.clone(), if st.model.starts_with("strata/") { cfg.xtreme.context } else { 0 })));
         // The sleep lock and the network listener went with the last daemon.
         if !st.dry_run && !rebooted {
             *XT.inhibit.lock().unwrap() = take_sleep_lock();
@@ -787,6 +854,31 @@ pub fn control(mgr: Arc<Manager>, action: &str, b: &Value) -> Result<Value, Stri
     let st = XT.state();
     if action == "add" {
         return add_task(&mgr.cfg(), &st, b["text"].as_str().unwrap_or(""), b["repo"].as_str());
+    }
+    if action == "brightness" {
+        // Also without a run: on a text console there is no other way.
+        return brightness(b["target"].as_str().unwrap_or("screen"), b["step"].as_str().unwrap_or("up")).map(|p| json!({"percent": p}));
+    }
+    if action == "delegate-start" {
+        let cfg = mgr.cfg();
+        if !st.phase.active() || st.delegate.is_empty() || st.delegate == "off" {
+            return Err("delegation is off for this run (xtreme.delegate, or start --delegate claude|codex)".into());
+        }
+        if st.delegations >= cfg.xtreme.delegate_max {
+            return Err(format!("this run's {} questions to the online model are used up; decide without it", cfg.xtreme.delegate_max));
+        }
+        let q = b["question"].as_str().unwrap_or("").lines().next().unwrap_or("").chars().take(80).collect::<String>();
+        let n = XT.with(|s| {
+            s.delegations += 1;
+            s.note(format!("asks {} ({} of {}): {q}", s.delegate, s.delegations, cfg.xtreme.delegate_max));
+            s.delegations
+        });
+        return Ok(json!({"provider": st.delegate, "model": cfg.xtreme.delegate_model, "cmd": cfg.xtreme.delegate_cmd, "n": n, "max": cfg.xtreme.delegate_max}));
+    }
+    if action == "delegate-done" {
+        let (secs, ok) = (b["secs"].as_f64().unwrap_or(0.0), b["ok"].as_bool().unwrap_or(false));
+        XT.with(|s| s.note(format!("{} answered{} in {secs:.0} s", s.delegate, if ok { "" } else { " with an error" })));
+        return Ok(json!({"ok": true}));
     }
     if !st.phase.active() {
         return Err("no XTreme run (lmdeck xtreme start)".into());
@@ -973,6 +1065,7 @@ async fn load(mgr: &Manager, st: &State) {
         return;
     }
     if st.dry_run {
+        set_profile(Some((st.model.clone(), if st.model.starts_with("strata/") { cfg.xtreme.context } else { 0 })));
         XT.with(|s| {
             s.note("dry run: the model is not loaded");
             s.phase = Phase::Running;
@@ -994,8 +1087,23 @@ async fn load(mgr: &Manager, st: &State) {
         }
         last = a;
     }
-    XT.with(|s| s.note(format!("loading {} with {:.1} GiB free", s.model, sys::mem().1 as f64 / (1u64 << 30) as f64)));
-    match mgr.acquire(&st.model, Some("-1")).await {
+    let context = if st.model.starts_with("strata/") { cfg.xtreme.context } else { 0 };
+    set_profile(Some((st.model.clone(), context)));
+    XT.with(|s| s.note(format!(
+        "loading {} with {:.1} GiB free{}",
+        s.model,
+        sys::mem().1 as f64 / (1u64 << 30) as f64,
+        if context > 0 { format!(", context {}k", context / 1024) } else { String::new() }
+    )));
+    let mut res = mgr.acquire(&st.model, Some("-1")).await;
+    if res.is_err() && context > 0 {
+        // The grown context did not fit: the model's own, once.
+        XT.with(|s| s.note(format!("the {}k context did not load ({}); trying the model's own", context / 1024, res.as_ref().err().map(|e| format!("{e:#}").chars().take(160).collect::<String>()).unwrap_or_default())));
+        set_profile(Some((st.model.clone(), 0)));
+        mgr.unload_all().await;
+        res = mgr.acquire(&st.model, Some("-1")).await;
+    }
+    match res {
         Ok((_guard, secs)) => {
             let arena = mgr.resolve(&st.model).ok().and_then(|m| arena_gb(&m));
             XT.with(|s| {
@@ -1244,6 +1352,21 @@ left, in a few short lines.\n\
 `STATUS: blocked: <why>`.\n\
 - Keep thinking short and turns small. Stop early rather than run out of turns or time.";
 
+/// The rules, plus the line about the online model when the run allows one (the same text every
+/// session of a run, so it stays in the shared prefix).
+pub fn rules(st: &State, cfg: &Config) -> String {
+    if st.delegate.is_empty() || st.delegate == "off" {
+        return RULES.to_string();
+    }
+    format!(
+        "{RULES}\n- For a hard sub-problem (a bug you cannot find, a design choice, an unfamiliar API) you may ask a \
+stronger online model: run `lmdeck xtreme delegate \"<a self-contained question>\"` in this directory. It can read \
+the files here but changes nothing, and it does not see this conversation: say what you know and what you tried. At \
+most {} questions in the whole run, so ask only when it saves real time; apply its answer yourself.",
+        cfg.xtreme.delegate_max
+    )
+}
+
 pub fn session_prompt(spec: &TaskSpec, t: &TaskState, n: u32, turns: u32, minutes: u32, notes: &str) -> String {
     let mut p = format!("TASK: {}\n\n{}\n\n", spec.title, if spec.body.is_empty() { "(no details: the title is the task)" } else { &spec.body });
     p.push_str(&format!("WHERE: {}", t.workdir().display()));
@@ -1294,12 +1417,12 @@ async fn start_session(cfg: &Config, st: &State, t: &TaskState, spec: &TaskSpec)
             cmd.env("OPENCODE_CONFIG_CONTENT", crate::launch::opencode_config(cfg, &st.model).to_string())
                 .args(["run", "--auto", "--format", "json", "-m", &format!("lmdeck/{}", st.model)])
                 .args(&cfg.xtreme.agent_args)
-                .arg(format!("{RULES}\n\n{prompt}"));
+                .arg(format!("{}\n\n{prompt}", rules(st, cfg)));
         }
         _ => {
             cmd.envs(crate::launch::claude_env(cfg, &st.model))
                 .args(["-p", &prompt, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"])
-                .args(["--max-turns", &turns.to_string(), "--append-system-prompt", RULES])
+                .args(["--max-turns", &turns.to_string(), "--append-system-prompt", &rules(st, cfg)])
                 .args(&cfg.xtreme.agent_args);
         }
     }
@@ -1638,6 +1761,7 @@ async fn go_back(mgr: &Manager) {
     XT.with(|s| s.note("returning to the desktop"));
     THINKING_BUDGET.store(0, Ordering::Relaxed);
     RESERVE.store(0, Ordering::Relaxed);
+    set_profile(None);
     // Its arena was sized for an empty machine; the desktop needs that memory back.
     if !dry {
         mgr.unload_all().await;
@@ -1830,6 +1954,7 @@ pub fn view() -> Value {
         "power": {"ac": ac, "charge": charge},
         "summary": summary_line(&st),
         "lan": lan_view(&st),
+        "delegate_max": Config::load().unwrap_or_default().xtreme.delegate_max,
         // Before a run: the titles in the task list, for the wall and the TUI tab.
         "planned": if st.phase.active() { vec![] } else {
             parse_tasks(&std::fs::read_to_string(tasks_path(&Config::load().unwrap_or_default())).unwrap_or_default()).into_iter().map(|t| t.title).collect::<Vec<_>>()
@@ -2002,6 +2127,9 @@ pub enum XtCmd {
         /// Server mode: the model stays loaded for other computers, tasks optional (also without a task list)
         #[arg(long)]
         serve: bool,
+        /// Online help for the agent: off | claude | codex | custom (default xtreme.delegate)
+        #[arg(long)]
+        delegate: Option<String>,
         /// Open the model APIs to the network on xtreme.lan_port (default with --serve)
         #[arg(long, overrides_with = "no_lan")]
         lan: bool,
@@ -2057,6 +2185,16 @@ pub enum XtCmd {
     },
     /// LAN addresses and the ports apps listen on
     Ip,
+    /// Screen or keyboard brightness (on the wall: the brightness keys, F1/F2 and F5/F6 with Fn, [ ] and { })
+    Brightness {
+        #[arg(value_parser = ["screen", "kbd"])]
+        target: String,
+        /// up, down, or a percentage
+        step: String,
+    },
+    /// Ask the online model (xtreme.delegate) a question about the files here; it changes nothing.
+    /// For the local agent during a run; prints the answer
+    Delegate { question: Vec<String> },
     /// More time before the desktop comes back
     Extend {
         #[arg(long, default_value_t = 60)]
@@ -2150,7 +2288,7 @@ pub async fn cli(cfg: &Config, d: &crate::client::Daemon, cmd: Option<XtCmd>) ->
         Some(c) => c,
     };
     match cmd {
-        XtCmd::Start { hours, until, away, dry_run, tasks, model, agent, screen, reserve, serve, lan, no_lan } => {
+        XtCmd::Start { hours, until, away, dry_run, tasks, model, agent, screen, reserve, serve, delegate, lan, no_lan } => {
             if !d.up().await {
                 crate::client::start_daemon()?;
                 for _ in 0..50 {
@@ -2167,7 +2305,7 @@ pub async fn cli(cfg: &Config, d: &crate::client::Daemon, cmd: Option<XtCmd>) ->
                 "model": model, "agent": agent,
                 "agent_bin": crate::config::which(&agent_name).map(|p| p.display().to_string()),
                 "path_env": std::env::var("PATH").unwrap_or_default(),
-                "screen": screen, "reserve_gib": reserve, "serve": serve,
+                "screen": screen, "reserve_gib": reserve, "serve": serve, "delegate": delegate,
                 "lan": if lan { Some(true) } else if no_lan { Some(false) } else { None },
             });
             let v = post(d, "start", body).await?;
@@ -2208,6 +2346,16 @@ pub async fn cli(cfg: &Config, d: &crate::client::Daemon, cmd: Option<XtCmd>) ->
             println!("{}", status_line(&v));
             Ok(())
         }
+        XtCmd::Brightness { target, step } => {
+            let p = match post(d, "brightness", json!({"target": target, "step": step})).await {
+                Ok(v) => v["percent"].as_u64().unwrap_or(0),
+                // No server: the same thing directly.
+                Err(_) => brightness(&target, &step).map_err(anyhow::Error::msg)?,
+            };
+            println!("{target}: {p}%");
+            Ok(())
+        }
+        XtCmd::Delegate { question } => delegate(d, &question.join(" ")).await,
         XtCmd::Screen { state } => {
             post(d, "screen", json!({"on": state == "on"})).await?;
             Ok(())
@@ -2288,6 +2436,87 @@ pub async fn cli(cfg: &Config, d: &crate::client::Daemon, cmd: Option<XtCmd>) ->
         }
         XtCmd::Wall | XtCmd::Plan => unreachable!(),
     }
+}
+
+/// The variables lmdeck sets for the local agent; the online model must not see them (they would
+/// point it back at the local model).
+const LOCAL_ENV: &[&str] = &[
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL", "API_TIMEOUT_MS",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT",
+    "OPENCODE_CONFIG_CONTENT", "CODEX_OSS_BASE_URL", "OLLAMA_HOST",
+];
+
+/// The online model's command line, read-only: Claude Code without its editing and shell tools,
+/// Codex in its read-only sandbox, or the configured command.
+pub fn delegate_argv(provider: &str, model: &str, custom: &str, question: &str, out: &Path) -> Result<Vec<String>, String> {
+    let mut v: Vec<String> = match provider {
+        "claude" => {
+            let mut v: Vec<String> = vec!["claude".into(), "-p".into(), question.into(), "--output-format".into(), "text".into(), "--max-turns".into(), "30".into(), "--no-session-persistence".into()];
+            if !model.is_empty() {
+                v.extend(["--model".into(), model.into()]);
+            }
+            v.extend(["--disallowedTools".into(), "Edit".into(), "Write".into(), "NotebookEdit".into(), "Bash".into()]);
+            return Ok(v);
+        }
+        "codex" => {
+            let mut v: Vec<String> = vec!["codex".into(), "exec".into(), "--sandbox".into(), "read-only".into(), "--skip-git-repo-check".into(), "--output-last-message".into(), out.display().to_string()];
+            if !model.is_empty() {
+                v.extend(["-m".into(), model.into()]);
+            }
+            v
+        }
+        "custom" if !custom.trim().is_empty() => custom.split_whitespace().map(str::to_string).collect(),
+        "custom" => return Err("xtreme.delegate_cmd is empty".into()),
+        other => return Err(format!("unknown delegate {other}")),
+    };
+    v.push(question.into());
+    Ok(v)
+}
+
+/// `lmdeck xtreme delegate "question"`: one question to the online model, within the run's budget.
+async fn delegate(d: &crate::client::Daemon, question: &str) -> anyhow::Result<()> {
+    let mut question = question.trim().to_string();
+    if question.is_empty() || question == "-" {
+        use std::io::Read;
+        std::io::stdin().read_to_string(&mut question)?;
+    }
+    if question.trim().is_empty() {
+        anyhow::bail!("no question");
+    }
+    let grant = post(d, "delegate-start", json!({"question": question})).await?;
+    let out = std::env::temp_dir().join(format!("lmdeck-delegate-{}.txt", std::process::id()));
+    let argv = delegate_argv(grant["provider"].as_str().unwrap_or(""), grant["model"].as_str().unwrap_or(""), grant["cmd"].as_str().unwrap_or(""), &question, &out)
+        .map_err(anyhow::Error::msg)?;
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    for k in LOCAL_ENV {
+        cmd.env_remove(k);
+    }
+    let t0 = std::time::Instant::now();
+    let r = tokio::time::timeout(Duration::from_secs(15 * 60), cmd.output()).await;
+    let (ok, text) = match r {
+        Ok(Ok(o)) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            if let Ok(last) = std::fs::read_to_string(&out) {
+                text = last;
+            }
+            if !o.status.success() {
+                text.push_str(&format!("\n(the online model's command failed: {})\n{}", o.status, String::from_utf8_lossy(&o.stderr).lines().rev().take(5).collect::<Vec<_>>().join("\n")));
+            }
+            (o.status.success(), text)
+        }
+        Ok(Err(e)) => (false, format!("could not run {}: {e}", argv[0])),
+        Err(_) => (false, "the online model did not answer within 15 minutes".into()),
+    };
+    let _ = std::fs::remove_file(&out);
+    let _ = post(d, "delegate-done", json!({"secs": t0.elapsed().as_secs_f64(), "ok": ok})).await;
+    println!("{}", text.trim());
+    println!("(question {} of {} for this run)", grant["n"], grant["max"]);
+    if !ok {
+        anyhow::bail!("no answer");
+    }
+    Ok(())
 }
 
 /// `lmdeck xtreme watch`: the wall as plain text, reprinted on every change (the daemon's
@@ -2404,6 +2633,41 @@ mod tests {
         for a in ["desktop-stop", "wall", "battery-limit 80", "battery-limit 90", "lan-on 11435", "bogus"] {
             println!("{a}: {}", helper_allowed(a));
         }
+    }
+
+    #[test]
+    fn a_run_profile_maxes_caches_and_grows_strata_context_in_memory_only() {
+        let mut c = Config::default();
+        c.server.keep_alive = "5m".into();
+        c.strata.prompt_path = "2048".into();
+        c.mlx.cache_limit_gib = 1.0;
+        overlay(&mut c);
+        assert_eq!(c.server.keep_alive, "5m", "no run: nothing changes");
+        set_profile(Some(("strata/q2_0".into(), 262_144)));
+        overlay(&mut c);
+        set_profile(None);
+        assert_eq!(c.server.keep_alive, "-1");
+        assert_eq!(c.strata.sessions, "keep");
+        assert_eq!(c.mlx.cache_limit_gib, 2.0);
+        assert_eq!(c.overrides["strata/q2_0"].ctx_size, Some(262_144));
+        assert_eq!(c.strata.prompt_path, "2048", "the prompt settings stay as set");
+    }
+
+    #[test]
+    fn delegation_is_read_only_and_announced_in_the_rules() {
+        let out = Path::new("/tmp/x");
+        let a = delegate_argv("claude", "opus", "", "why does it hang?", out).unwrap();
+        assert_eq!(&a[..3], ["claude", "-p", "why does it hang?"]);
+        assert!(a.windows(2).any(|w| w == ["--model", "opus"]));
+        assert!(a.ends_with(&["--disallowedTools".into(), "Edit".into(), "Write".into(), "NotebookEdit".into(), "Bash".into()]));
+        let c = delegate_argv("codex", "", "", "q", out).unwrap();
+        assert!(c.windows(2).any(|w| w == ["--sandbox", "read-only"]) && c.last().unwrap() == "q");
+        assert_eq!(delegate_argv("custom", "", "gemini -p", "q", out).unwrap(), ["gemini", "-p", "q"]);
+        let cfg = Config::default();
+        let mut st = State::default();
+        assert_eq!(rules(&st, &cfg), RULES);
+        st.delegate = "claude".into();
+        assert!(rules(&st, &cfg).contains("lmdeck xtreme delegate") && rules(&st, &cfg).contains("At most 10 questions"));
     }
 
     #[test]

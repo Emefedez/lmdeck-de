@@ -2,3 +2,5 @@
 # for away mode Tailscale, the charge limit and the hardware watchdog, and for server runs the firewall port of the
 # network listener; nothing else.
 %USER% ALL=(root) NOPASSWD: /usr/local/libexec/lmdeck-xtreme-root ^(desktop-stop|desktop-start|screen-off|screen-on|wall|remote-on|remote-off|battery-limit (80|100)|watchdog-on|watchdog-off|lan-(on|off) [0-9]{4,5})$
+# Brightness of the panel and the keyboard without a desktop session (logind only lets a session's own user set it).
+%USER% ALL=(root) NOPASSWD: /usr/bin/brightnessctl

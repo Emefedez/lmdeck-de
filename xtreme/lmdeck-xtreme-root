@@ -4,6 +4,9 @@ set -eu
 fb=/sys/class/graphics/fb0/blank
 bl=/sys/class/backlight/apple-panel-bl/bl_power
 bat=/sys/class/power_supply/macsmc-battery/charge_control_end_threshold
+kbd=/sys/class/leds/kbd_backlight/brightness
+# the keyboard's brightness while the panel is off (restored with the panel)
+kbd_saved=/run/lmdeck-xtreme-kbd
 # The wall's console: above the six that logind gives gettys (NAutoVTs), so nothing else claims it.
 vt=8
 # sudo passes the arguments one by one; the rule matches them as one string, and so does this
@@ -15,8 +18,15 @@ case "$*" in
     exec /usr/bin/systemctl start sddm.service ;;
   # panel off through the console's framebuffer (DRM fbdev blank, 4 = powerdown); the backlight too, in case the
   # blank alone leaves it lit
-  screen-off) echo 4 > "$fb" 2>/dev/null || true; [ -w "$bl" ] && echo 4 > "$bl"; exit 0 ;;
-  screen-on)  [ -w "$bl" ] && echo 0 > "$bl"; echo 0 > "$fb" 2>/dev/null || true; exit 0 ;;
+  # (and the keyboard's backlight off with it, back as it was with it)
+  screen-off)
+    echo 4 > "$fb" 2>/dev/null || true; [ -w "$bl" ] && echo 4 > "$bl"
+    if [ -w "$kbd" ] && [ ! -e "$kbd_saved" ]; then cat "$kbd" > "$kbd_saved"; echo 0 > "$kbd"; fi
+    exit 0 ;;
+  screen-on)
+    [ -w "$bl" ] && echo 0 > "$bl"; echo 0 > "$fb" 2>/dev/null || true
+    if [ -e "$kbd_saved" ]; then cat "$kbd_saved" > "$kbd" 2>/dev/null || true; rm -f "$kbd_saved"; fi
+    exit 0 ;;
   # the wall on a console of its own, as the user who ran sudo, with the Terminus 16x32 font (that console only)
   wall)
     u="${SUDO_USER:?run through sudo}"
@@ -24,6 +34,11 @@ case "$*" in
     exe="$h/.local/bin/lmdeck"
     [ -x "$exe" ] || exe=/usr/bin/lmdeck
     /usr/bin/setfont -C "/dev/tty$vt" ter-132n 2>/dev/null || true
+    # The brightness and keyboard-light keys mean nothing on a text console: give them F13-F16, which the console
+    # sends as ordinary escape sequences, so the wall reads them as keys (no input-device listener). Only these four
+    # keycodes change, and only for the text consoles; the desktop reads the keyboard itself.
+    printf 'keycode 224 = F13\nkeycode 225 = F14\nkeycode 229 = F15\nkeycode 230 = F16\n' > /run/lmdeck-xtreme.keymap
+    /usr/bin/loadkeys -C "/dev/tty$vt" /run/lmdeck-xtreme.keymap >/dev/null 2>&1 || true
     # a system unit of its own, so the wall outlives whoever started it (lmdeck's service restarting included)
     if ! /usr/bin/systemctl is-active --quiet lmdeck-xtreme-wall.service; then
       /usr/bin/systemd-run --quiet --unit=lmdeck-xtreme-wall --collect --uid="$u" --gid="$(id -g "$u")" \

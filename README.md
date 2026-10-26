@@ -104,6 +104,11 @@ server. The model stays loaded in the freed memory, and other computers reach it
 on port 11435 with a token (`lmdeck xtreme ip` prints the client settings); lmdeck's control API stays local. Tasks
 can still be added during the run.
 
+During a run every setting is at its maximum in memory (resident model, all the safe GPU heap, every cache kept;
+the prompt settings stay as set), and Strata's context grows from 32K to 262K, which costs it about a gigabyte. The
+brightness keys work on the console (`brightnessctl` through sudo), and with `xtreme.delegate` the local agent may
+ask an online model (Claude Code with your login, or Codex) a few questions a run, read-only.
+
 Each task works on its own branch (`xtreme/<task>`) in a worktree, so your checkout is never touched; the agent
 commits what works and keeps its notes in the task's `PROGRESS.md`, which is all the next session knows. A task ends
 as done (its notes say `STATUS: done` and its `check:` passes), blocked, stuck (two sessions with no commit and no

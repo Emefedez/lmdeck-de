@@ -49,6 +49,40 @@ OpenAI API:   OPENAI_BASE_URL=http://192.168.0.36:11435/v1 OPENAI_API_KEY=lmx-..
 The wall's header shows the address and the token; its NOW pane, the request in flight, the last request's speed
 and today's requests.
 
+## The run's profile: everything at its maximum (but the prompt)
+
+While a run holds, lmdeck lays a profile over its settings, in memory only (`config.toml` is not touched, and the
+status and Settings show the values in force): the model stays resident (`keep_alive -1`, one model at a time), the
+GPU heap is `auto` (all the safe free memory, the expert arena for Strata), every cache is kept (Strata's
+conversation sessions and shared system prefix, MLX prompt cache 16 entries and prefix checkpoints, a 2 GB MLX
+buffer cache, llama.cpp cache reuse), uclamp boost on. The prompt path, the prompt groups and the system prompts stay
+as you set them.
+
+**The context grows.** Strata runs with `--max-context 32768` normally; in a run it gets `xtreme.context`, by default
+262144, the engine's maximum. That is cheap on this model: only its long-range attention layers keep per-token state,
+about 64 MiB a layer at 262K (Strata's `session.cpp`), so roughly a gigabyte of a ~15 GB arena; the arena the load
+ends up with is in the run's log. If the grown window does not load, the run loads the model's own once. MLX and GGUF
+contexts stay as set (their KV cache is not cheap).
+
+## Brightness without a desktop
+
+Off the desktop, logind lets nobody set the brightness, so a sudoers line allows `brightnessctl` without a password
+(`xtreme/lmdeck-xtreme.sudoers`). On the wall, the Mac's brightness and keyboard-light keys work: the helper's `wall`
+step maps their keycodes to F13-F16 in the console keymap (only those four keys, only on the text consoles; the
+desktop reads the keyboard itself), so they reach the wall as keys; no listener runs. F1/F2 and F5/F6 (with Fn) and
+`[` `]` `{` `}` do the same. `lmdeck xtreme brightness screen|kbd up|down|PERCENT` works from any console or ssh, with
+or without a run. The keyboard's light goes off with the panel and comes back with it.
+
+## Online help: delegation
+
+`xtreme.delegate` (or `start --delegate claude|codex|custom`) lets the local agent ask a stronger online model when it
+is stuck: the session rules gain a line about `lmdeck xtreme delegate "question"`, which runs, in the task's
+directory, Claude Code with your own login (`claude -p`, model `xtreme.delegate_model`, e.g. `opus`; without its
+Edit, Write and Bash tools), Codex (`codex exec --sandbox read-only`) or `xtreme.delegate_cmd`, and prints the answer.
+It reads the files, changes nothing, and does not see the session: the question has to say what is known. lmdeck's
+variables (`ANTHROPIC_BASE_URL` and the rest) are removed first, so it reaches the online model, not the local one.
+`xtreme.delegate_max` (10) questions a run; each shows on the wall and in the log. Off by default.
+
 ## The task list
 
 `lmdeck xtreme tasks` opens it (`xtreme.tasks`, default `~/.config/lmdeck/xtreme/tasks.md`; written from a template
@@ -398,7 +432,7 @@ another machine):
   without a password by `/etc/sudoers.d/lmdeck-xtreme` for exactly these arguments: `desktop-stop`, `desktop-start`,
   `screen-off`, `screen-on`, `wall`, for away mode `remote-on`, `remote-off`, `battery-limit 80|100`,
   `watchdog-on`, `watchdog-off`, and for the network listener `lan-on PORT`, `lan-off PORT` (a ufw rule for that
-  port, only when ufw is active); anything else is refused. Sources in `xtreme/` (the sudoers file has `%USER%` for
+  port, only when ufw is active); anything else is refused. The same file allows `/usr/bin/brightnessctl`. Sources in `xtreme/` (the sudoers file has `%USER%` for
   the user name). This is what lets the run restore the desktop by itself at the end of `--hours`.
   `screen-off` writes `4` to `fb0/blank` and to the panel backlight's `bl_power`; `screen-on` undoes both.
   The installed copy (2026-10-26) has only the first four steps: **install it again** with the commands below, then
@@ -435,6 +469,8 @@ loginctl enable-linger "$USER"
 | `thinking_budget` | 3072 | thinking tokens per Strata reply during a run (0 = the engine's) |
 | `reserve_gib` | 2.0 | memory kept out of the arena for editing and builds; replaces `server.mem_reserve_gib` while a run holds |
 | `screen`, `screen_idle_secs` | `off`, 120 | the panel at the start, and the idle time before the wall turns it off |
+| `context` | 262144 | Strata's context window during a run (0 = the model's own) |
+| `delegate`, `delegate_model`, `delegate_max`, `delegate_cmd` | `off`, none, 10, none | online help for the agent |
 | `wind_down_minutes`, `check_minutes`, `min_battery` | 15, 10, 50 | (config file only) |
 
 ## Checked so far

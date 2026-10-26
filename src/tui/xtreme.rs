@@ -288,6 +288,9 @@ pub fn wall_text(x: &Value, s: Option<&Value>, w: usize, h: usize, ascii: bool, 
     } else if active && !st.dry_run && st.phase != Phase::Waiting {
         right.push("model not loaded".into());
     }
+    if active && !st.delegate.is_empty() && st.delegate != "off" {
+        right.push(format!("online help  {}: {} of {} questions asked", st.delegate, st.delegations, x["delegate_max"].as_u64().unwrap_or(0)));
+    }
     if let Some(sess) = &st.session {
         if !sess.last_tool.is_empty() {
             right.push(format!("last tool  {}", sess.last_tool));
@@ -596,6 +599,27 @@ impl Ui {
                 }
                 _ => {}
             }
+            return None;
+        }
+        // Brightness: the keys the console maps to F13-F16 (helper step `wall`), F1/F2 and F5/F6 (with
+        // Fn, as on the Mac's keys), and [ ] { }.
+        let bright = match k.code {
+            KeyCode::F(13) | KeyCode::F(1) | KeyCode::Char('[') => Some(("screen", "down")),
+            KeyCode::F(14) | KeyCode::F(2) | KeyCode::Char(']') => Some(("screen", "up")),
+            KeyCode::F(15) | KeyCode::F(5) | KeyCode::Char('{') => Some(("kbd", "down")),
+            KeyCode::F(16) | KeyCode::F(6) | KeyCode::Char('}') => Some(("kbd", "up")),
+            _ => None,
+        };
+        if let Some((target, step)) = bright {
+            let d = self.d.clone();
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let msg = match xt::post(&d, "brightness", json!({"target": target, "step": step})).await {
+                    Ok(v) => format!("{} {}%", if target == "screen" { "screen" } else { "keyboard" }, v["percent"]),
+                    Err(e) => format!("brightness: {e:#}"),
+                };
+                let _ = tx.send(Msg::Toast(msg));
+            });
             return None;
         }
         if self.xt.wall {

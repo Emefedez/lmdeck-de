@@ -321,6 +321,18 @@ pub struct XtremeCfg {
     pub lan_port: u16,
     /// "token" = every request on it carries the run's token (Bearer / x-api-key); "none" = open.
     pub lan_auth: String,
+    /// Strata's context window during a run (its --max-context; 0 = the model's own). The long-range
+    /// attention state costs ~64 MiB a layer at 262K (Strata's session.cpp), so the window can grow.
+    pub context: u32,
+    /// Online help for the local agent (`lmdeck xtreme delegate`): "off", "claude" (Claude Code with
+    /// your login), "codex", or "custom" (delegate_cmd). It reads the task's files; it changes none.
+    pub delegate: String,
+    /// Its model ("" = the CLI's default), e.g. opus, sonnet, gpt-5.
+    pub delegate_model: String,
+    /// For "custom": the command; the question is its last argument.
+    pub delegate_cmd: String,
+    /// Questions per run.
+    pub delegate_max: u32,
 }
 
 impl Default for XtremeCfg {
@@ -342,6 +354,11 @@ impl Default for XtremeCfg {
             min_battery: 50,
             lan_port: 11435,
             lan_auth: "token".into(),
+            context: 262_144,
+            delegate: "off".into(),
+            delegate_model: String::new(),
+            delegate_cmd: String::new(),
+            delegate_max: 10,
         }
     }
 }
@@ -955,6 +972,10 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "XTreme", key: "xtreme.screen", kind: Kind::Choice(&["off", "on"]), help: "Panel at the start of a run: off (a key brings it back) / on" },
     Setting { section: "XTreme", key: "xtreme.lan_port", kind: Kind::Number, help: "Port other computers reach the model APIs on during a run (--lan; not the control API)" },
     Setting { section: "XTreme", key: "xtreme.lan_auth", kind: Kind::Choice(&["token", "none"]), help: "Network listener: token (clients send it as their API key) / none (open to the network)" },
+    Setting { section: "XTreme", key: "xtreme.context", kind: Kind::Number, help: "Strata's context window during a run (0 = the model's own; 262144 = the engine's maximum)" },
+    Setting { section: "XTreme", key: "xtreme.delegate", kind: Kind::Choice(&["off", "claude", "codex", "custom"]), help: "Online model the local agent may ask (lmdeck xtreme delegate): reads the task's files, changes none" },
+    Setting { section: "XTreme", key: "xtreme.delegate_model", kind: Kind::Text, help: "Its model (empty = the CLI's default), e.g. opus" },
+    Setting { section: "XTreme", key: "xtreme.delegate_max", kind: Kind::Number, help: "Questions to the online model per run" },
     Setting { section: "XTreme", key: "xtreme.screen_idle_secs", kind: Kind::Number, help: "Seconds without a key before the wall turns the panel off (0 = never)" },
     Setting { section: "Integration", key: "usage.perf", kind: Kind::Bool, help: "Record each model's speed and system power while it generates, for the grader (off: the grader estimates them). Costs one sensor read every 2 s while a request runs and ~10 KB" },
 ];
@@ -1048,6 +1069,11 @@ pub fn get_setting(c: &Config, key: &str) -> String {
         "xtreme.screen" => c.xtreme.screen.clone(),
         "xtreme.screen_idle_secs" => c.xtreme.screen_idle_secs.to_string(),
         "xtreme.lan_port" => c.xtreme.lan_port.to_string(),
+        "xtreme.context" => c.xtreme.context.to_string(),
+        "xtreme.delegate" => c.xtreme.delegate.clone(),
+        "xtreme.delegate_model" => c.xtreme.delegate_model.clone(),
+        "xtreme.delegate_cmd" => c.xtreme.delegate_cmd.clone(),
+        "xtreme.delegate_max" => c.xtreme.delegate_max.to_string(),
         "xtreme.lan_auth" => c.xtreme.lan_auth.clone(),
         "strata.dir" => c.strata.dir.clone(),
         "strata.git_ref" => c.strata.git_ref.clone(),
@@ -1200,6 +1226,14 @@ pub fn set_setting(c: &mut Config, key: &str, v: &str) -> Result<(), String> {
         },
         "xtreme.screen_idle_secs" => c.xtreme.screen_idle_secs = num(v)? as u32,
         "xtreme.lan_port" => c.xtreme.lan_port = (num(v)?).clamp(1024, 65535) as u16,
+        "xtreme.context" => c.xtreme.context = (num(v)? as u32).min(262_144),
+        "xtreme.delegate" => match v {
+            "off" | "claude" | "codex" | "custom" => c.xtreme.delegate = v.into(),
+            _ => return Err("off, claude, codex or custom".into()),
+        },
+        "xtreme.delegate_model" => c.xtreme.delegate_model = v.into(),
+        "xtreme.delegate_cmd" => c.xtreme.delegate_cmd = v.into(),
+        "xtreme.delegate_max" => c.xtreme.delegate_max = num(v)? as u32,
         "xtreme.lan_auth" => match v {
             "token" | "none" => c.xtreme.lan_auth = v.into(),
             _ => return Err("token or none".into()),

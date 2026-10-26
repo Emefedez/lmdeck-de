@@ -290,8 +290,11 @@ impl Manager {
         })
     }
 
+    /// The settings in force: the config, with an XTreme run's profile on top while one holds.
     pub fn cfg(&self) -> Config {
-        self.cfg.read().unwrap().clone()
+        let mut c = self.cfg.read().unwrap().clone();
+        crate::xtreme::overlay(&mut c);
+        c
     }
 
     pub fn models(&self) -> Arc<Vec<LocalModel>> {
